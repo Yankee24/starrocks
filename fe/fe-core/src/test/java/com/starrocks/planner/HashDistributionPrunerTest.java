@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/planner/HashDistributionPrunerTest.java
 
@@ -30,7 +43,11 @@ import com.starrocks.analysis.InPredicate;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.StringLiteral;
 import com.starrocks.catalog.Column;
+import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Type;
+import com.starrocks.sql.plan.PlanTestBase;
+import mockit.Mock;
+import mockit.MockUp;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -39,7 +56,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-public class HashDistributionPrunerTest {
+public class HashDistributionPrunerTest extends PlanTestBase {
 
     @Test
     public void test() {
@@ -179,4 +196,37 @@ public class HashDistributionPrunerTest {
         Assert.assertEquals(tabletIds.size(), results.size());
     }
 
+    @Test
+    public void testPruneTablet() throws Exception {
+        new MockUp<Partition>() {
+            @Mock
+            public boolean hasData() {
+                return true;
+            }
+        };
+
+        starRocksAssert.withTable("CREATE TABLE `test_bucket_prune` (\n" +
+                "  `dim_dt` date NOT NULL COMMENT \"\",\n" +
+                "  `dim_class_id` int(11) NOT NULL COMMENT \"\",\n" +
+                "  `dim_week_start_time` bigint(20) NOT NULL COMMENT \"\",\n" +
+                "  `deleted` int(11) NOT NULL COMMENT \"\"\n" +
+                ") ENGINE=OLAP \n" +
+                "PRIMARY KEY(`dim_dt`, `dim_class_id`, `dim_week_start_time`)\n" +
+                "PARTITION BY RANGE(`dim_dt`)\n" +
+                "(PARTITION p20241227 VALUES [(\"2024-12-27\"), (\"2024-12-28\")),\n" +
+                "PARTITION p20241228 VALUES [(\"2024-12-28\"), (\"2024-12-29\")),\n" +
+                "PARTITION p20241229 VALUES [(\"2024-12-29\"), (\"2024-12-30\")),\n" +
+                "PARTITION p20241230 VALUES [(\"2024-12-30\"), (\"2024-12-31\")),\n" +
+                "PARTITION p20241231 VALUES [(\"2024-12-31\"), (\"2025-01-01\")),\n" +
+                "PARTITION p20250101 VALUES [(\"2025-01-01\"), (\"2025-01-02\")),\n" +
+                "PARTITION p20250102 VALUES [(\"2025-01-02\"), (\"2025-01-03\")),\n" +
+                "PARTITION p20250103 VALUES [(\"2025-01-03\"), (\"2025-01-04\")))\n" +
+                "DISTRIBUTED BY HASH(`dim_dt`, `dim_class_id`) BUCKETS 8 \n" +
+                "PROPERTIES (\n" +
+                "\"replication_num\" = \"1\"\n" +
+                ");");
+
+        starRocksAssert.query("select * from test_bucket_prune where dim_dt = '2024-12-29' and dim_class_id = 1")
+                .explainContains("tabletRatio=1/8");
+    }
 }

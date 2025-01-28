@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/alter/AlterOpType.java
 
@@ -30,6 +43,7 @@ public enum AlterOpType {
     // partition
     ADD_PARTITION,
     DROP_PARTITION,
+    TRUNCATE_PARTITION,
     REPLACE_PARTITION,
     MODIFY_PARTITION,
     // rename
@@ -40,7 +54,21 @@ public enum AlterOpType {
     // others operation, such as add/drop backend. currently we do not care about them
     ALTER_OTHER,
     SWAP,
+    COMPACT,
 
+    // comment
+    ALTER_COMMENT,
+
+    //Alter View
+    ALTER_VIEW,
+    REFRESH_SCHEMA,
+    ALTER_MV_STATUS,
+
+    // Optimize table
+    OPTIMIZE,
+    ALTER_BRANCH,
+    ALTER_TAG,
+    ALTER_TABLE_OPERATION,
     INVALID_OP; // INVALID_OP must be the last one
 
     // true means 2 operations have no conflict.
@@ -62,7 +90,7 @@ public enum AlterOpType {
     }
 
     public boolean needCheckCapacity() {
-        return this == ADD_ROLLUP || this == SCHEMA_CHANGE || this == ADD_PARTITION;
+        return this == ADD_ROLLUP || this == SCHEMA_CHANGE || this == ADD_PARTITION || this == OPTIMIZE;
     }
 
 }

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/mysql/MysqlSerializer.java
 
@@ -26,8 +39,8 @@ import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Type;
 
 import java.io.ByteArrayOutputStream;
-import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 
 // used for serialize memory data to byte stream of MySQL protocol
 public class MysqlSerializer {
@@ -136,32 +149,20 @@ public class MysqlSerializer {
     }
 
     public void writeLenEncodedString(String value) {
-        try {
-            byte[] buf = value.getBytes("UTF-8");
-            writeVInt(buf.length);
-            writeBytes(buf);
-        } catch (UnsupportedEncodingException e) {
-            e.printStackTrace();
-        }
+        byte[] buf = value.getBytes(StandardCharsets.UTF_8);
+        writeVInt(buf.length);
+        writeBytes(buf);
     }
 
     public void writeEofString(String value) {
-        try {
-            byte[] buf = value.getBytes("UTF-8");
-            writeBytes(buf);
-        } catch (UnsupportedEncodingException e) {
-            e.printStackTrace();
-        }
+        byte[] buf = value.getBytes(StandardCharsets.UTF_8);
+        writeBytes(buf);
     }
 
     public void writeNulTerminateString(String value) {
-        try {
-            byte[] buf = value.getBytes("UTF-8");
-            writeBytes(buf);
-            writeByte((byte) 0);
-        } catch (UnsupportedEncodingException e) {
-            e.printStackTrace();
-        }
+        byte[] buf = value.getBytes(StandardCharsets.UTF_8);
+        writeBytes(buf);
+        writeByte((byte) 0);
     }
 
     public void writeField(String db, String table, Column column, boolean sendDefault) {
@@ -176,7 +177,7 @@ public class MysqlSerializer {
         writeLenEncodedString(table);
         // Name: length encoded string
         writeLenEncodedString(column.getName());
-        // Orignal Name: length encoded string
+        // Original Name: length encoded string
         writeLenEncodedString(column.getName());
         // length of the following fields(always 0x0c)
         writeVInt(0x0c);
@@ -214,7 +215,7 @@ public class MysqlSerializer {
         writeLenEncodedString("");
         // Name: length encoded string
         writeLenEncodedString(colName);
-        // Orignal Name: length encoded string
+        // Original Name: length encoded string
         writeLenEncodedString(colName);
         // length of the following fields(always 0x0c)
         writeVInt(0x0c);

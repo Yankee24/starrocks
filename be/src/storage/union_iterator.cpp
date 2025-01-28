@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/union_iterator.h"
 
@@ -6,7 +18,7 @@
 
 #include "column/chunk.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 class UnionIterator final : public ChunkIterator {
 public:
@@ -29,18 +41,18 @@ public:
 
     size_t merged_rows() const override { return _merged_rows; }
 
-    virtual Status init_encoded_schema(ColumnIdToGlobalDictMap& dict_maps) override {
-        ChunkIterator::init_encoded_schema(dict_maps);
+    Status init_encoded_schema(ColumnIdToGlobalDictMap& dict_maps) override {
+        RETURN_IF_ERROR(ChunkIterator::init_encoded_schema(dict_maps));
         for (auto& child : _children) {
-            child->init_encoded_schema(dict_maps);
+            RETURN_IF_ERROR(child->init_encoded_schema(dict_maps));
         }
         return Status::OK();
     }
 
-    virtual Status init_output_schema(const std::unordered_set<uint32_t>& unused_output_column_ids) override {
-        ChunkIterator::init_output_schema(unused_output_column_ids);
+    Status init_output_schema(const std::unordered_set<uint32_t>& unused_output_column_ids) override {
+        RETURN_IF_ERROR(ChunkIterator::init_output_schema(unused_output_column_ids));
         for (auto& child : _children) {
-            child->init_output_schema(unused_output_column_ids);
+            RETURN_IF_ERROR(child->init_output_schema(unused_output_column_ids));
         }
         return Status::OK();
     }
@@ -48,6 +60,10 @@ public:
 protected:
     Status do_get_next(Chunk* chunk) override;
     Status do_get_next(Chunk* chunk, std::vector<uint32_t>* rowid) override;
+    Status do_get_next(Chunk* chunk, std::vector<uint64_t>* rssid_rowids) override;
+    // Union Iterator will read data in order of segment and we don't need to record the read segment record
+    // Add this function for compatibility
+    Status do_get_next(Chunk* chunk, std::vector<RowSourceMask>* source_masks) override { return do_get_next(chunk); }
 
 private:
     std::vector<ChunkIteratorPtr> _children;
@@ -70,9 +86,24 @@ inline Status UnionIterator::do_get_next(Chunk* chunk) {
     return Status::EndOfFile("End of union iterator");
 }
 
-inline Status UnionIterator::do_get_next(Chunk* chunk, vector<uint32_t>* rowid) {
+inline Status UnionIterator::do_get_next(Chunk* chunk, std::vector<uint32_t>* rowid) {
     while (_cur_idx < _children.size()) {
         Status res = _children[_cur_idx]->get_next(chunk, rowid);
+        if (res.is_end_of_file()) {
+            _merged_rows += _children[_cur_idx]->merged_rows();
+            _children[_cur_idx]->close();
+            _children[_cur_idx].reset();
+            _cur_idx++;
+            continue;
+        }
+        return res;
+    }
+    return Status::EndOfFile("End of union iterator");
+}
+
+inline Status UnionIterator::do_get_next(Chunk* chunk, std::vector<uint64_t>* rssid_rowids) {
+    while (_cur_idx < _children.size()) {
+        Status res = _children[_cur_idx]->get_next(chunk, rssid_rowids);
         if (res.is_end_of_file()) {
             _merged_rows += _children[_cur_idx]->merged_rows();
             _children[_cur_idx]->close();
@@ -102,4 +133,4 @@ ChunkIteratorPtr new_union_iterator(std::vector<ChunkIteratorPtr> children) {
     return std::make_shared<UnionIterator>(std::move(children));
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

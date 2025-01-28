@@ -44,7 +44,7 @@ public class CurrentQueryBackendInstanceProcDir implements ProcDirInterface {
 
     @Override
     public ProcNodeInterface lookup(String name) throws AnalysisException {
-        throw new AnalysisException(name + " does't exist.");
+        throw new AnalysisException(name + " doesn't exist.");
     }
 
     @Override
@@ -66,7 +66,7 @@ public class CurrentQueryBackendInstanceProcDir implements ProcDirInterface {
                         .toString();
                 content.setHost(address);
                 content.setInstanceId(DebugUtil.printId(info.getInstanceId()));
-                content.setExecTime(item.getQueryExecTime());
+                content.setExecTime(String.valueOf(item.getQueryExecTime()));
                 final String hostWithPort = info.getAddress().toString();
                 List<RowData> list = hostInstances.get(hostWithPort);
                 if (list == null) {

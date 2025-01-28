@@ -23,8 +23,8 @@ namespace starrocks {
 
 class BrpcStubCacheTest : public testing::Test {
 public:
-    BrpcStubCacheTest() {}
-    virtual ~BrpcStubCacheTest() {}
+    BrpcStubCacheTest() = default;
+    ~BrpcStubCacheTest() override = default;
 };
 
 TEST_F(BrpcStubCacheTest, normal) {
@@ -50,6 +50,21 @@ TEST_F(BrpcStubCacheTest, invalid) {
     address.port = 123;
     auto stub1 = cache.get_stub(address);
     ASSERT_EQ(nullptr, stub1);
+}
+
+TEST_F(BrpcStubCacheTest, reset) {
+    BrpcStubCache cache;
+    TNetworkAddress address;
+    address.hostname = "127.0.0.1";
+    address.port = 123;
+    auto stub1 = cache.get_stub(address);
+    ASSERT_NE(nullptr, stub1);
+    auto istub1 = stub1->stub();
+
+    stub1->reset_channel();
+    auto istub2 = stub1->stub();
+
+    ASSERT_NE(istub1, istub2);
 }
 
 } // namespace starrocks

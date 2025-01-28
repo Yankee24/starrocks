@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/task/AgentTaskQueue.java
 
@@ -37,6 +50,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -46,13 +60,17 @@ public class AgentTaskQueue {
     private static final Logger LOG = LogManager.getLogger(AgentTaskQueue.class);
 
     // backend id -> (task type -> (signature -> agent task))
-    private static Table<Long, TTaskType, Map<Long, AgentTask>> tasks = HashBasedTable.create();
+    public static Table<Long, TTaskType, Map<Long, AgentTask>> tasks = HashBasedTable.create();
     private static int taskNum = 0;
 
     public static synchronized void addBatchTask(AgentBatchTask batchTask) {
         for (AgentTask task : batchTask.getAllTasks()) {
             addTask(task);
         }
+    }
+
+    public static synchronized void addTaskList(List<AgentTask> taskList) {
+        taskList.forEach(AgentTaskQueue::addTask);
     }
 
     public static synchronized boolean addTask(AgentTask task) {
@@ -72,11 +90,6 @@ public class AgentTaskQueue {
         signatureMap.put(signature, task);
         ++taskNum;
         LOG.debug("add task: type[{}], backend[{}], signature[{}]", type, backendId, signature);
-        if (type == TTaskType.PUSH) {
-            PushTask pushTask = (PushTask) task;
-            LOG.debug("push task info: version[{}]",
-                    pushTask.getVersion());
-        }
         return true;
     }
 
@@ -297,7 +310,7 @@ public class AgentTaskQueue {
             }
         }
 
-        LOG.info("get task num with type[{}] in backend[{}]: {}. isFailed: {}",
+        LOG.debug("get task num with type[{}] in backend[{}]: {}. isFailed: {}",
                 type.name(), backendId, taskNum, isFailed);
         return taskNum;
     }
@@ -314,5 +327,18 @@ public class AgentTaskQueue {
         }
         return tasks;
     }
-}
 
+    public static synchronized List<Object> getSamplesForMemoryTracker() {
+        List<Object> result = new ArrayList<>();
+        // Get one task of each type
+        for (TTaskType type : TTaskType.values()) {
+            Map<Long, Map<Long, AgentTask>> tasksForType = tasks.column(type);
+            Optional<Map<Long, AgentTask>> beTasks = tasksForType.values().stream().findAny();
+            if (beTasks.isPresent()) {
+                Optional<AgentTask> task = beTasks.get().values().stream().findAny();
+                task.ifPresent(result::add);
+            }
+        }
+        return result;
+    }
+}

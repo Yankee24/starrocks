@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/vertical_compaction_task.h"
 
@@ -10,11 +22,9 @@
 #include "storage/compaction_utils.h"
 #include "storage/olap_common.h"
 #include "storage/row_source_mask.h"
-#include "storage/rowset/beta_rowset.h"
 #include "storage/rowset/column_reader.h"
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_writer.h"
-#include "storage/storage_engine.h"
 #include "storage/tablet_reader.h"
 #include "storage/tablet_reader_params.h"
 #include "util/time.h"
@@ -24,6 +34,7 @@ namespace starrocks {
 
 Status VerticalCompactionTask::run_impl() {
     Statistics statistics;
+    RETURN_IF_ERROR(_shortcut_compact(&statistics));
     RETURN_IF_ERROR(_vertical_compaction_data(&statistics));
     TRACE_COUNTER_INCREMENT("merged_rows", statistics.merged_rows);
     TRACE_COUNTER_INCREMENT("filtered_rows", statistics.filtered_rows);
@@ -32,29 +43,32 @@ Status VerticalCompactionTask::run_impl() {
     RETURN_IF_ERROR(_validate_compaction(statistics));
     TRACE("[Compaction] vertical compaction validated");
 
-    _commit_compaction();
+    RETURN_IF_ERROR(_commit_compaction());
     TRACE("[Compaction] vertical compaction committed");
 
     return Status::OK();
 }
 
 Status VerticalCompactionTask::_vertical_compaction_data(Statistics* statistics) {
+    if (_output_rowset != nullptr) {
+        return Status::OK();
+    }
     TRACE("[Compaction] start vertical comapction data");
     int64_t max_rows_per_segment = CompactionUtils::get_segment_max_rows(
             config::max_segment_file_size, _task_info.input_rows_num, _task_info.input_rowsets_size);
 
     std::unique_ptr<RowsetWriter> output_rs_writer;
     RETURN_IF_ERROR(CompactionUtils::construct_output_rowset_writer(
-            _tablet.get(), max_rows_per_segment, _task_info.algorithm, _task_info.output_version, &output_rs_writer));
+            _tablet.get(), max_rows_per_segment, _task_info.algorithm, _task_info.output_version, _task_info.gtid,
+            &output_rs_writer, _tablet_schema));
 
     std::vector<std::vector<uint32_t>> column_groups;
-    CompactionUtils::split_column_into_groups(_tablet->num_columns(), _tablet->num_key_columns(),
+    CompactionUtils::split_column_into_groups(_tablet_schema->num_columns(), _tablet_schema->sort_key_idxes(),
                                               config::vertical_compaction_max_columns_per_group, &column_groups);
     _task_info.column_group_size = column_groups.size();
 
-    auto mask_buffer =
-            std::make_unique<vectorized::RowSourceMaskBuffer>(_tablet->tablet_id(), _tablet->data_dir()->path());
-    auto source_masks = std::make_unique<std::vector<vectorized::RowSourceMask>>();
+    auto mask_buffer = std::make_unique<RowSourceMaskBuffer>(_tablet->tablet_id(), _tablet->data_dir()->path());
+    auto source_masks = std::make_unique<std::vector<RowSourceMask>>();
     TRACE("[Compaction] compaction prepare finished, max_rows_per_segment:$0, column groups "
           "size:$1",
           max_rows_per_segment, column_groups.size());
@@ -67,7 +81,7 @@ Status VerticalCompactionTask::_vertical_compaction_data(Statistics* statistics)
         bool is_key = (i == 0);
         if (!is_key) {
             // read mask buffer from the beginning
-            mask_buffer->flip_to_read();
+            RETURN_IF_ERROR(mask_buffer->flip_to_read());
         }
         RETURN_IF_ERROR(_compact_column_group(is_key, i, column_groups[i], output_rs_writer.get(), mask_buffer.get(),
                                               source_masks.get(), statistics));
@@ -97,32 +111,34 @@ Status VerticalCompactionTask::_vertical_compaction_data(Statistics* statistics)
     TRACE_COUNTER_INCREMENT("output_segments_num", _output_rowset->num_segments());
     TRACE("[Compaction] output rowset built");
 
+    if (config::enable_rowset_verify) {
+        RETURN_IF_ERROR(_output_rowset->verify());
+    }
+
     return Status::OK();
 }
 
 Status VerticalCompactionTask::_compact_column_group(bool is_key, int column_group_index,
                                                      const std::vector<uint32_t>& column_group,
-                                                     RowsetWriter* output_rs_writer,
-                                                     vectorized::RowSourceMaskBuffer* mask_buffer,
-                                                     std::vector<vectorized::RowSourceMask>* source_masks,
-                                                     Statistics* statistics) {
-    vectorized::Schema schema =
-            vectorized::ChunkHelper::convert_schema_to_format_v2(_tablet->tablet_schema(), column_group);
-    vectorized::TabletReader reader(std::static_pointer_cast<Tablet>(_tablet->shared_from_this()),
-                                    output_rs_writer->version(), schema, is_key, mask_buffer);
+                                                     RowsetWriter* output_rs_writer, RowSourceMaskBuffer* mask_buffer,
+                                                     std::vector<RowSourceMask>* source_masks, Statistics* statistics) {
+    Schema schema = ChunkHelper::convert_schema(_tablet_schema, column_group);
+    TabletReader reader(std::static_pointer_cast<Tablet>(_tablet->shared_from_this()), output_rs_writer->version(),
+                        schema, is_key, mask_buffer, _tablet_schema);
     RETURN_IF_ERROR(reader.prepare());
-    vectorized::TabletReaderParams reader_params;
+    TabletReaderParams reader_params;
     DCHECK(compaction_type() == BASE_COMPACTION || compaction_type() == CUMULATIVE_COMPACTION);
     reader_params.reader_type =
             compaction_type() == BASE_COMPACTION ? READER_BASE_COMPACTION : READER_CUMULATIVE_COMPACTION;
     reader_params.profile = _runtime_profile.create_child("merge_rowsets");
+    reader_params.column_access_paths = &_column_access_paths;
 
     StatusOr<int32_t> ret = _calculate_chunk_size_for_column_group(column_group);
     if (!ret.ok()) {
         return ret.status();
     }
     int32_t chunk_size = ret.value();
-    VLOG(1) << "compaction task_id:" << _task_info.task_id << ", tablet=" << _tablet->tablet_id()
+    VLOG(2) << "compaction task_id:" << _task_info.task_id << ", tablet=" << _tablet->tablet_id()
             << ", column group=" << column_group_index << ", reader chunk size=" << chunk_size;
     reader_params.chunk_size = chunk_size;
     RETURN_IF_ERROR(reader.open(reader_params));
@@ -153,10 +169,10 @@ StatusOr<int32_t> VerticalCompactionTask::_calculate_chunk_size_for_column_group
     int64_t total_mem_footprint = 0;
     for (auto& rowset : _input_rowsets) {
         total_num_rows += rowset->num_rows();
-        auto* beta_rowset = down_cast<BetaRowset*>(rowset.get());
-        for (auto& segment : beta_rowset->segments()) {
+        for (auto& segment : rowset->segments()) {
             for (uint32_t column_index : column_group) {
-                const auto* column_reader = segment->column(column_index);
+                auto uid = _tablet_schema->column(column_index).unique_id();
+                const auto* column_reader = segment->column_with_uid(uid);
                 if (column_reader == nullptr) {
                     continue;
                 }
@@ -171,15 +187,14 @@ StatusOr<int32_t> VerticalCompactionTask::_calculate_chunk_size_for_column_group
 }
 
 StatusOr<size_t> VerticalCompactionTask::_compact_data(bool is_key, int32_t chunk_size,
-                                                       const std::vector<uint32_t>& column_group,
-                                                       const vectorized::Schema& schema,
-                                                       vectorized::TabletReader* reader, RowsetWriter* output_rs_writer,
-                                                       vectorized::RowSourceMaskBuffer* mask_buffer,
-                                                       std::vector<vectorized::RowSourceMask>* source_masks) {
+                                                       const std::vector<uint32_t>& column_group, const Schema& schema,
+                                                       TabletReader* reader, RowsetWriter* output_rs_writer,
+                                                       RowSourceMaskBuffer* mask_buffer,
+                                                       std::vector<RowSourceMask>* source_masks) {
     DCHECK(reader);
     size_t output_rows = 0;
-    auto chunk = vectorized::ChunkHelper::new_chunk(schema, chunk_size);
-    auto char_field_indexes = vectorized::ChunkHelper::get_char_field_indexes(schema);
+    auto chunk = ChunkHelper::new_chunk(schema, chunk_size);
+    auto char_field_indexes = ChunkHelper::get_char_field_indexes(schema);
 
     Status status = Status::OK();
     size_t column_group_del_filtered_rows = 0;
@@ -205,8 +220,7 @@ StatusOr<size_t> VerticalCompactionTask::_compact_data(bool is_key, int32_t chun
             }
         }
 
-        vectorized::ChunkHelper::padding_char_columns(char_field_indexes, schema, _tablet->tablet_schema(),
-                                                      chunk.get());
+        ChunkHelper::padding_char_columns(char_field_indexes, schema, _tablet_schema, chunk.get());
 
         RETURN_IF_ERROR(output_rs_writer->add_columns(*chunk, column_group, is_key));
 

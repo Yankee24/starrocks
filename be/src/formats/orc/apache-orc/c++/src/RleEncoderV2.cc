@@ -1,19 +1,20 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
- * distributed with option work for additional information
- * regarding copyright ownership.  The ASF licenses option file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
  * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use option file except in compliance
+ * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
 
 #include "Adaptor.hh"
@@ -21,17 +22,16 @@
 #include "RLEV2Util.hh"
 #include "RLEv2.hh"
 
-#define MAX_LITERAL_SIZE 512
 #define MAX_SHORT_REPEAT_LENGTH 10
 
 namespace orc {
 
 /**
- * Compute the bits required to represent pth percentile value
- * @param data - array
- * @param p - percentile value (>=0.0 to <=1.0)
- * @return pth percentile bits
- */
+   * Compute the bits required to represent pth percentile value
+   * @param data - array
+   * @param p - percentile value (>=0.0 to <=1.0)
+   * @return pth percentile bits
+   */
 uint32_t RleEncoderV2::percentileBits(int64_t* data, size_t offset, size_t length, double p, bool reuseHist) {
     if ((p > 1.0) || (p <= 0.0)) {
         throw InvalidArgument("Invalid p value: " + to_string(p));
@@ -48,7 +48,7 @@ uint32_t RleEncoderV2::percentileBits(int64_t* data, size_t offset, size_t lengt
         }
     }
 
-    int32_t perLen = static_cast<int32_t>(static_cast<double>(length) * (1.0 - p));
+    auto perLen = static_cast<int32_t>(static_cast<double>(length) * (1.0 - p));
 
     // return the bits required by pth percentile length
     for (int32_t i = HIST_LEN - 1; i >= 0; i--) {
@@ -64,7 +64,7 @@ RleEncoderV2::RleEncoderV2(std::unique_ptr<BufferedOutputStream> outStream, bool
         : RleEncoder(std::move(outStream), hasSigned), alignedBitPacking(alignBitPacking), prevDelta(0) {
     literals = new int64_t[MAX_LITERAL_SIZE];
     gapVsPatchList = new int64_t[MAX_LITERAL_SIZE];
-    zigzagLiterals = new int64_t[MAX_LITERAL_SIZE];
+    zigzagLiterals = hasSigned ? new int64_t[MAX_LITERAL_SIZE] : nullptr;
     baseRedLiterals = new int64_t[MAX_LITERAL_SIZE];
     adjDeltas = new int64_t[MAX_LITERAL_SIZE];
 }
@@ -121,7 +121,8 @@ void RleEncoderV2::write(int64_t val) {
         }
 
         if (fixedRunLength == MAX_LITERAL_SIZE) {
-            determineEncoding(option);
+            option.encoding = DELTA;
+            option.isFixedDelta = true;
             writeValues(option);
         }
         return;
@@ -165,14 +166,9 @@ void RleEncoderV2::write(int64_t val) {
 }
 
 void RleEncoderV2::computeZigZagLiterals(EncodingOption& option) {
-    int64_t zzEncVal = 0;
+    assert(isSigned);
     for (size_t i = 0; i < numLiterals; i++) {
-        if (isSigned) {
-            zzEncVal = zigZag(literals[i]);
-        } else {
-            zzEncVal = literals[i];
-        }
-        zigzagLiterals[option.zigzagLiteralsCount++] = zzEncVal;
+        zigzagLiterals[option.zigzagLiteralsCount++] = zigZag(literals[i]);
     }
 }
 
@@ -278,6 +274,20 @@ void RleEncoderV2::preparePatchedBlob(EncodingOption& option) {
     }
 }
 
+/**
+   * Prepare for Direct or PatchedBase encoding
+   * compute zigZagLiterals and zzBits100p (Max number of encoding bits required)
+   * @return zigzagLiterals
+   */
+int64_t* RleEncoderV2::prepareForDirectOrPatchedBase(EncodingOption& option) {
+    if (isSigned) {
+        computeZigZagLiterals(option);
+    }
+    int64_t* currentZigzagLiterals = isSigned ? zigzagLiterals : literals;
+    option.zzBits100p = percentileBits(currentZigzagLiterals, 0, numLiterals, 1.0);
+    return currentZigzagLiterals;
+}
+
 void RleEncoderV2::determineEncoding(EncodingOption& option) {
     // We need to compute zigzag values for DIRECT and PATCHED_BASE encodings,
     // but not for SHORT_REPEAT or DELTA. So we only perform the zigzag
@@ -287,8 +297,7 @@ void RleEncoderV2::determineEncoding(EncodingOption& option) {
     if (numLiterals <= MIN_REPEAT) {
         // we need to compute zigzag values for DIRECT encoding if we decide to
         // break early for delta overflows or for shorter runs
-        computeZigZagLiterals(option);
-        option.zzBits100p = percentileBits(zigzagLiterals, 0, numLiterals, 1.0);
+        prepareForDirectOrPatchedBase(option);
         option.encoding = DIRECT;
         return;
     }
@@ -328,8 +337,7 @@ void RleEncoderV2::determineEncoding(EncodingOption& option) {
     // PATCHED_BASE condition as encoding using DIRECT is faster and has less
     // overhead than PATCHED_BASE
     if (!isSafeSubtract(max, option.min)) {
-        computeZigZagLiterals(option);
-        option.zzBits100p = percentileBits(zigzagLiterals, 0, numLiterals, 1.0);
+        prepareForDirectOrPatchedBase(option);
         option.encoding = DIRECT;
         return;
     }
@@ -383,9 +391,8 @@ void RleEncoderV2::determineEncoding(EncodingOption& option) {
     // beyond a threshold then we need to patch the values. if the variation
     // is not significant then we can use direct encoding
 
-    computeZigZagLiterals(option);
-    option.zzBits100p = percentileBits(zigzagLiterals, 0, numLiterals, 1.0);
-    option.zzBits90p = percentileBits(zigzagLiterals, 0, numLiterals, 0.9, true);
+    int64_t* currentZigzagLiterals = prepareForDirectOrPatchedBase(option);
+    option.zzBits90p = percentileBits(currentZigzagLiterals, 0, numLiterals, 0.9, true);
     uint32_t diffBitsLH = option.zzBits100p - option.zzBits90p;
 
     // if the difference between 90th percentile and 100th percentile fixed
@@ -427,31 +434,8 @@ void RleEncoderV2::determineEncoding(EncodingOption& option) {
 }
 
 uint64_t RleEncoderV2::flush() {
-    if (numLiterals != 0) {
-        EncodingOption option = {};
-        if (variableRunLength != 0) {
-            determineEncoding(option);
-            writeValues(option);
-        } else if (fixedRunLength != 0) {
-            if (fixedRunLength < MIN_REPEAT) {
-                variableRunLength = fixedRunLength;
-                fixedRunLength = 0;
-                determineEncoding(option);
-                writeValues(option);
-            } else if (fixedRunLength >= MIN_REPEAT && fixedRunLength <= MAX_SHORT_REPEAT_LENGTH) {
-                option.encoding = SHORT_REPEAT;
-                writeValues(option);
-            } else {
-                option.encoding = DELTA;
-                option.isFixedDelta = true;
-                writeValues(option);
-            }
-        }
-    }
-
-    outputStream->BackUp(static_cast<int>(bufferLength - bufferPosition));
+    finishEncode();
     uint64_t dataSize = outputStream->flush();
-    bufferLength = bufferPosition = 0;
     return dataSize;
 }
 
@@ -499,7 +483,7 @@ void RleEncoderV2::writeShortRepeatValues(EncodingOption&) {
 
     writeByte(static_cast<char>(header));
 
-    for (int32_t i = static_cast<int32_t>(numBytesRepeatVal - 1); i >= 0; i--) {
+    for (auto i = static_cast<int32_t>(numBytesRepeatVal - 1); i >= 0; i--) {
         int64_t b = ((repeatVal >> (i * 8)) & 0xff);
         writeByte(static_cast<char>(b));
     }
@@ -533,7 +517,8 @@ void RleEncoderV2::writeDirectValues(EncodingOption& option) {
     writeByte(headerSecondByte);
 
     // bit packing the zigzag encoded literals
-    writeInts(zigzagLiterals, 0, numLiterals, fb);
+    int64_t* currentZigzagLiterals = isSigned ? zigzagLiterals : literals;
+    writeInts(currentZigzagLiterals, 0, numLiterals, fb);
 
     // reset run length
     variableRunLength = 0;
@@ -571,9 +556,7 @@ void RleEncoderV2::writePatchedBasedValues(EncodingOption& option) {
     // find the number of bytes required for base and shift it by 5 bits
     // to accommodate patch width. The additional bit is used to store the sign
     // of the base value.
-    uint32_t baseBitsNum = findClosestNumBits(option.min);
-    // if Negative, sign bit is already accounted for
-    uint32_t baseWidth = isNegative ? baseBitsNum : baseBitsNum + 1;
+    const uint32_t baseWidth = findClosestNumBits(option.min) + 1;
     const uint32_t baseBytes = baseWidth % 8 == 0 ? baseWidth / 8 : (baseWidth / 8) + 1;
     const uint32_t bb = (baseBytes - 1) << 5;
 
@@ -597,7 +580,7 @@ void RleEncoderV2::writePatchedBasedValues(EncodingOption& option) {
     writeByte(headerFourthByte);
 
     // write the base value using fixed bytes in big endian order
-    for (int32_t i = static_cast<int32_t>(baseBytes - 1); i >= 0; i--) {
+    for (auto i = static_cast<int32_t>(baseBytes - 1); i >= 0; i--) {
         char b = static_cast<char>(((option.min >> (i * 8)) & 0xff));
         writeByte(b);
     }
@@ -691,11 +674,11 @@ void RleEncoderV2::writeInts(int64_t* input, uint32_t offset, size_t len, uint32
 
     if (getClosestAlignedFixedBits(bitSize) == bitSize) {
         uint32_t numBytes;
-        uint32_t endOffSet = static_cast<uint32_t>(offset + len);
+        auto endOffSet = static_cast<uint32_t>(offset + len);
         if (bitSize < 8) {
             char bitMask = static_cast<char>((1 << bitSize) - 1);
             uint32_t numHops = 8 / bitSize;
-            uint32_t remainder = static_cast<uint32_t>(len % numHops);
+            auto remainder = static_cast<uint32_t>(len % numHops);
             uint32_t endUnroll = endOffSet - remainder;
             for (uint32_t i = offset; i < endUnroll; i += numHops) {
                 char toWrite = 0;
@@ -765,5 +748,31 @@ void RleEncoderV2::initializeLiterals(int64_t val) {
     literals[numLiterals++] = val;
     fixedRunLength = 1;
     variableRunLength = 1;
+}
+
+void RleEncoderV2::finishEncode() {
+    if (numLiterals != 0) {
+        EncodingOption option = {};
+        if (variableRunLength != 0) {
+            determineEncoding(option);
+            writeValues(option);
+        } else if (fixedRunLength != 0) {
+            if (fixedRunLength < MIN_REPEAT) {
+                variableRunLength = fixedRunLength;
+                fixedRunLength = 0;
+                determineEncoding(option);
+                writeValues(option);
+            } else if (fixedRunLength >= MIN_REPEAT && fixedRunLength <= MAX_SHORT_REPEAT_LENGTH) {
+                option.encoding = SHORT_REPEAT;
+                writeValues(option);
+            } else {
+                option.encoding = DELTA;
+                option.isFixedDelta = true;
+                writeValues(option);
+            }
+        }
+    }
+
+    RleEncoder::finishEncode();
 }
 } // namespace orc

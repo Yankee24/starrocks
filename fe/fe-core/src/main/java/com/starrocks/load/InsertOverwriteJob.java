@@ -1,9 +1,22 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.load;
 
 import com.google.gson.annotations.SerializedName;
-import com.starrocks.analysis.InsertStmt;
+import com.starrocks.sql.ast.InsertStmt;
 
 import java.util.List;
 
@@ -26,24 +39,41 @@ public class InsertOverwriteJob {
     @SerializedName(value = "targetTableId")
     private long targetTableId;
 
+    @SerializedName(value = "warehouseId")
+    private long warehouseId;
+
+    @SerializedName(value = "sourcePartitionNames")
+    private List<String> sourcePartitionNames;
+
+    @SerializedName(value = "dynamicOverwrite")
+    private boolean dynamicOverwrite = false;
+
     private transient InsertStmt insertStmt;
 
-    public InsertOverwriteJob(long jobId, InsertStmt insertStmt, long targetDbId, long targetTableId) {
+    public InsertOverwriteJob() {
+    }
+
+    public InsertOverwriteJob(long jobId, InsertStmt insertStmt, long targetDbId,
+                              long targetTableId, long warehouseId, boolean dynamicOverwrite) {
         this.jobId = jobId;
         this.insertStmt = insertStmt;
         this.sourcePartitionIds = insertStmt.getTargetPartitionIds();
         this.jobState = InsertOverwriteJobState.OVERWRITE_PENDING;
         this.targetDbId = targetDbId;
         this.targetTableId = targetTableId;
+        this.warehouseId = warehouseId;
+        this.dynamicOverwrite = dynamicOverwrite;
     }
 
     // used to replay InsertOverwriteJob
-    public InsertOverwriteJob(long jobId, long targetDbId, long targetTableId, List<Long> sourcePartitionIds) {
+    public InsertOverwriteJob(long jobId, long targetDbId, long targetTableId,
+                              List<Long> sourcePartitionIds, boolean dynamicOverwrite) {
         this.jobId = jobId;
         this.targetDbId = targetDbId;
         this.targetTableId = targetTableId;
         this.sourcePartitionIds = sourcePartitionIds;
         this.jobState = InsertOverwriteJobState.OVERWRITE_PENDING;
+        this.dynamicOverwrite = dynamicOverwrite;
     }
 
     public long getJobId() {
@@ -70,6 +100,14 @@ public class InsertOverwriteJob {
         this.sourcePartitionIds = sourcePartitionIds;
     }
 
+    public List<String> getSourcePartitionNames() {
+        return sourcePartitionNames;
+    }
+
+    public void setSourcePartitionNames(List<String> sourcePartitionNames) {
+        this.sourcePartitionNames = sourcePartitionNames;
+    }
+
     public List<Long> getTmpPartitionIds() {
         return tmpPartitionIds;
     }
@@ -93,5 +131,13 @@ public class InsertOverwriteJob {
 
     public InsertStmt getInsertStmt() {
         return insertStmt;
+    }
+
+    public long getWarehouseId() {
+        return warehouseId;
+    }
+
+    public boolean isDynamicOverwrite() {
+        return dynamicOverwrite;
     }
 }

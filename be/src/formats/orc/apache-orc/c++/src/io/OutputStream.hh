@@ -58,8 +58,10 @@ public:
     virtual std::string getName() const;
     virtual uint64_t getSize() const;
     virtual uint64_t flush();
+    virtual void suppress();
 
     virtual bool isCompressed() const { return false; }
+    virtual void finishStream();
 };
 
 /**

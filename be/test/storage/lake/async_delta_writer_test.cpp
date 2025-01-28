@@ -1,11 +1,21 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/lake/async_delta_writer.h"
 
-#include <fmt/format.h>
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <random>
 
 #include "column/chunk.h"
@@ -15,90 +25,42 @@
 #include "column/vectorized_fwd.h"
 #include "common/logging.h"
 #include "fs/fs_util.h"
-#include "gutil/strings/util.h"
-#include "runtime/mem_tracker.h"
 #include "storage/chunk_helper.h"
-#include "storage/lake/tablet.h"
+#include "storage/lake/fixed_location_provider.h"
+#include "storage/lake/join_path.h"
+#include "storage/lake/load_spill_block_manager.h"
 #include "storage/lake/tablet_manager.h"
-#include "storage/lake/test_group_assigner.h"
 #include "storage/lake/txn_log.h"
 #include "storage/rowset/segment.h"
-#include "storage/rowset/segment_iterator.h"
 #include "storage/rowset/segment_options.h"
 #include "storage/tablet_schema.h"
+#include "test_util.h"
 #include "testutil/assert.h"
+#include "testutil/id_generator.h"
+#include "testutil/sync_point.h"
 #include "util/countdown_latch.h"
-#include "util/defer_op.h"
 
 namespace starrocks::lake {
 
-using namespace starrocks::vectorized;
+using namespace starrocks;
 
-using VSchema = starrocks::vectorized::Schema;
-using VChunk = starrocks::vectorized::Chunk;
-
-class AsyncDeltaWriterTest : public testing::Test {
+class LakeAsyncDeltaWriterTest : public TestBase {
 public:
-    AsyncDeltaWriterTest() {
-        _tablet_manager = ExecEnv::GetInstance()->lake_tablet_manager();
-
-        _parent_mem_tracker = std::make_unique<MemTracker>(-1);
-        _mem_tracker = std::make_unique<MemTracker>(-1, "", _parent_mem_tracker.get());
-        _group_assigner = std::make_unique<TestGroupAssigner>(kTestGroupPath);
-        _backup_group_assigner = _tablet_manager->TEST_set_group_assigner(_group_assigner.get());
-
-        _tablet_metadata = std::make_unique<TabletMetadata>();
-        _tablet_metadata->set_id(10086);
-        _tablet_metadata->set_version(1);
-        //
-        //  | column | type | KEY | NULL |
-        //  +--------+------+-----+------+
-        //  |   c0   |  INT | YES |  NO  |
-        //  |   c1   |  INT | NO  |  NO  |
-        auto schema = _tablet_metadata->mutable_schema();
-        schema->set_id(10);
-        schema->set_num_short_key_columns(1);
-        schema->set_keys_type(DUP_KEYS);
-        schema->set_num_rows_per_row_block(65535);
-        schema->set_compress_kind(COMPRESS_LZ4);
-        auto c0 = schema->add_column();
-        {
-            c0->set_unique_id(0);
-            c0->set_name("c0");
-            c0->set_type("INT");
-            c0->set_is_key(true);
-            c0->set_is_nullable(false);
-        }
-        auto c1 = schema->add_column();
-        {
-            c1->set_unique_id(1);
-            c1->set_name("c1");
-            c1->set_type("INT");
-            c1->set_is_key(false);
-            c1->set_is_nullable(false);
-        }
-
-        _tablet_schema = TabletSchema::create(_mem_tracker.get(), *schema);
-        _schema = std::make_shared<VSchema>(vectorized::ChunkHelper::convert_schema(*_tablet_schema));
+    LakeAsyncDeltaWriterTest() : TestBase(kTestDirectory), _partition_id(next_id()) {
+        _tablet_metadata = generate_simple_tablet_metadata(DUP_KEYS);
+        _tablet_schema = TabletSchema::create(_tablet_metadata->schema());
+        _schema = std::make_shared<Schema>(ChunkHelper::convert_schema(_tablet_schema));
     }
 
 protected:
     void SetUp() override {
-        (void)ExecEnv::GetInstance()->lake_tablet_manager()->TEST_set_group_assigner(_group_assigner.get());
-        (void)fs::remove_all(kTestGroupPath);
-        CHECK_OK(fs::create_directories(kTestGroupPath));
-        CHECK_OK(_tablet_manager->put_tablet_metadata(kTestGroupPath, *_tablet_metadata));
+        clear_and_init_test_dir();
+        CHECK_OK(_tablet_mgr->put_tablet_metadata(*_tablet_metadata));
     }
 
-    void TearDown() override {
-        ASSIGN_OR_ABORT(auto tablet, _tablet_manager->get_tablet(_tablet_metadata->id()));
-        tablet.delete_txn_log(_txn_id);
-        _txn_id++;
-        (void)ExecEnv::GetInstance()->lake_tablet_manager()->TEST_set_group_assigner(_backup_group_assigner);
-        (void)fs::remove_all(kTestGroupPath);
-    }
+    void TearDown() override { remove_test_dir_ignore_error(); }
 
-    VChunk generate_data(int64_t chunk_size) {
+    Chunk generate_data(int64_t chunk_size) {
         std::vector<int> v0(chunk_size);
         std::vector<int> v1(chunk_size);
         for (int i = 0; i < chunk_size; i++) {
@@ -114,54 +76,46 @@ protected:
         auto c1 = Int32Column::create();
         c0->append_numbers(v0.data(), v0.size() * sizeof(int));
         c1->append_numbers(v1.data(), v1.size() * sizeof(int));
-        return VChunk({c0, c1}, _schema);
+        return Chunk({c0, c1}, _schema);
     }
 
-    constexpr static const char* const kTestGroupPath = "test_lake_async_delta_writer";
+    constexpr static const char* const kTestDirectory = "test_lake_async_delta_writer";
 
-    TabletManager* _tablet_manager;
-    std::unique_ptr<MemTracker> _parent_mem_tracker;
-    std::unique_ptr<MemTracker> _mem_tracker;
-    std::unique_ptr<TestGroupAssigner> _group_assigner;
-    GroupAssigner* _backup_group_assigner;
-    std::unique_ptr<TabletMetadata> _tablet_metadata;
+    int64_t _partition_id;
+    std::shared_ptr<TabletMetadata> _tablet_metadata;
     std::shared_ptr<TabletSchema> _tablet_schema;
-    std::shared_ptr<VSchema> _schema;
-    int64_t _txn_id = 123;
-    int64_t _partition_id = 456;
+    std::shared_ptr<Schema> _schema;
+    RuntimeProfile _dummy_runtime_profile{"dummy"};
 };
 
-TEST_F(AsyncDeltaWriterTest, test_open) {
+TEST_F(LakeAsyncDeltaWriterTest, test_open) {
     // Invalid tablet id
     {
+        auto txn_id = next_id();
         auto tablet_id = -1;
-        auto delta_writer = AsyncDeltaWriter::create(tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
-        ASSERT_ERROR(delta_writer->open());
-        ASSERT_ERROR(delta_writer->open());
+        ASSIGN_OR_ABORT(auto delta_writer, AsyncDeltaWriterBuilder()
+                                                   .set_tablet_manager(_tablet_mgr.get())
+                                                   .set_tablet_id(tablet_id)
+                                                   .set_txn_id(txn_id)
+                                                   .set_partition_id(_partition_id)
+                                                   .set_mem_tracker(_mem_tracker.get())
+                                                   .set_schema_id(_tablet_schema->id())
+                                                   .build());
+        ASSERT_OK(delta_writer->open());
         delta_writer->close();
-    }
-    // GroupAssigner returns error
-    {
-        class MockGroupAssigner : public GroupAssigner {
-        public:
-            StatusOr<std::string> get_group(int64_t) override { return Status::InternalError("injected error"); }
-            Status list_group(std::set<std::string>*) override { return Status::InternalError("injected error"); }
-        };
-        MockGroupAssigner mock;
-        auto old = _tablet_manager->TEST_set_group_assigner(&mock);
-
-        auto tablet_id = _tablet_metadata->id();
-        auto delta_writer = AsyncDeltaWriter::create(tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
-        ASSERT_ERROR(delta_writer->open());
-        ASSERT_ERROR(delta_writer->open());
-        delta_writer->close();
-
-        (void)_tablet_manager->TEST_set_group_assigner(old);
     }
     // Call open() multiple times
     {
+        auto txn_id = next_id();
         auto tablet_id = _tablet_metadata->id();
-        auto delta_writer = AsyncDeltaWriter::create(tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
+        ASSIGN_OR_ABORT(auto delta_writer, AsyncDeltaWriterBuilder()
+                                                   .set_tablet_manager(_tablet_mgr.get())
+                                                   .set_tablet_id(tablet_id)
+                                                   .set_txn_id(txn_id)
+                                                   .set_partition_id(_partition_id)
+                                                   .set_mem_tracker(_mem_tracker.get())
+                                                   .set_schema_id(_tablet_schema->id())
+                                                   .build());
         ASSERT_OK(delta_writer->open());
         ASSERT_OK(delta_writer->open());
         ASSERT_OK(delta_writer->open());
@@ -169,8 +123,16 @@ TEST_F(AsyncDeltaWriterTest, test_open) {
     }
     // Call open() concurrently
     {
+        auto txn_id = next_id();
         auto tablet_id = _tablet_metadata->id();
-        auto delta_writer = AsyncDeltaWriter::create(tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
+        ASSIGN_OR_ABORT(auto delta_writer, AsyncDeltaWriterBuilder()
+                                                   .set_tablet_manager(_tablet_mgr.get())
+                                                   .set_tablet_id(tablet_id)
+                                                   .set_txn_id(txn_id)
+                                                   .set_partition_id(_partition_id)
+                                                   .set_mem_tracker(_mem_tracker.get())
+                                                   .set_schema_id(_tablet_schema->id())
+                                                   .build());
         auto t1 = std::thread([&]() {
             for (int i = 0; i < 10000; i++) {
                 ASSERT_OK(delta_writer->open());
@@ -187,7 +149,7 @@ TEST_F(AsyncDeltaWriterTest, test_open) {
     }
 }
 
-TEST_F(AsyncDeltaWriterTest, test_write) {
+TEST_F(LakeAsyncDeltaWriterTest, test_write) {
     // Prepare data for writing
     static const int kChunkSize = 128;
     auto chunk0 = generate_data(kChunkSize);
@@ -197,8 +159,16 @@ TEST_F(AsyncDeltaWriterTest, test_write) {
     }
 
     // Create and open DeltaWriter
+    auto txn_id = next_id();
     auto tablet_id = _tablet_metadata->id();
-    auto delta_writer = AsyncDeltaWriter::create(tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
+    ASSIGN_OR_ABORT(auto delta_writer, AsyncDeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_schema_id(_tablet_schema->id())
+                                               .build());
     ASSERT_OK(delta_writer->open());
     // Call open() again
     ASSERT_OK(delta_writer->open());
@@ -209,8 +179,8 @@ TEST_F(AsyncDeltaWriterTest, test_write) {
     // Write
     delta_writer->write(&chunk0, indexes.data(), indexes.size(), [&](const Status& st) { ASSERT_OK(st); });
     // finish
-    delta_writer->finish([&](const Status& st) {
-        ASSERT_OK(st);
+    delta_writer->finish([&](StatusOr<TxnLogPtr> res) {
+        ASSERT_TRUE(res.ok()) << res.ok();
         latch.count_down();
     });
 
@@ -220,10 +190,10 @@ TEST_F(AsyncDeltaWriterTest, test_write) {
     delta_writer->close();
 
     // Check TxnLog
-    ASSIGN_OR_ABORT(auto tablet, _tablet_manager->get_tablet(tablet_id));
-    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(_txn_id));
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id));
+    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(txn_id));
     ASSERT_EQ(tablet_id, txnlog->tablet_id());
-    ASSERT_EQ(_txn_id, txnlog->txn_id());
+    ASSERT_EQ(txn_id, txnlog->txn_id());
     ASSERT_TRUE(txnlog->has_op_write());
     ASSERT_FALSE(txnlog->has_op_compaction());
     ASSERT_FALSE(txnlog->has_op_schema_change());
@@ -232,13 +202,12 @@ TEST_F(AsyncDeltaWriterTest, test_write) {
     ASSERT_FALSE(txnlog->op_write().rowset().overlapped());
     ASSERT_EQ(2 * kChunkSize, txnlog->op_write().rowset().num_rows());
     ASSERT_GT(txnlog->op_write().rowset().data_size(), 0);
-    ASSERT_EQ(0, txnlog->op_write().rowset().del_vectors_size());
 
     // Check segment file
-    ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(kTestGroupPath));
-    auto path0 = fmt::format("{}/{}", kTestGroupPath, txnlog->op_write().rowset().segments(0));
+    ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(kTestDirectory));
+    auto path0 = _tablet_mgr->segment_location(tablet_id, txnlog->op_write().rowset().segments(0));
 
-    ASSIGN_OR_ABORT(auto seg0, Segment::open(_mem_tracker.get(), fs, path0, 0, _tablet_schema.get()));
+    ASSIGN_OR_ABORT(auto seg0, Segment::open(fs, FileInfo{path0}, 0, _tablet_schema));
 
     OlapReaderStatistics statistics;
     SegmentReadOptions opts;
@@ -247,7 +216,7 @@ TEST_F(AsyncDeltaWriterTest, test_write) {
     opts.stats = &statistics;
     opts.chunk_size = 1024;
 
-    auto check_segment = [&](SegmentSharedPtr segment) {
+    auto check_segment = [&](const SegmentSharedPtr& segment) {
         ASSIGN_OR_ABORT(auto seg_iter, segment->new_iterator(*_schema, opts));
         auto read_chunk_ptr = ChunkHelper::new_chunk(*_schema, 1024);
         ASSERT_OK(seg_iter->get_next(read_chunk_ptr.get()));
@@ -264,7 +233,7 @@ TEST_F(AsyncDeltaWriterTest, test_write) {
     check_segment(seg0);
 }
 
-TEST_F(AsyncDeltaWriterTest, test_write_concurrently) {
+TEST_F(LakeAsyncDeltaWriterTest, test_write_concurrently) {
     // Prepare data for writing
     static const int kChunkSize = 128;
     auto chunk0 = generate_data(kChunkSize);
@@ -274,8 +243,16 @@ TEST_F(AsyncDeltaWriterTest, test_write_concurrently) {
     }
 
     // Create and open DeltaWriter
+    auto txn_id = next_id();
     auto tablet_id = _tablet_metadata->id();
-    auto delta_writer = AsyncDeltaWriter::create(tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
+    ASSIGN_OR_ABORT(auto delta_writer, AsyncDeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_schema_id(_tablet_schema->id())
+                                               .build());
 
     ASSERT_OK(delta_writer->open());
 
@@ -304,8 +281,8 @@ TEST_F(AsyncDeltaWriterTest, test_write_concurrently) {
 
     // finish
     CountDownLatch latch(1);
-    delta_writer->finish([&](const Status& st) {
-        ASSERT_OK(st);
+    delta_writer->finish([&](StatusOr<TxnLogPtr> res) {
+        ASSERT_TRUE(res.ok()) << res.status();
         latch.count_down();
     });
 
@@ -315,10 +292,10 @@ TEST_F(AsyncDeltaWriterTest, test_write_concurrently) {
     delta_writer->close();
 
     // Check TxnLog
-    ASSIGN_OR_ABORT(auto tablet, _tablet_manager->get_tablet(tablet_id));
-    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(_txn_id));
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id));
+    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(txn_id));
     ASSERT_EQ(tablet_id, txnlog->tablet_id());
-    ASSERT_EQ(_txn_id, txnlog->txn_id());
+    ASSERT_EQ(txn_id, txnlog->txn_id());
     ASSERT_TRUE(txnlog->has_op_write());
     ASSERT_FALSE(txnlog->has_op_compaction());
     ASSERT_FALSE(txnlog->has_op_schema_change());
@@ -327,13 +304,12 @@ TEST_F(AsyncDeltaWriterTest, test_write_concurrently) {
     ASSERT_FALSE(txnlog->op_write().rowset().overlapped());
     ASSERT_EQ(kNumThreads * kChunksPerThread * kChunkSize, txnlog->op_write().rowset().num_rows());
     ASSERT_GT(txnlog->op_write().rowset().data_size(), 0);
-    ASSERT_EQ(0, txnlog->op_write().rowset().del_vectors_size());
 
     // Check segment file
-    ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(kTestGroupPath));
-    auto path0 = fmt::format("{}/{}", kTestGroupPath, txnlog->op_write().rowset().segments(0));
+    ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(kTestDirectory));
+    auto path0 = _tablet_mgr->segment_location(tablet_id, txnlog->op_write().rowset().segments(0));
 
-    ASSIGN_OR_ABORT(auto seg0, Segment::open(_mem_tracker.get(), fs, path0, 0, _tablet_schema.get()));
+    ASSIGN_OR_ABORT(auto seg0, Segment::open(fs, FileInfo{path0}, 0, _tablet_schema));
 
     OlapReaderStatistics statistics;
     SegmentReadOptions opts;
@@ -342,7 +318,7 @@ TEST_F(AsyncDeltaWriterTest, test_write_concurrently) {
     opts.stats = &statistics;
     opts.chunk_size = kNumThreads * kChunksPerThread * kChunkSize;
 
-    auto check_segment = [&](SegmentSharedPtr segment) {
+    auto check_segment = [&](const SegmentSharedPtr& segment) {
         ASSIGN_OR_ABORT(auto seg_iter, segment->new_iterator(*_schema, opts));
         auto read_chunk_ptr = ChunkHelper::new_chunk(*_schema, opts.chunk_size);
         ASSERT_OK(seg_iter->get_next(read_chunk_ptr.get()));
@@ -359,7 +335,7 @@ TEST_F(AsyncDeltaWriterTest, test_write_concurrently) {
     check_segment(seg0);
 }
 
-TEST_F(AsyncDeltaWriterTest, test_write_after_close) {
+TEST_F(LakeAsyncDeltaWriterTest, test_write_after_close) {
     // Prepare data for writing
     static const int kChunkSize = 128;
     auto chunk0 = generate_data(kChunkSize);
@@ -369,8 +345,16 @@ TEST_F(AsyncDeltaWriterTest, test_write_after_close) {
     }
 
     // Create and open DeltaWriter
+    auto txn_id = next_id();
     auto tablet_id = _tablet_metadata->id();
-    auto delta_writer = AsyncDeltaWriter::create(tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
+    ASSIGN_OR_ABORT(auto delta_writer, AsyncDeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_schema_id(_tablet_schema->id())
+                                               .build());
     ASSERT_OK(delta_writer->open());
 
     // close()
@@ -384,21 +368,29 @@ TEST_F(AsyncDeltaWriterTest, test_write_after_close) {
     });
 
     // TxnLog should not exist
-    ASSIGN_OR_ABORT(auto tablet, _tablet_manager->get_tablet(tablet_id));
-    ASSERT_TRUE(tablet.get_txn_log(_txn_id).status().is_not_found());
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id));
+    ASSERT_TRUE(tablet.get_txn_log(txn_id).status().is_not_found());
 
     // Segment file should not exist
-    ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(kTestGroupPath));
-    ASSERT_OK(fs->iterate_dir(kTestGroupPath, [&](std::string_view name) {
-        EXPECT_TRUE(HasPrefixString(name, "tbl_"));
+    ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(kTestDirectory));
+    ASSERT_OK(fs->iterate_dir(join_path(kTestDirectory, kMetadataDirectoryName), [&](std::string_view name) {
+        EXPECT_TRUE(is_tablet_metadata(name)) << name;
         return true;
     }));
 }
 
-TEST_F(AsyncDeltaWriterTest, test_finish_after_close) {
+TEST_F(LakeAsyncDeltaWriterTest, test_finish_after_close) {
     // Create and open DeltaWriter
+    auto txn_id = next_id();
     auto tablet_id = _tablet_metadata->id();
-    auto delta_writer = AsyncDeltaWriter::create(tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
+    ASSIGN_OR_ABORT(auto delta_writer, AsyncDeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_schema_id(_tablet_schema->id())
+                                               .build());
     ASSERT_OK(delta_writer->open());
 
     // close()
@@ -406,17 +398,25 @@ TEST_F(AsyncDeltaWriterTest, test_finish_after_close) {
 
     auto tid = std::this_thread::get_id();
     // finish()
-    delta_writer->finish([&](const Status& st) {
-        ASSERT_ERROR(st);
+    delta_writer->finish([&](StatusOr<TxnLogPtr> res) {
+        ASSERT_FALSE(res.ok());
         ASSERT_EQ(tid, std::this_thread::get_id());
     });
 }
 
-TEST_F(AsyncDeltaWriterTest, test_close) {
+TEST_F(LakeAsyncDeltaWriterTest, test_close) {
     // Call close() multiple times
     {
+        auto txn_id = next_id();
         auto tablet_id = _tablet_metadata->id();
-        auto delta_writer = AsyncDeltaWriter::create(tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
+        ASSIGN_OR_ABORT(auto delta_writer, AsyncDeltaWriterBuilder()
+                                                   .set_tablet_manager(_tablet_mgr.get())
+                                                   .set_tablet_id(tablet_id)
+                                                   .set_txn_id(txn_id)
+                                                   .set_partition_id(_partition_id)
+                                                   .set_mem_tracker(_mem_tracker.get())
+                                                   .set_schema_id(_tablet_schema->id())
+                                                   .build());
         ASSERT_OK(delta_writer->open());
 
         delta_writer->close();
@@ -424,8 +424,16 @@ TEST_F(AsyncDeltaWriterTest, test_close) {
     }
     // Call close() concurrently
     {
+        auto txn_id = next_id();
         auto tablet_id = _tablet_metadata->id();
-        auto delta_writer = AsyncDeltaWriter::create(tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
+        ASSIGN_OR_ABORT(auto delta_writer, AsyncDeltaWriterBuilder()
+                                                   .set_tablet_manager(_tablet_mgr.get())
+                                                   .set_tablet_id(tablet_id)
+                                                   .set_txn_id(txn_id)
+                                                   .set_partition_id(_partition_id)
+                                                   .set_mem_tracker(_mem_tracker.get())
+                                                   .set_schema_id(_tablet_schema->id())
+                                                   .build());
         ASSERT_OK(delta_writer->open());
         auto t1 = std::thread([&]() {
             for (int i = 0; i < 10000; i++) {
@@ -440,6 +448,162 @@ TEST_F(AsyncDeltaWriterTest, test_close) {
         t1.join();
         t2.join();
     }
+}
+
+TEST_F(LakeAsyncDeltaWriterTest, test_open_after_close) {
+    auto txn_id = next_id();
+    auto tablet_id = _tablet_metadata->id();
+    ASSIGN_OR_ABORT(auto delta_writer, AsyncDeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_schema_id(_tablet_schema->id())
+                                               .build());
+    ASSERT_OK(delta_writer->open());
+    delta_writer->close();
+    auto st = delta_writer->open();
+    ASSERT_FALSE(st.ok());
+    ASSERT_EQ("AsyncDeltaWriter has been closed", st.message());
+}
+
+TEST_F(LakeAsyncDeltaWriterTest, test_concurrent_write_and_close) {
+    // Prepare data for writing
+    static const int kChunkSize = 128;
+    auto chunk0 = generate_data(kChunkSize);
+    auto indexes = std::vector<uint32_t>(kChunkSize);
+    for (int i = 0; i < kChunkSize; i++) {
+        indexes[i] = i;
+    }
+
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    SyncPoint::GetInstance()->LoadDependency({{"AsyncDeltaWriterImpl::close:1", "AsyncDeltaWriterImpl::execute:1"}});
+
+    // Create and open DeltaWriter
+    auto txn_id = next_id();
+    auto tablet_id = _tablet_metadata->id();
+    ASSIGN_OR_ABORT(auto delta_writer, AsyncDeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_schema_id(_tablet_schema->id())
+                                               .build());
+    ASSERT_OK(delta_writer->open());
+
+    auto tid = std::this_thread::get_id();
+    // write()
+    delta_writer->write(&chunk0, indexes.data(), indexes.size(), [&](const Status& st) {
+        ASSERT_ERROR(st);
+        ASSERT_NE(tid, std::this_thread::get_id());
+    });
+
+    // close()
+    delta_writer->close();
+
+    // TxnLog should not exist
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id));
+    ASSERT_TRUE(tablet.get_txn_log(txn_id).status().is_not_found());
+
+    // Segment file should not exist
+    ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(kTestDirectory));
+    ASSERT_OK(fs->iterate_dir(join_path(kTestDirectory, kMetadataDirectoryName), [&](std::string_view name) {
+        EXPECT_TRUE(is_tablet_metadata(name)) << name;
+        return true;
+    }));
+
+    SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(LakeAsyncDeltaWriterTest, test_flush) {
+    // Prepare data for writing
+    static const int kChunkSize = 128;
+    auto chunk0 = generate_data(kChunkSize);
+    auto indexes = std::vector<uint32_t>(kChunkSize);
+    for (int i = 0; i < kChunkSize; i++) {
+        indexes[i] = i;
+    }
+
+    auto txn_id = next_id();
+    auto tablet_id = _tablet_metadata->id();
+    CountDownLatch latch(1);
+    ASSIGN_OR_ABORT(auto delta_writer, AsyncDeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_schema_id(_tablet_schema->id())
+                                               .set_profile(&_dummy_runtime_profile)
+                                               .build());
+    ASSERT_OK(delta_writer->open());
+    delta_writer->write(&chunk0, indexes.data(), indexes.size(), [&](const Status& st) { ASSERT_OK(st); });
+    delta_writer->flush([&](const Status& st) {
+        ASSERT_OK(st);
+        latch.count_down();
+    });
+    latch.wait();
+    while (delta_writer->queueing_memtable_num() > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    EXPECT_EQ(0, delta_writer->queueing_memtable_num());
+
+    // test flush after close
+    SyncPoint::GetInstance()->LoadDependency({{"AsyncDeltaWriterImpl::close:2", "AsyncDeltaWriterImpl::execute:1"}});
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([&]() { SyncPoint::GetInstance()->DisableProcessing(); });
+    delta_writer->flush([&](const Status& st) { ASSERT_ERROR(st); });
+    delta_writer->close();
+}
+
+TEST_F(LakeAsyncDeltaWriterTest, test_block_merger) {
+    // Prepare data for writing
+    static const int kChunkSize = 128;
+    auto chunk0 = generate_data(kChunkSize);
+    auto indexes = std::vector<uint32_t>(kChunkSize);
+    for (int i = 0; i < kChunkSize; i++) {
+        indexes[i] = i;
+    }
+
+    auto txn_id = next_id();
+    auto tablet_id = _tablet_metadata->id();
+    StorageEngine::instance()->load_spill_block_merge_executor()->refresh_max_thread_num();
+    CountDownLatch latch(10);
+    // flush multi times and generate spill blocks
+    int64_t old_val = config::write_buffer_size;
+    bool old_val2 = config::enable_load_spill;
+    config::write_buffer_size = 1;
+    config::enable_load_spill = true;
+    ASSIGN_OR_ABORT(auto delta_writer, AsyncDeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_schema_id(_tablet_schema->id())
+                                               .set_profile(&_dummy_runtime_profile)
+                                               .build());
+    ASSERT_OK(delta_writer->open());
+    for (int i = 0; i < 10; i++) {
+        delta_writer->write(&chunk0, indexes.data(), indexes.size(), [&](const Status& st) { ASSERT_OK(st); });
+        delta_writer->flush([&](const Status& st) {
+            ASSERT_OK(st);
+            latch.count_down();
+        });
+    }
+    latch.wait();
+    config::write_buffer_size = old_val;
+    config::enable_load_spill = old_val2;
+    // finish
+    CountDownLatch latch2(1);
+    delta_writer->finish([&](StatusOr<TxnLogPtr> res) {
+        ASSERT_TRUE(res.ok()) << res.ok();
+        latch2.count_down();
+    });
+    latch2.wait();
 }
 
 } // namespace starrocks::lake

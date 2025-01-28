@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/planner/HashJoinNode.java
 
@@ -22,17 +35,23 @@
 package com.starrocks.planner;
 
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.JoinOperator;
+import com.starrocks.analysis.SlotId;
+import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TableRef;
+import com.starrocks.common.Config;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.SessionVariable;
 import com.starrocks.thrift.TEqJoinCondition;
 import com.starrocks.thrift.THashJoinNode;
+import com.starrocks.thrift.TNormalHashJoinNode;
+import com.starrocks.thrift.TNormalPlanNode;
 import com.starrocks.thrift.TPlanNode;
 import com.starrocks.thrift.TPlanNodeType;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -40,13 +59,7 @@ import java.util.List;
  * The right child must be a leaf node, ie, can only materialize
  * a single input tuple.
  */
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public class HashJoinNode extends JoinNode {
-    private static final Logger LOG = LogManager.getLogger(HashJoinNode.class);
-
-
     public HashJoinNode(PlanNodeId id, PlanNode outer, PlanNode inner, TableRef innerRef,
                         List<Expr> eqJoinConjuncts, List<Expr> otherJoinConjuncts) {
         super("HASH JOIN", id, outer, inner, innerRef, eqJoinConjuncts, otherJoinConjuncts);
@@ -56,7 +69,6 @@ public class HashJoinNode extends JoinNode {
                         List<Expr> eqJoinConjuncts, List<Expr> otherJoinConjuncts) {
         super("HASH JOIN", id, outer, inner, joinOp, eqJoinConjuncts, otherJoinConjuncts);
     }
-
 
     @Override
     protected void toThrift(TPlanNode msg) {
@@ -105,8 +117,23 @@ public class HashJoinNode extends JoinNode {
             msg.hash_join_node.setBuild_runtime_filters(
                     RuntimeFilterDescription.toThriftRuntimeFilterDescriptions(buildRuntimeFilters));
         }
-        msg.hash_join_node.setBuild_runtime_filters_from_planner(
-                ConnectContext.get().getSessionVariable().getEnableGlobalRuntimeFilter());
+        SessionVariable sv = ConnectContext.get().getSessionVariable();
+
+        msg.hash_join_node.setLate_materialization(enableLateMaterialization);
+        // predicate filtration rate
+        double predicateRate = getCardinality() / (double) getChild(0).getCardinality();
+        if (enableLateMaterialization) {
+            // If join late materialize is turned on higher filtering can lead to performance degradation.
+            if (predicateRate > Config.partition_hash_join_min_cardinality_rate) {
+                msg.hash_join_node.setEnable_partition_hash_join(sv.enablePartitionHashJoin());
+            } else {
+                msg.hash_join_node.setEnable_partition_hash_join(false);
+            }
+        } else {
+            msg.hash_join_node.setEnable_partition_hash_join(sv.enablePartitionHashJoin());
+        }
+        msg.hash_join_node.setBuild_runtime_filters_from_planner(sv.getEnableGlobalRuntimeFilter());
+
         if (partitionExprs != null) {
             msg.hash_join_node.setPartition_exprs(Expr.treesToThrift(partitionExprs));
         }
@@ -115,6 +142,57 @@ public class HashJoinNode extends JoinNode {
         if (outputSlots != null) {
             msg.hash_join_node.setOutput_columns(outputSlots);
         }
+
+        if (getCanLocalShuffle()) {
+            msg.hash_join_node.setInterpolate_passthrough(sv.isHashJoinInterpolatePassthrough());
+        }
     }
 
+    @Override
+    protected void toNormalForm(TNormalPlanNode planNode, FragmentNormalizer normalizer) {
+        TNormalHashJoinNode hashJoinNode = new TNormalHashJoinNode();
+        hashJoinNode.setJoin_op(getJoinOp().toThrift());
+        hashJoinNode.setDistribution_mode(getDistrMode().toThrift());
+        hashJoinNode.setEq_join_conjuncts(normalizer.normalizeExprs(new ArrayList<>(eqJoinConjuncts)));
+        hashJoinNode.setOther_join_conjuncts(normalizer.normalizeExprs(otherJoinConjuncts));
+        hashJoinNode.setIs_rewritten_from_not_in(innerRef != null && innerRef.isJoinRewrittenFromNotIn());
+        hashJoinNode.setPartition_exprs(normalizer.normalizeOrderedExprs(partitionExprs));
+        hashJoinNode.setOutput_columns(normalizer.remapIntegerSlotIds(outputSlots));
+        hashJoinNode.setLate_materialization(enableLateMaterialization);
+        planNode.setHash_join_node(hashJoinNode);
+        planNode.setNode_type(TPlanNodeType.HASH_JOIN_NODE);
+        normalizeConjuncts(normalizer, planNode, conjuncts);
+    }
+
+    @Override
+    public void collectEquivRelation(FragmentNormalizer normalizer) {
+        if (!joinOp.isSemiJoin() && !joinOp.isInnerJoin()) {
+            return;
+        }
+        for (BinaryPredicate eq : eqJoinConjuncts) {
+            if (!eq.getOp().equals(BinaryType.EQ)) {
+                continue;
+            }
+            SlotId lhsSlotId = ((SlotRef) eq.getChild(0)).getSlotId();
+            SlotId rhsSlotId = ((SlotRef) eq.getChild(1)).getSlotId();
+            normalizer.getEquivRelation().union(lhsSlotId, rhsSlotId);
+        }
+    }
+
+    @Override
+    public boolean extractConjunctsToNormalize(FragmentNormalizer normalizer) {
+        if (!joinOp.isInnerJoin() && joinOp.isSemiJoin()) {
+            return false;
+        }
+        return super.extractConjunctsToNormalize(normalizer);
+    }
+
+    @Override
+    public boolean canUseRuntimeAdaptiveDop() {
+        if (joinOp.isRightJoin() || joinOp.isFullOuterJoin()) {
+            return false;
+        }
+
+        return getChildren().stream().allMatch(PlanNode::canUseRuntimeAdaptiveDop);
+    }
 }

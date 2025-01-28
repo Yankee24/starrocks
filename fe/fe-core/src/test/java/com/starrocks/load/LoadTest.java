@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.load;
 
@@ -6,10 +19,10 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.ArithmeticExpr;
+import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.DescriptorTable;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionCallExpr;
-import com.starrocks.analysis.ImportColumnDesc;
 import com.starrocks.analysis.IntLiteral;
 import com.starrocks.analysis.SlotDescriptor;
 import com.starrocks.analysis.SlotRef;
@@ -22,8 +35,12 @@ import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.RandomDistributionInfo;
 import com.starrocks.catalog.SinglePartitionInfo;
 import com.starrocks.catalog.Type;
-import com.starrocks.common.UserException;
+import com.starrocks.common.AnalysisException;
+import com.starrocks.common.ExceptionChecker;
+import com.starrocks.common.StarRocksException;
+import com.starrocks.sql.ast.ImportColumnDesc;
 import com.starrocks.thrift.TBrokerScanRangeParams;
+import com.starrocks.thrift.TFileFormatType;
 import mockit.Expectations;
 import mockit.Mocked;
 import org.junit.Assert;
@@ -64,6 +81,7 @@ public class LoadTest {
             {
                 analyzer.getDescTbl();
                 result = descTable;
+                minTimes = 0;
             }
         };
 
@@ -76,7 +94,7 @@ public class LoadTest {
     }
 
     @Test
-    public void testInitColumnsPathColumns() throws UserException {
+    public void testInitColumnsPathColumns() throws StarRocksException {
         // columns
         String c0Name = "c0";
         columns.add(new Column(c0Name, Type.INT, true, null, true, null, ""));
@@ -91,7 +109,9 @@ public class LoadTest {
         List<Expr> params1 = Lists.newArrayList();
         params1.add(new SlotRef(null, c1Name));
         Expr mapping1 = new FunctionCallExpr(FunctionSet.YEAR, params1);
-        columnExprs.add(new ImportColumnDesc(c1Name, mapping1));
+        CompoundPredicate compoundPredicate = new CompoundPredicate(CompoundPredicate.Operator.OR,
+                mapping1, new SlotRef(null, c0Name));
+        columnExprs.add(new ImportColumnDesc(c1Name, compoundPredicate));
 
         // c1 is from path
         // path/c1=2021-03-01/file
@@ -119,7 +139,7 @@ public class LoadTest {
     }
 
     @Test
-    public void testInitColumnsColumnInSchemaAndExprArgs() throws UserException {
+    public void testInitColumnsColumnInSchemaAndExprArgs() throws StarRocksException {
         table = new OlapTable(1, "test", columns, KeysType.AGG_KEYS,
                 new SinglePartitionInfo(), new RandomDistributionInfo(3));
 
@@ -196,7 +216,7 @@ public class LoadTest {
      * set (C1 = year(c1))
      */
     @Test
-    public void testSourceColumnCaseSensitive() throws UserException {
+    public void testSourceColumnCaseSensitive() throws StarRocksException {
         // columns
         String c0Name = "c0";
         columns.add(new Column(c0Name, Type.INT, true, null, true, null, ""));
@@ -234,5 +254,58 @@ public class LoadTest {
         Assert.assertEquals(2, slotDescByName.size());
         Assert.assertFalse(slotDescByName.containsKey(c1Name));
         Assert.assertTrue(slotDescByName.containsKey(c1NameInSource));
+    }
+
+    /**
+     * set (c1 = year())
+     */
+    @Test
+    public void testMappingExprInvalid() {
+        // columns
+        String c0Name = "c0";
+        columns.add(new Column(c0Name, Type.INT, true, null, true, null, ""));
+        columnExprs.add(new ImportColumnDesc(c0Name, null));
+
+        String c1Name = "c1";
+        columns.add(new Column(c1Name, Type.INT, true, null, true, null, ""));
+
+        // column mappings
+        // c1 = year()
+        List<Expr> params1 = Lists.newArrayList();
+        Expr mapping1 = new FunctionCallExpr(FunctionSet.YEAR, params1);
+        columnExprs.add(new ImportColumnDesc(c1Name, mapping1));
+
+        new Expectations() {
+            {
+                table.getBaseSchema();
+                result = columns;
+                table.getColumn(c0Name);
+                result = columns.get(0);
+                table.getColumn(c1Name);
+                result = columns.get(1);
+            }
+        };
+
+        ExceptionChecker.expectThrowsWithMsg(AnalysisException.class,
+                "Expr 'year()' analyze error: No matching function with signature: year(), derived column is 'c1'",
+                () -> Load.initColumns(table, columnExprs, null, exprsByName, analyzer, srcTupleDesc,
+                        slotDescByName, params, true, true, columnsFromPath));
+    }
+
+    @Test
+    public void testGetFormatType() {
+        Assert.assertEquals(TFileFormatType.FORMAT_PARQUET, Load.getFormatType("parquet", "hdfs://127.0.0.1:9000/some_file"));
+        Assert.assertEquals(TFileFormatType.FORMAT_ORC, Load.getFormatType("orc", "hdfs://127.0.0.1:9000/some_file"));
+        Assert.assertEquals(TFileFormatType.FORMAT_JSON, Load.getFormatType("json", "hdfs://127.0.0.1:9000/some_file"));
+
+        Assert.assertEquals(TFileFormatType.FORMAT_PARQUET, Load.getFormatType("", "hdfs://127.0.0.1:9000/some_file.parq"));
+        Assert.assertEquals(TFileFormatType.FORMAT_PARQUET, Load.getFormatType("", "hdfs://127.0.0.1:9000/some_file.parquet"));
+        Assert.assertEquals(TFileFormatType.FORMAT_ORC, Load.getFormatType("", "hdfs://127.0.0.1:9000/some_file.orc"));
+        Assert.assertEquals(TFileFormatType.FORMAT_CSV_GZ, Load.getFormatType("csv", "hdfs://127.0.0.1:9000/some_file.gz"));
+        Assert.assertEquals(TFileFormatType.FORMAT_CSV_BZ2, Load.getFormatType("csv", "hdfs://127.0.0.1:9000/some_file.bz2"));
+        Assert.assertEquals(TFileFormatType.FORMAT_CSV_LZ4_FRAME, Load.getFormatType("csv", "hdfs://127.0.0.1:9000/some_file.lz4"));
+        Assert.assertEquals(TFileFormatType.FORMAT_CSV_DEFLATE, Load.getFormatType("csv", "hdfs://127.0.0.1:9000/some_file.deflate"));
+        Assert.assertEquals(TFileFormatType.FORMAT_CSV_ZSTD, Load.getFormatType("csv", "hdfs://127.0.0.1:9000/some_file.zst"));
+        Assert.assertEquals(TFileFormatType.FORMAT_CSV_PLAIN, Load.getFormatType("csv", "hdfs://127.0.0.1:9000/some_file"));
     }
 }

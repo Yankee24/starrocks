@@ -1,10 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "fs/fs_memory.h"
 
 #include <butil/files/file_path.h>
 #include <fmt/format.h>
 
+#include "fs/encrypt_file.h"
 #include "io/array_input_stream.h"
 #include "util/raw_container.h"
 
@@ -38,8 +51,9 @@ private:
 
 class MemoryWritableFile final : public WritableFile {
 public:
-    MemoryWritableFile(std::string path, InodePtr inode)
-            : _path(std::move(path)), _inode(std::move(inode)), _closed(false) {}
+    MemoryWritableFile(std::string path, InodePtr inode) : _path(std::move(path)), _inode(std::move(inode)) {
+        FileSystem::on_file_write_open(this);
+    }
 
     Status append(const Slice& data) override {
         if (_closed) return Status::IOError(fmt::format("{} has been closed", _path));
@@ -49,7 +63,7 @@ public:
 
     Status appendv(const Slice* data, size_t cnt) override {
         for (size_t i = 0; i < cnt; i++) {
-            (void)append(data[i]);
+            RETURN_IF_ERROR(append(data[i]));
         }
         return Status::OK();
     }
@@ -62,6 +76,7 @@ public:
 
     Status close() override {
         _closed = true;
+        FileSystem::on_file_write_close(this);
         return Status::OK();
     }
 
@@ -76,7 +91,7 @@ public:
 private:
     std::string _path;
     InodePtr _inode;
-    bool _closed;
+    bool _closed{false};
 };
 
 class EnvMemoryImpl {
@@ -86,18 +101,14 @@ public:
         _namespace["/"] = std::make_shared<Inode>(kDir, "");
     }
 
-    StatusOr<std::unique_ptr<SequentialFile>> new_sequential_file(const butil::FilePath& path) {
+    StatusOr<std::unique_ptr<SequentialFile>> new_sequential_file(const butil::FilePath& path,
+                                                                  const FileEncryptionInfo& info) {
         auto iter = _namespace.find(path.value());
         if (iter == _namespace.end()) {
             return Status::NotFound(path.value());
         } else {
-            auto stream = std::make_shared<MemoryFileInputStream>(iter->second);
-            return std::make_unique<SequentialFile>(std::move(stream), path.value());
+            return SequentialFile::from(std::make_unique<MemoryFileInputStream>(iter->second), path.value(), info);
         }
-    }
-
-    StatusOr<std::unique_ptr<RandomAccessFile>> new_random_access_file(const butil::FilePath& path) {
-        return new_random_access_file(RandomAccessFileOptions(), path);
     }
 
     StatusOr<std::unique_ptr<RandomAccessFile>> new_random_access_file(const RandomAccessFileOptions& opts,
@@ -106,13 +117,14 @@ public:
         if (iter == _namespace.end()) {
             return Status::NotFound(path.value());
         } else {
-            auto stream = std::make_unique<MemoryFileInputStream>(iter->second);
-            return std::make_unique<RandomAccessFile>(std::move(stream), path.value());
+            return RandomAccessFile::from(std::make_unique<MemoryFileInputStream>(iter->second), path.value(), false,
+                                          opts.encryption_info);
         }
     }
 
     template <typename DerivedType, typename BaseType>
-    StatusOr<std::unique_ptr<BaseType>> new_writable_file(FileSystem::OpenMode mode, const butil::FilePath& path) {
+    StatusOr<std::unique_ptr<BaseType>> new_writable_file(FileSystem::OpenMode mode, const butil::FilePath& path,
+                                                          const FileEncryptionInfo& info) {
         InodePtr inode = get_inode(path);
         if (mode == FileSystem::MUST_EXIST && inode == nullptr) {
             return Status::NotFound(path.value());
@@ -133,7 +145,7 @@ public:
         } else if (inode->type != kNormal) {
             return Status::IOError(path.value() + " is a directory");
         }
-        return std::make_unique<DerivedType>(path.value(), std::move(inode));
+        return wrap_encrypted(std::make_unique<DerivedType>(path.value(), std::move(inode)), info);
     }
 
     Status path_exists(const butil::FilePath& path) {
@@ -169,6 +181,42 @@ public:
                 continue;
             }
             if (!cb(child.data)) {
+                break;
+            }
+        }
+        return Status::OK();
+    }
+
+    Status iterate_dir2(const butil::FilePath& path, const std::function<bool(DirEntry)>& cb) {
+        auto inode = get_inode(path);
+        if (inode == nullptr || inode->type != kDir) {
+            return Status::NotFound(path.value());
+        }
+        DCHECK(path.value().back() != '/' || path.value() == "/");
+        std::string s = (path.value() == "/") ? path.value() : path.value() + "/";
+        for (auto iter = _namespace.lower_bound(s); iter != _namespace.end(); ++iter) {
+            Slice child(iter->first);
+            if (!child.starts_with(s)) {
+                break;
+            }
+            DirEntry entry;
+            ASSIGN_OR_RETURN(bool is_dir, is_directory(butil::FilePath(child.to_string())));
+            entry.is_dir = is_dir;
+            if (!is_dir) {
+                ASSIGN_OR_RETURN(int64_t size, get_file_size(butil::FilePath(child.to_string())));
+                entry.size = size;
+            }
+            // Get the relative path.
+            child.remove_prefix(s.size());
+            if (child.empty()) {
+                continue;
+            }
+            auto slash = (const char*)memchr(child.data, '/', child.size);
+            if (slash != nullptr) {
+                continue;
+            }
+            entry.name = child.data;
+            if (!cb(entry)) {
                 break;
             }
         }
@@ -368,20 +416,17 @@ MemoryFileSystem::~MemoryFileSystem() {
     delete _impl;
 }
 
-StatusOr<std::unique_ptr<SequentialFile>> MemoryFileSystem::new_sequential_file(const std::string& path) {
+StatusOr<std::unique_ptr<SequentialFile>> MemoryFileSystem::new_sequential_file(const SequentialFileOptions& opts,
+                                                                                const std::string& path) {
+    if (opts.encryption_info.is_encrypted()) return Status::NotSupported("MemoryFileSystem do not support encryption");
     std::string new_path;
     RETURN_IF_ERROR(canonicalize(path, &new_path));
-    return _impl->new_sequential_file(butil::FilePath(new_path));
-}
-
-StatusOr<std::unique_ptr<RandomAccessFile>> MemoryFileSystem::new_random_access_file(const std::string& path) {
-    std::string new_path;
-    RETURN_IF_ERROR(canonicalize(path, &new_path));
-    return _impl->new_random_access_file(butil::FilePath(new_path));
+    return _impl->new_sequential_file(butil::FilePath(new_path), opts.encryption_info);
 }
 
 StatusOr<std::unique_ptr<RandomAccessFile>> MemoryFileSystem::new_random_access_file(
         const RandomAccessFileOptions& opts, const std::string& path) {
+    if (opts.encryption_info.is_encrypted()) return Status::NotSupported("MemoryFileSystem do not support encryption");
     std::string new_path;
     RETURN_IF_ERROR(canonicalize(path, &new_path));
     return _impl->new_random_access_file(opts, butil::FilePath(new_path));
@@ -393,9 +438,11 @@ StatusOr<std::unique_ptr<WritableFile>> MemoryFileSystem::new_writable_file(cons
 
 StatusOr<std::unique_ptr<WritableFile>> MemoryFileSystem::new_writable_file(const WritableFileOptions& opts,
                                                                             const std::string& path) {
+    if (opts.encryption_info.is_encrypted()) return Status::NotSupported("MemoryFileSystem do not support encryption");
     std::string new_path;
     RETURN_IF_ERROR(canonicalize(path, &new_path));
-    return _impl->new_writable_file<MemoryWritableFile, WritableFile>(opts.mode, butil::FilePath(new_path));
+    return _impl->new_writable_file<MemoryWritableFile, WritableFile>(opts.mode, butil::FilePath(new_path),
+                                                                      opts.encryption_info);
 }
 
 Status MemoryFileSystem::path_exists(const std::string& path) {
@@ -415,6 +462,12 @@ Status MemoryFileSystem::iterate_dir(const std::string& dir, const std::function
     std::string new_path;
     RETURN_IF_ERROR(canonicalize(dir, &new_path));
     return _impl->iterate_dir(butil::FilePath(new_path), cb);
+}
+
+Status MemoryFileSystem::iterate_dir2(const std::string& dir, const std::function<bool(DirEntry)>& cb) {
+    std::string new_path;
+    RETURN_IF_ERROR(canonicalize(dir, &new_path));
+    return _impl->iterate_dir2(butil::FilePath(new_path), cb);
 }
 
 Status MemoryFileSystem::delete_file(const std::string& path) {
@@ -538,10 +591,28 @@ Status MemoryFileSystem::append_file(const std::string& path, const Slice& conte
 }
 
 Status MemoryFileSystem::read_file(const std::string& path, std::string* content) {
-    ASSIGN_OR_RETURN(auto random_access_file, new_random_access_file(path));
+    ASSIGN_OR_RETURN(auto random_access_file, new_random_access_file(RandomAccessFileOptions(), path));
     ASSIGN_OR_RETURN(const uint64_t size, random_access_file->get_size());
     raw::make_room(content, size);
     return random_access_file->read_at_fully(0, content->data(), content->size());
+}
+
+namespace {
+
+class MemoryInputStream : public io::SeekableInputStreamWrapper {
+public:
+    explicit MemoryInputStream(std::string_view data) : io::SeekableInputStreamWrapper(&_stream, kDontTakeOwnership) {
+        _stream.reset(data.data(), static_cast<int64_t>(data.size()));
+    }
+
+private:
+    io::ArrayInputStream _stream;
+};
+
+} // namespace
+
+std::unique_ptr<RandomAccessFile> new_random_access_file_from_memory(std::string_view name, std::string_view data) {
+    return std::make_unique<RandomAccessFile>(std::make_shared<MemoryInputStream>(data), std::string(name));
 }
 
 } // namespace starrocks

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/version_graph.cpp
 
@@ -27,6 +40,7 @@
 #include <queue>
 
 #include "common/logging.h"
+#include "util/ratelimit.h"
 #include "util/time.h"
 
 namespace starrocks {
@@ -34,8 +48,8 @@ namespace starrocks {
 void TimestampedVersionTracker::_construct_versioned_tracker(const std::vector<RowsetMetaSharedPtr>& rs_metas) {
     int64_t max_version = 0;
 
-    // construct the roset graph
-    _version_graph.reconstruct_version_graph(rs_metas, &max_version);
+    // construct the rowset graph
+    _version_graph.construct_version_graph(rs_metas, &max_version);
 }
 
 void TimestampedVersionTracker::construct_versioned_tracker(const std::vector<RowsetMetaSharedPtr>& rs_metas) {
@@ -62,7 +76,7 @@ void TimestampedVersionTracker::get_stale_version_path_json_doc(rapidjson::Docum
         auto path_id_str = std::to_string(path_id);
         rapidjson::Value path_id_value;
         path_id_value.SetString(path_id_str.c_str(), path_id_str.length(), path_arr.GetAllocator());
-        item.AddMember("path id", path_id_value, path_arr.GetAllocator());
+        item.AddMember("path_id", path_id_value, path_arr.GetAllocator());
 
         // add max create time to item
         auto time_zone = cctz::local_time_zone();
@@ -72,26 +86,27 @@ void TimestampedVersionTracker::get_stale_version_path_json_doc(rapidjson::Docum
 
         rapidjson::Value create_time_value;
         create_time_value.SetString(create_time_str.c_str(), create_time_str.length(), path_arr.GetAllocator());
-        item.AddMember("last create time", create_time_value, path_arr.GetAllocator());
+        item.AddMember("last_create_time", create_time_value, path_arr.GetAllocator());
 
         // add path list to item
         std::stringstream path_list_stream;
-        path_list_stream << path_id_str;
         auto path_list_ptr = path_version_path->timestamped_versions();
         auto path_list_iter = path_list_ptr.begin();
         while (path_list_iter != path_list_ptr.end()) {
-            path_list_stream << " -> ";
             path_list_stream << "[";
             path_list_stream << (*path_list_iter)->version().first;
             path_list_stream << "-";
             path_list_stream << (*path_list_iter)->version().second;
             path_list_stream << "]";
             path_list_iter++;
+            if (path_list_iter != path_list_ptr.end()) {
+                path_list_stream << "->";
+            }
         }
         std::string path_list = path_list_stream.str();
         rapidjson::Value path_list_value;
         path_list_value.SetString(path_list.c_str(), path_list.length(), path_arr.GetAllocator());
-        item.AddMember("path list", path_list_value, path_arr.GetAllocator());
+        item.AddMember("path_list", path_list_value, path_arr.GetAllocator());
 
         // add item to path_arr
         path_arr.PushBack(item, path_arr.GetAllocator());
@@ -102,6 +117,14 @@ void TimestampedVersionTracker::get_stale_version_path_json_doc(rapidjson::Docum
 
 int64_t TimestampedVersionTracker::get_max_continuous_version() const {
     return _version_graph.max_continuous_version();
+}
+
+void TimestampedVersionTracker::update_max_continuous_version() {
+    _version_graph.update_max_continuous_version();
+}
+
+int64_t TimestampedVersionTracker::get_min_readable_version() const {
+    return _version_graph.min_readable_version();
 }
 
 void TimestampedVersionTracker::add_version(const Version& version) {
@@ -140,7 +163,7 @@ Status TimestampedVersionTracker::capture_consistent_versions(const Version& spe
 
 void TimestampedVersionTracker::capture_expired_paths(int64_t stale_sweep_endtime,
                                                       std::vector<int64_t>* path_version_vec) const {
-    std::map<int64_t, PathVersionListSharedPtr>::const_iterator iter = _stale_version_path_map.begin();
+    auto iter = _stale_version_path_map.begin();
 
     while (iter != _stale_version_path_map.end()) {
         int64_t max_create_time = iter->second->max_create_time();
@@ -172,7 +195,7 @@ PathVersionListSharedPtr TimestampedVersionTracker::fetch_and_delete_path_by_id(
     _stale_version_path_map.erase(path_id);
 
     for (auto& version : ptr->timestamped_versions()) {
-        _version_graph.delete_version_from_graph(version->version());
+        (void)_version_graph.delete_version_from_graph(version->version());
     }
     return ptr;
 }
@@ -181,11 +204,11 @@ std::string TimestampedVersionTracker::_get_current_path_map_str() {
     std::stringstream tracker_info;
     tracker_info << "current expired next_path_id " << _next_path_id << std::endl;
 
-    std::map<int64_t, PathVersionListSharedPtr>::const_iterator iter = _stale_version_path_map.begin();
+    auto iter = _stale_version_path_map.begin();
     while (iter != _stale_version_path_map.end()) {
         tracker_info << "current expired path_version " << iter->first;
         std::vector<TimestampedVersionSharedPtr>& timestamped_versions = iter->second->timestamped_versions();
-        std::vector<TimestampedVersionSharedPtr>::iterator version_path_iter = timestamped_versions.begin();
+        auto version_path_iter = timestamped_versions.begin();
         int64_t max_create_time = -1;
         while (version_path_iter != timestamped_versions.end()) {
             if (max_create_time < (*version_path_iter)->get_create_time()) {
@@ -218,7 +241,14 @@ std::vector<TimestampedVersionSharedPtr>& TimestampedVersionPathContainer::times
     return _timestamped_versions_container;
 }
 
+void VersionGraph::update_max_continuous_version() {
+    _max_continuous_version = _get_max_continuous_version_from(0);
+}
+
 void VersionGraph::construct_version_graph(const std::vector<RowsetMetaSharedPtr>& rs_metas, int64_t* max_version) {
+    _version_graph.clear();
+    _max_continuous_version = -1;
+    _min_readable_version = -1;
     if (rs_metas.empty()) {
         VLOG(3) << "there is no version in the header.";
         return;
@@ -234,18 +264,32 @@ void VersionGraph::construct_version_graph(const std::vector<RowsetMetaSharedPtr
         }
     }
     _max_continuous_version = _get_max_continuous_version_from(0);
-}
-
-void VersionGraph::reconstruct_version_graph(const std::vector<RowsetMetaSharedPtr>& rs_metas, int64_t* max_version) {
-    _version_graph.clear();
-    _max_continuous_version = -1;
-    construct_version_graph(rs_metas, max_version);
+    _min_readable_version = -1;
+    for (const auto& rs_meta : rs_metas) {
+        const auto& version = rs_meta->version();
+        if (version.second <= _max_continuous_version && version.first != version.second) {
+            // it's a compacted version
+            _min_readable_version = std::max(version.second, _min_readable_version);
+        }
+    }
+    _tablet_id = rs_metas[0]->tablet_id();
 }
 
 void VersionGraph::add_version_to_graph(const Version& version) {
     _add_version_to_graph(version);
     if (version.first == _max_continuous_version + 1) {
         _max_continuous_version = _get_max_continuous_version_from(_max_continuous_version + 1);
+    } else if (version.first == 0) {
+        // We need to reconstruct max_continuous_version from zero if input version is starting from zero
+        // e.g.
+        // 1. Tablet A is doing schema change
+        // 2. We create a new tablet B releated A, and we will create a initial rowset and _max_continuous_version
+        //    will be updated to 1
+        // 3. Tablet A has a rowset R with version (0, m)
+        // 4. Schema change will try convert R
+        // 5. The start version of R (0) is not equal to `_max_continuous_version + 1`, and the _max_continuous_version
+        //    will not update
+        _max_continuous_version = _get_max_continuous_version_from(0);
     }
 }
 
@@ -316,6 +360,9 @@ Status VersionGraph::delete_version_from_graph(const Version& version) {
         _version_graph.erase(end_iter);
     }
 
+    if (version.second <= _max_continuous_version) {
+        _min_readable_version = std::max(_min_readable_version, version.second);
+    }
     return Status::OK();
 }
 
@@ -365,8 +412,11 @@ Status VersionGraph::capture_consistent_versions(const Version& spec_version,
     auto end_vertex_iter = _version_graph.find(spec_version.second + 1);
 
     if (start_vertex_iter == _version_graph.end() || end_vertex_iter == _version_graph.end()) {
-        LOG(WARNING) << "fail to find path in version_graph. "
-                     << "spec_version: " << spec_version.first << "-" << spec_version.second;
+        RATE_LIMIT_BY_TAG(_tablet_id,
+                          LOG(WARNING) << "fail to find path in version_graph. "
+                                       << "spec_version: " << spec_version.first << "-" << spec_version.second
+                                       << " tablet_id: " << _tablet_id,
+                          1000);
         return Status::NotFound("Version not found");
     }
 

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/qe/ConnectScheduler.java
 
@@ -21,25 +34,36 @@
 
 package com.starrocks.qe;
 
+import com.google.common.base.Predicate;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.starrocks.authorization.AccessDeniedException;
+import com.starrocks.authorization.PrivilegeType;
 import com.starrocks.common.Config;
+import com.starrocks.common.Pair;
 import com.starrocks.common.ThreadPoolManager;
+import com.starrocks.common.util.LogUtil;
+import com.starrocks.http.HttpConnectContext;
 import com.starrocks.mysql.MysqlProto;
+import com.starrocks.mysql.NegotiateState;
 import com.starrocks.mysql.nio.NConnectContext;
-import com.starrocks.mysql.privilege.PrivPredicate;
-import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.service.arrow.flight.sql.ArrowFlightSqlConnectContext;
+import com.starrocks.sql.analyzer.Authorizer;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TimerTask;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class ConnectScheduler {
     private static final Logger LOG = LogManager.getLogger(ConnectScheduler.class);
@@ -48,7 +72,10 @@ public class ConnectScheduler {
     private final AtomicInteger nextConnectionId;
 
     private final Map<Long, ConnectContext> connectionMap = Maps.newConcurrentMap();
-    private final Map<String, AtomicInteger> connByUser = Maps.newConcurrentMap();
+    private final Map<String, ArrowFlightSqlConnectContext> arrowFlightSqlConnectContextMap = Maps.newConcurrentMap();
+
+    private final Map<String, AtomicInteger> connCountByUser = Maps.newConcurrentMap();
+    private final ReentrantLock connStatsLock = new ReentrantLock();
     private final ExecutorService executor = ThreadPoolManager
             .newDaemonCacheThreadPool(Config.max_connection_scheduler_threads_num, "connect-scheduler-pool", true);
 
@@ -78,12 +105,24 @@ public class ConnectScheduler {
                     ArrayList<Long> connectionIds = new ArrayList<>(connectionMap.keySet());
                     for (Long connectId : connectionIds) {
                         ConnectContext connectContext = connectionMap.get(connectId);
-                        connectContext.checkTimeout(now);
+                        try (var guard = connectContext.bindScope()) {
+                            connectContext.checkTimeout(now);
+                        }
+                    }
+
+                    // remove arrow flight sql timeout connect
+                    ArrayList<String> arrowFlightSqlConnections =
+                            new ArrayList<>(arrowFlightSqlConnectContextMap.keySet());
+                    for (String token : arrowFlightSqlConnections) {
+                        ConnectContext connectContext = arrowFlightSqlConnectContextMap.get(token);
+                        try (var guard = connectContext.bindScope()) {
+                            connectContext.checkTimeout(now);
+                        }
                     }
                 }
             } catch (Throwable e) {
-                //Catch Exception to avoid thread exit
-                LOG.warn("Timeout checker exception, Internal error : " + e.getMessage());
+                // Catch Exception to avoid thread exit
+                LOG.warn("Timeout checker exception, Internal error:", e);
             }
         }
     }
@@ -98,8 +137,8 @@ public class ConnectScheduler {
 
         context.setConnectionId(nextConnectionId.getAndAdd(1));
         context.resetConnectionStartTime();
-        // no necessary for nio.
-        if (context instanceof NConnectContext) {
+        // no necessary for nio or Http.
+        if (context instanceof NConnectContext || context instanceof HttpConnectContext) {
             return true;
         }
         if (executor.submit(new LoopHandler(context)) == null) {
@@ -109,32 +148,78 @@ public class ConnectScheduler {
         return true;
     }
 
-    // Register one connection with its connection id.
-    public boolean registerConnection(ConnectContext ctx) {
-        if (numberConnection.get() >= maxConnections.get()) {
-            return false;
+    /**
+     * Register one connection with its connection id.
+     *
+     * @param ctx connection context
+     * @return a pair, first is success or not, second is error message(if any)
+     */
+    public Pair<Boolean, String> registerConnection(ConnectContext ctx) {
+        try {
+            connStatsLock.lock();
+            if (numberConnection.get() >= maxConnections.get()) {
+                return new Pair<>(false, "Reach cluster-wide connection limit, qe_max_connection=" + maxConnections +
+                        ", connectionMap.size=" + connectionMap.size() +
+                        ", node=" + ctx.getGlobalStateMgr().getNodeMgr().getSelfNode());
+            }
+            // Check user
+            connCountByUser.computeIfAbsent(ctx.getQualifiedUser(), k -> new AtomicInteger(0));
+            AtomicInteger currentConnAtomic = connCountByUser.get(ctx.getQualifiedUser());
+            int currentConn = currentConnAtomic.get();
+            long currentUserMaxConn =
+                    ctx.getGlobalStateMgr().getAuthenticationMgr().getMaxConn(ctx.getCurrentUserIdentity());
+            if (currentConn >= currentUserMaxConn) {
+                String userErrMsg = "Reach user-level(qualifiedUser: " + ctx.getQualifiedUser() +
+                        ", currUserIdentity: " + ctx.getCurrentUserIdentity() + ") connection limit, " +
+                        "currentUserMaxConn=" + currentUserMaxConn + ", connectionMap.size=" + connectionMap.size() +
+                        ", connByUser.totConn=" + connCountByUser.values().stream().mapToInt(AtomicInteger::get).sum() +
+                        ", user.currConn=" + currentConn +
+                        ", node=" + ctx.getGlobalStateMgr().getNodeMgr().getSelfNode();
+                LOG.info(userErrMsg + ", details: connectionId={}, connByUser={}",
+                        ctx.getConnectionId(), connCountByUser);
+                return new Pair<>(false, userErrMsg);
+            }
+            numberConnection.incrementAndGet();
+            currentConnAtomic.incrementAndGet();
+            connectionMap.put((long) ctx.getConnectionId(), ctx);
+
+            if (ctx instanceof ArrowFlightSqlConnectContext) {
+                ArrowFlightSqlConnectContext context = (ArrowFlightSqlConnectContext) ctx;
+                arrowFlightSqlConnectContextMap.put(context.getToken(), context);
+            }
+
+            return new Pair<>(true, null);
+        } finally {
+            connStatsLock.unlock();
         }
-        // Check user
-        if (connByUser.get(ctx.getQualifiedUser()) == null) {
-            connByUser.put(ctx.getQualifiedUser(), new AtomicInteger(0));
-        }
-        int conns = connByUser.get(ctx.getQualifiedUser()).get();
-        if (conns >= ctx.getGlobalStateMgr().getAuth().getMaxConn(ctx.getQualifiedUser())) {
-            return false;
-        }
-        numberConnection.incrementAndGet();
-        connByUser.get(ctx.getQualifiedUser()).incrementAndGet();
-        connectionMap.put((long) ctx.getConnectionId(), ctx);
-        return true;
     }
 
     public void unregisterConnection(ConnectContext ctx) {
-        if (connectionMap.remove((long) ctx.getConnectionId()) != null) {
-            numberConnection.decrementAndGet();
-            AtomicInteger conns = connByUser.get(ctx.getQualifiedUser());
-            if (conns != null) {
-                conns.decrementAndGet();
+        boolean removed;
+        try {
+            connStatsLock.lock();
+            removed = connectionMap.remove((long) ctx.getConnectionId()) != null;
+            if (removed) {
+                numberConnection.decrementAndGet();
+                AtomicInteger conns = connCountByUser.get(ctx.getQualifiedUser());
+                if (conns != null) {
+                    conns.decrementAndGet();
+                }
+                LOG.info("Connection closed. remote={}, connectionId={}, qualifiedUser={}, user.currConn={}",
+                        ctx.getMysqlChannel().getRemoteHostPortString(), ctx.getConnectionId(),
+                        ctx.getQualifiedUser(), conns != null ? Integer.toString(conns.get()) : "nil");
             }
+
+            if (ctx instanceof ArrowFlightSqlConnectContext) {
+                ArrowFlightSqlConnectContext context = (ArrowFlightSqlConnectContext) ctx;
+                arrowFlightSqlConnectContextMap.remove(context.getToken());
+            }
+        } finally {
+            connStatsLock.unlock();
+        }
+
+        if (removed) {
+            ctx.cleanTemporaryTable();
         }
     }
 
@@ -142,24 +227,75 @@ public class ConnectScheduler {
         return connectionMap.get(connectionId);
     }
 
+    public ConnectContext getContext(String token) {
+        return connectionMap.get(token);
+    }
+
+    public ArrowFlightSqlConnectContext getArrowFlightSqlConnectContext(String token) {
+        return arrowFlightSqlConnectContextMap.get(token);
+    }
+
+    public ConnectContext findContextByQueryId(String queryId) {
+        return connectionMap.values().stream().filter(
+                (Predicate<ConnectContext>) c ->
+                        c.getQueryId() != null
+                                && queryId.equals(c.getQueryId().toString())
+        )
+                .findFirst().orElse(null);
+    }
+
+    public ConnectContext findContextByCustomQueryId(String customQueryId) {
+        return connectionMap.values().stream().filter(
+                (Predicate<ConnectContext>) c -> customQueryId.equals(c.getCustomQueryId())).findFirst().orElse(null);
+    }
+
     public int getConnectionNum() {
         return numberConnection.get();
     }
+    
+    public Map<String, AtomicInteger> getUserConnectionMap() {
+        return connCountByUser;
+    }
 
-    public List<ConnectContext.ThreadInfo> listConnection(String user) {
+    private List<ConnectContext.ThreadInfo> getAllConnThreadInfoByUser(ConnectContext connectContext,
+                                                                       String currUser,
+                                                                       String forUser) {
         List<ConnectContext.ThreadInfo> infos = Lists.newArrayList();
+        ConnectContext currContext = connectContext == null ? ConnectContext.get() : connectContext;
 
         for (ConnectContext ctx : connectionMap.values()) {
-            // Check auth
-            if (!ctx.getQualifiedUser().equals(user) &&
-                    !GlobalStateMgr.getCurrentState().getAuth().checkGlobalPriv(ConnectContext.get(),
-                            PrivPredicate.GRANT)) {
+            // Check authorization first.
+            if (!ctx.getQualifiedUser().equals(currUser)) {
+                try {
+                    Authorizer.checkSystemAction(currContext.getCurrentUserIdentity(),
+                            currContext.getCurrentRoleIds(), PrivilegeType.OPERATE);
+                } catch (AccessDeniedException e) {
+                    continue;
+                }
+            }
+
+            // Check whether it's the connection for the specified user.
+            if (forUser != null && !ctx.getQualifiedUser().equals(forUser)) {
                 continue;
             }
 
             infos.add(ctx.toThreadInfo());
         }
         return infos;
+    }
+
+    public List<ConnectContext.ThreadInfo> listConnection(String currUser, String forUser) {
+        return getAllConnThreadInfoByUser(null, currUser, forUser);
+    }
+
+    public List<ConnectContext.ThreadInfo> listConnection(ConnectContext context, String currUser) {
+        return getAllConnThreadInfoByUser(context, currUser, null);
+    }
+
+    public Set<UUID> listAllSessionsId() {
+        Set<UUID> sessionIds = new HashSet<>();
+        connectionMap.values().forEach(ctx -> sessionIds.add(ctx.getSessionId()));
+        return sessionIds;
     }
 
     private class LoopHandler implements Runnable {
@@ -176,23 +312,34 @@ public class ConnectScheduler {
                 context.setThreadLocalInfo();
                 context.setConnectScheduler(ConnectScheduler.this);
                 // authenticate check failed.
-                if (!MysqlProto.negotiate(context)) {
-                    return;
-                }
+                MysqlProto.NegotiateResult result = null;
+                try {
+                    result = MysqlProto.negotiate(context);
+                    if (result.getState() != NegotiateState.OK) {
+                        return;
+                    }
 
-                if (registerConnection(context)) {
-                    MysqlProto.sendResponsePacket(context);
-                } else {
-                    context.getState().setError("Reach limit of connections");
-                    MysqlProto.sendResponsePacket(context);
-                    return;
+                    Pair<Boolean, String> registerResult = registerConnection(context);
+                    if (registerResult.first) {
+                        MysqlProto.sendResponsePacket(context);
+                    } else {
+                        context.getState().setError(registerResult.second);
+                        MysqlProto.sendResponsePacket(context);
+                        return;
+                    }
+                } finally {
+                    // Ignore the NegotiateState.READ_FIRST_AUTH_PKG_FAILED connections,
+                    // because this maybe caused by port probe.
+                    if (result != null && result.getState() != NegotiateState.READ_FIRST_AUTH_PKG_FAILED) {
+                        LogUtil.logConnectionInfoToAuditLogAndQueryQueue(context, result.getAuthPacket());
+                    }
                 }
 
                 context.setStartTime();
                 ConnectProcessor processor = new ConnectProcessor(context);
                 processor.loop();
             } catch (Exception e) {
-                // for unauthrorized access such lvs probe request, may cause exception, just log it in debug level
+                // for unauthorized access such lvs probe request, may cause exception, just log it in debug level
                 if (context.getCurrentUserIdentity() != null) {
                     LOG.warn("connect processor exception because ", e);
                 } else {

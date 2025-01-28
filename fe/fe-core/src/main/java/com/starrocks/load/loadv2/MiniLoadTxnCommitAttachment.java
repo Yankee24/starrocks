@@ -17,19 +17,22 @@
 
 package com.starrocks.load.loadv2;
 
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.common.io.Text;
 import com.starrocks.thrift.TMiniLoadTxnCommitAttachment;
 import com.starrocks.transaction.TransactionState;
 import com.starrocks.transaction.TxnCommitAttachment;
 
-import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 
 public class MiniLoadTxnCommitAttachment extends TxnCommitAttachment {
+    @SerializedName("lr")
     private long loadedRows;
+    @SerializedName("fr")
     private long filteredRows;
     // optional
+    @SerializedName("eu")
     private String errorLogUrl;
 
     public MiniLoadTxnCommitAttachment() {
@@ -69,14 +72,5 @@ public class MiniLoadTxnCommitAttachment extends TxnCommitAttachment {
             Text.writeString(out, errorLogUrl);
         }
 
-    }
-
-    public void readFields(DataInput in) throws IOException {
-        super.readFields(in);
-        filteredRows = in.readLong();
-        loadedRows = in.readLong();
-        if (in.readBoolean()) {
-            errorLogUrl = Text.readString(in);
-        }
     }
 }

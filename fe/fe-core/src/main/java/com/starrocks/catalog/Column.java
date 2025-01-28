@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/Column.java
 
@@ -25,44 +38,68 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.alter.SchemaChangeHandler;
-import com.starrocks.analysis.ColumnDef;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.NullLiteral;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.StringLiteral;
+import com.starrocks.analysis.TypeDef;
+import com.starrocks.catalog.combinator.AggStateDesc;
 import com.starrocks.common.CaseSensibility;
 import com.starrocks.common.DdlException;
-import com.starrocks.common.FeConstants;
-import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.common.util.TimeUtils;
+import com.starrocks.persist.ColumnIdExpr;
+import com.starrocks.persist.ExpressionSerializedObject;
+import com.starrocks.persist.gson.GsonPostProcessable;
+import com.starrocks.persist.gson.GsonPreProcessable;
 import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.AstToSQLBuilder;
+import com.starrocks.sql.ast.ColumnDef;
+import com.starrocks.sql.ast.IndexDef;
+import com.starrocks.thrift.TAggStateDesc;
 import com.starrocks.thrift.TColumn;
+import org.apache.commons.lang.StringEscapeUtils;
+import org.apache.commons.text.translate.UnicodeUnescaper;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.time.Instant;
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
-import static com.starrocks.common.util.DateUtils.DATE_TIME_FORMAT;
+import static com.starrocks.common.util.DateUtils.DATE_TIME_FORMATTER;
 
 /**
  * This class represents the column-related metadata.
  */
-public class Column implements Writable {
+public class Column implements Writable, GsonPreProcessable, GsonPostProcessable {
 
     public static final String CAN_NOT_CHANGE_DEFAULT_VALUE = "Can not change default value";
+    public static final int COLUMN_UNIQUE_ID_INIT_VALUE = -1;
 
+    // logical name, rename will change this name.
     @SerializedName(value = "name")
     private String name;
+
+    // For OLAP Table and its sub classes:
+    // When column is created, columnId is same to name.
+    // If the column name is changed, the value of name will be updated to the new column name,
+    // and the value of columnId remains unchanged.
+    //
+    // For other tables: columnId is same to name.
+    //
+    // All references to Column should use columnId instead of name.
+    @SerializedName(value = "columnId")
+    private ColumnId columnId;
+    @SerializedName(value = "uniqueId")
+    private int uniqueId;
+
     @SerializedName(value = "type")
     private Type type;
     // column is key: aggregate type is null
@@ -70,6 +107,10 @@ public class Column implements Writable {
     // column is not key and has aggregate type: aggregate type is name of aggregate function.
     @SerializedName(value = "aggregationType")
     private AggregateType aggregationType;
+    // aggStateDesc is used for common aggregate function state with intermediate result type in aggregate key model.
+    // if aggregationType is AGG_STATE_UNION, aggStateDesc should not be null.
+    @SerializedName("aggStateDesc")
+    protected AggStateDesc aggStateDesc = null;
 
     // if isAggregationTypeImplicit is true, the actual aggregation type will not be shown in show create table
     // the key type of table is duplicate or unique: the isAggregationTypeImplicit of value columns are true
@@ -80,6 +121,8 @@ public class Column implements Writable {
     private boolean isKey;
     @SerializedName(value = "isAllowNull")
     private boolean isAllowNull;
+    @SerializedName(value = "isAutoIncrement")
+    private boolean isAutoIncrement;
     @SerializedName(value = "defaultValue")
     private String defaultValue;
     // this handle function like now() or simple expression
@@ -93,44 +136,74 @@ public class Column implements Writable {
     // Currently, analyzed define expr is only used when creating materialized views, so the define expr in RollupJob must be analyzed.
     // In other cases, such as define expr in `MaterializedIndexMeta`, it may not be analyzed after being relayed.
     private Expr defineExpr; // use to define column in materialize view
+    // physicalName is used to store the physical name of the column in the storage layer.
+    // for example, the physical name of a column in a parquet file.
+    // used in delta lake column mapping name mode
+    @SerializedName(value = "physicalName")
+    private String physicalName;
 
+    @SerializedName(value = "materializedColumnExpr")
+    private ExpressionSerializedObject generatedColumnExprSerialized;
+    private ColumnIdExpr generatedColumnExpr;
+
+    // Only for persist
     public Column() {
         this.name = "";
         this.type = Type.NULL;
         this.isAggregationTypeImplicit = false;
         this.isKey = false;
         this.stats = new ColumnStats();
+        this.uniqueId = -1;
     }
 
     public Column(String name, Type dataType) {
-        this(name, dataType, false, null, false, null, "");
+        this(name, dataType, false, null, null, false, null, "", COLUMN_UNIQUE_ID_INIT_VALUE);
         Preconditions.checkArgument(dataType.isValid());
     }
 
     public Column(String name, Type dataType, boolean isAllowNull) {
-        this(name, dataType, false, null, isAllowNull, null, "");
+        this(name, dataType, false, null, null, isAllowNull, null, "", COLUMN_UNIQUE_ID_INIT_VALUE);
+        Preconditions.checkArgument(dataType.isValid());
+    }
+
+    public Column(String name, Type dataType, boolean isAllowNull, String comment) {
+        this(name, dataType, false, null, null, isAllowNull, null, comment, COLUMN_UNIQUE_ID_INIT_VALUE);
         Preconditions.checkArgument(dataType.isValid());
     }
 
     public Column(String name, Type type, boolean isKey, AggregateType aggregateType, String defaultValue,
                   String comment) {
-        this(name, type, isKey, aggregateType, false,
-                new ColumnDef.DefaultValueDef(true, new StringLiteral(defaultValue)), comment);
+        this(name, type, isKey, aggregateType, null, false,
+                new ColumnDef.DefaultValueDef(true, new StringLiteral(defaultValue)), comment,
+                COLUMN_UNIQUE_ID_INIT_VALUE);
     }
 
     public Column(String name, Type type, boolean isKey, AggregateType aggregateType,
                   ColumnDef.DefaultValueDef defaultValue,
                   String comment) {
-        this(name, type, isKey, aggregateType, false, defaultValue, comment);
+        this(name, type, isKey, aggregateType, null, false, defaultValue, comment,
+                COLUMN_UNIQUE_ID_INIT_VALUE);
     }
 
     public Column(String name, Type type, boolean isKey, AggregateType aggregateType, boolean isAllowNull,
                   ColumnDef.DefaultValueDef defaultValueDef, String comment) {
+        this(name, type, isKey, aggregateType, null, isAllowNull, defaultValueDef, comment,
+                COLUMN_UNIQUE_ID_INIT_VALUE);
+    }
+
+    public Column(String name, Type type, boolean isKey, AggregateType aggregateType, AggStateDesc aggStateDesc,
+                  boolean isAllowNull, ColumnDef.DefaultValueDef defaultValueDef, String comment, int columnUniqId) {
+        this(name, type, isKey, aggregateType, aggStateDesc, isAllowNull, defaultValueDef, comment, columnUniqId, "");
+    }
+
+    public Column(String name, Type type, boolean isKey, AggregateType aggregateType, AggStateDesc aggStateDesc,
+                  boolean isAllowNull, ColumnDef.DefaultValueDef defaultValueDef, String comment, int columnUniqId,
+                  String physicalName) {
         this.name = name;
         if (this.name == null) {
             this.name = "";
         }
-
+        this.columnId = ColumnId.create(this.name);
         this.type = type;
         if (this.type == null) {
             this.type = Type.NULL;
@@ -139,6 +212,13 @@ public class Column implements Writable {
                 this.type.getPrimitiveType() != PrimitiveType.INVALID_TYPE);
 
         this.aggregationType = aggregateType;
+        if (aggregateType != null && aggregateType == AggregateType.AGG_STATE_UNION) {
+            Preconditions.checkArgument(aggStateDesc != null, "aggStateDesc should not be null if " +
+                    "aggregation type is AGG_STATE_UNION");
+        }
+        this.aggStateDesc = aggStateDesc;
+        this.type.setAggStateDesc(aggStateDesc);
+
         this.isAggregationTypeImplicit = false;
         this.isKey = isKey;
         this.isAllowNull = isAllowNull;
@@ -152,13 +232,20 @@ public class Column implements Writable {
                 this.defaultExpr = new DefaultExpr(defaultValueDef.expr.toSql());
             }
         }
+        this.isAutoIncrement = false;
         this.comment = comment;
         this.stats = new ColumnStats();
+        this.generatedColumnExpr = null;
+        this.uniqueId = columnUniqId;
+        this.physicalName = physicalName;
     }
 
     public Column(Column column) {
         this.name = column.getName();
+        this.columnId = column.getColumnId();
+        this.aggStateDesc = column.aggStateDesc;
         this.type = column.type;
+        this.type.setAggStateDesc(column.aggStateDesc);
         this.aggregationType = column.getAggregationType();
         this.isAggregationTypeImplicit = column.isAggregationTypeImplicit();
         this.isKey = column.isKey();
@@ -170,6 +257,43 @@ public class Column implements Writable {
         this.defaultExpr = column.defaultExpr;
         Preconditions.checkArgument(this.type.isComplexType() ||
                 this.type.getPrimitiveType() != PrimitiveType.INVALID_TYPE);
+        this.uniqueId = column.getUniqueId();
+        this.generatedColumnExpr = column.generatedColumnExpr;
+    }
+
+    public Column deepCopy() {
+        Column col = new Column(this);
+        col.setIsAutoIncrement(this.isAutoIncrement);
+        Type newType = type.clone();
+        col.setType(newType);
+        return col;
+    }
+
+    public ColumnDef toColumnDef(Table table) {
+        ColumnDef.DefaultValueDef defaultDef = null;
+        if (defaultValue == null) {
+            if (defaultExpr != null) {
+                defaultDef = new ColumnDef.DefaultValueDef(true, defaultExpr.obtainExpr());
+            } else {
+                defaultDef = new ColumnDef.DefaultValueDef(false, null);
+            }
+        } else {
+            defaultDef = new ColumnDef.DefaultValueDef(true, new StringLiteral(defaultValue));
+        }
+        ColumnDef.DefaultValueDef defaultValueDef = null;
+        if (defaultValue != null) {
+            defaultValueDef = new ColumnDef.DefaultValueDef(true, new StringLiteral(defaultValue));
+        } else {
+            if (defaultExpr != null) {
+                defaultValueDef = new ColumnDef.DefaultValueDef(true, defaultExpr.obtainExpr());
+            } else {
+                defaultValueDef = new ColumnDef.DefaultValueDef(false, null);
+            }
+        }
+        return new ColumnDef(name, new TypeDef(type), null, isKey, aggregationType, aggStateDesc, isAllowNull,
+                defaultValueDef, isAutoIncrement,
+                generatedColumnExpr != null ? generatedColumnExpr.convertToColumnNameExpr(table.getIdToColumn()) : null,
+                comment);
     }
 
     public void setName(String newName) {
@@ -180,16 +304,8 @@ public class Column implements Writable {
         return this.name;
     }
 
-    public String getDisplayName() {
-        if (defineExpr == null) {
-            return name;
-        } else {
-            return defineExpr.toSql();
-        }
-    }
-
-    public String getNameWithoutPrefix(String prefix) {
-        if (isNameWithPrefix(prefix)) {
+    public String getNameWithoutPrefix(String prefix, String name) {
+        if (name.startsWith(prefix)) {
             return name.substring(prefix.length());
         }
         return name;
@@ -256,8 +372,16 @@ public class Column implements Writable {
         return isAllowNull;
     }
 
+    public boolean isAutoIncrement() {
+        return isAutoIncrement;
+    }
+
     public void setIsAllowNull(boolean isAllowNull) {
         this.isAllowNull = isAllowNull;
+    }
+
+    public void setIsAutoIncrement(boolean isAutoIncrement) {
+        this.isAutoIncrement = isAutoIncrement;
     }
 
     public DefaultExpr getDefaultExpr() {
@@ -288,6 +412,20 @@ public class Column implements Writable {
         return comment;
     }
 
+    // Attention: cause the remove escape character in parser phase, when you want to print the
+    // comment, you need add the escape character back
+    public String getDisplayComment() {
+        return CatalogUtils.addEscapeCharacter(comment);
+    }
+
+    public boolean isGeneratedColumn() {
+        return generatedColumnExpr != null;
+    }
+
+    public boolean isShadowColumn() {
+        return this.name.startsWith(SchemaChangeHandler.SHADOW_NAME_PREFIX);
+    }
+
     public int getOlapColumnIndexSize() {
         PrimitiveType type = this.getPrimitiveType();
         if (type == PrimitiveType.CHAR) {
@@ -299,14 +437,19 @@ public class Column implements Writable {
 
     public TColumn toThrift() {
         TColumn tColumn = new TColumn();
-        tColumn.setColumn_name(this.name);
+        tColumn.setColumn_name(this.columnId.getId());
         tColumn.setIndex_len(this.getOlapColumnIndexSize());
         tColumn.setType_desc(this.type.toThrift());
         if (null != this.aggregationType) {
             tColumn.setAggregation_type(this.aggregationType.toThrift());
         }
+        if (null != this.aggStateDesc) {
+            TAggStateDesc tAggStateDesc = this.aggStateDesc.toThrift();
+            tColumn.setAgg_state_desc(tAggStateDesc);
+        }
         tColumn.setIs_key(this.isKey);
         tColumn.setIs_allow_null(this.isAllowNull);
+        tColumn.setIs_auto_increment(this.isAutoIncrement);
         tColumn.setDefault_value(this.defaultValue);
         // The define expr does not need to be serialized here for now.
         // At present, only serialized(analyzed) define expr is directly used when creating a materialized view.
@@ -315,10 +458,16 @@ public class Column implements Writable {
         // scalar type or nested type
         // If this field is set, column_type will be ignored.
         tColumn.setType_desc(type.toThrift());
+        tColumn.setCol_unique_id(uniqueId);
+
         return tColumn;
     }
 
     public void checkSchemaChangeAllowed(Column other) throws DdlException {
+        if (other.isGeneratedColumn()) {
+            return;
+        }
+
         if (Strings.isNullOrEmpty(other.name)) {
             throw new DdlException("Dest column name is empty");
         }
@@ -329,6 +478,9 @@ public class Column implements Writable {
 
         if (this.aggregationType != other.aggregationType) {
             throw new DdlException("Can not change aggregation type");
+        }
+        if (this.aggStateDesc != null && !this.aggStateDesc.equals(other.aggStateDesc)) {
+            throw new DdlException("Can not change aggregation state desc type");
         }
 
         if (this.isAllowNull && !other.isAllowNull) {
@@ -345,6 +497,11 @@ public class Column implements Writable {
                 || (getPrimitiveType() == PrimitiveType.CHAR && other.getPrimitiveType() == PrimitiveType.CHAR)) {
             if (getStrLen() > other.getStrLen()) {
                 throw new DdlException("Cannot shorten string length");
+            }
+        }
+        if (getPrimitiveType().isJsonType() && other.getPrimitiveType().isCharFamily()) {
+            if (other.getStrLen() <= getPrimitiveType().getTypeSize()) {
+                throw new DdlException("JSON needs minimum length of " + getPrimitiveType().getTypeSize());
             }
         }
     }
@@ -389,11 +546,8 @@ public class Column implements Writable {
     }
 
     public static String removeNamePrefix(String colName) {
-        if (colName.startsWith(SchemaChangeHandler.SHADOW_NAME_PRFIX)) {
-            return colName.substring(SchemaChangeHandler.SHADOW_NAME_PRFIX.length());
-        }
-        if (colName.startsWith(SchemaChangeHandler.SHADOW_NAME_PRFIX_V1)) {
-            return colName.substring(SchemaChangeHandler.SHADOW_NAME_PRFIX_V1.length());
+        if (colName.startsWith(SchemaChangeHandler.SHADOW_NAME_PREFIX)) {
+            return colName.substring(SchemaChangeHandler.SHADOW_NAME_PREFIX.length());
         }
         return colName;
     }
@@ -406,38 +560,87 @@ public class Column implements Writable {
         defineExpr = expr;
     }
 
-    public SlotRef getRefColumn() {
-        List<Expr> slots = new ArrayList<>();
+    public Expr getGeneratedColumnExpr(Map<ColumnId, Column> idToColumn) {
+        if (generatedColumnExpr == null) {
+            return null;
+        }
+        Expr expr = generatedColumnExpr.convertToColumnNameExpr(idToColumn).clone();
+        expr.setType(type);
+        return expr;
+    }
+
+    public Expr getGeneratedColumnExpr(List<Column> schema) {
+        if (generatedColumnExpr == null) {
+            return null;
+        }
+        Expr res = generatedColumnExpr.convertToColumnNameExpr(schema).clone();
+        res.setType(type);
+        return res;
+    }
+
+    public void setGeneratedColumnExpr(ColumnIdExpr expr) {
+        generatedColumnExpr = expr;
+    }
+
+    public List<SlotRef> getRefColumns() {
+        List<SlotRef> slots = new ArrayList<>();
         if (defineExpr == null) {
             return null;
         } else {
             defineExpr.collect(SlotRef.class, slots);
-            Preconditions.checkArgument(slots.size() == 1);
-            return (SlotRef) slots.get(0);
+            return slots;
         }
     }
 
-    public String toSql() {
+    public List<SlotRef> getGeneratedColumnRef(Map<ColumnId, Column> idToColumn) {
+        List<SlotRef> slots = new ArrayList<>();
+        if (generatedColumnExpr == null) {
+            return null;
+        } else {
+            generatedColumnExpr.convertToColumnNameExpr(idToColumn).collect(SlotRef.class, slots);
+            return slots;
+        }
+    }
+
+    public String toSql(Map<ColumnId, Column> idToColumn) {
         StringBuilder sb = new StringBuilder();
         sb.append("`").append(name).append("` ");
         String typeStr = type.toSql();
         sb.append(typeStr).append(" ");
         if (isAggregated() && !isAggregationTypeImplicit) {
-            sb.append(aggregationType.name()).append(" ");
+            if (aggregationType == AggregateType.AGG_STATE_UNION) {
+                sb.append(aggStateDesc.toSql()).append(" ");
+            } else {
+                sb.append(aggregationType.name()).append(" ");
+            }
         }
         if (isAllowNull) {
             sb.append("NULL ");
         } else {
             sb.append("NOT NULL ");
         }
-        if (defaultExpr != null && "now()".equalsIgnoreCase(defaultExpr.getExpr())) {
-            // compatible with mysql
-            sb.append("DEFAULT ").append("CURRENT_TIMESTAMP").append(" ");
-        } else if (defaultValue != null && getPrimitiveType() != PrimitiveType.HLL &&
-                getPrimitiveType() != PrimitiveType.BITMAP) {
-            sb.append("DEFAULT \"").append(defaultValue).append("\" ");
+        if (defaultExpr == null && isAutoIncrement) {
+            sb.append("AUTO_INCREMENT ");
+        } else if (defaultExpr != null) {
+            if ("now()".equalsIgnoreCase(defaultExpr.getExpr())) {
+                // compatible with mysql
+                sb.append("DEFAULT ").append("CURRENT_TIMESTAMP").append(" ");
+            } else {
+                sb.append("DEFAULT ").append("(").append(defaultExpr.getExpr()).append(") ");
+            }
+        } else if (defaultValue != null && !type.isOnlyMetricType()) {
+            sb.append("DEFAULT \"").append(new UnicodeUnescaper().translate(StringEscapeUtils.escapeJava(defaultValue)))
+                    .append("\" ");
+        } else if (isGeneratedColumn()) {
+            String generatedColumnSql;
+            if (idToColumn != null) {
+                generatedColumnSql = AstToSQLBuilder.toSQL(generatedColumnExpr.convertToColumnNameExpr(idToColumn));
+            } else {
+                generatedColumnSql = generatedColumnExpr.toSql();
+            }
+            sb.append("AS ").append(generatedColumnSql).append(" ");
         }
-        sb.append("COMMENT \"").append(comment).append("\"");
+        sb.append("COMMENT \"").append(getDisplayComment()).append("\"");
 
         return sb.toString();
     }
@@ -449,14 +652,14 @@ public class Column implements Writable {
     }
 
     public DefaultValueType getDefaultValueType() {
-        if (defaultValue != null) {
-            return DefaultValueType.CONST;
-        } else if (defaultExpr != null) {
+        if (defaultExpr != null) {
             if ("now()".equalsIgnoreCase(defaultExpr.getExpr())) {
                 return DefaultValueType.CONST;
             } else {
                 return DefaultValueType.VARY;
             }
+        } else if (defaultValue != null) {
+            return DefaultValueType.CONST;
         }
         return DefaultValueType.NULL;
     }
@@ -467,20 +670,24 @@ public class Column implements Writable {
     // This function is only used to a const default value like "-1" or now().
     // If the default value is uuid(), this function is not suitable.
     public String calculatedDefaultValue() {
+        if (defaultExpr != null) {
+            if ("now()".equalsIgnoreCase(defaultExpr.getExpr())) {
+                // current transaction time
+                if (ConnectContext.get() != null) {
+                    LocalDateTime localDateTime = Instant.ofEpochMilli(ConnectContext.get().getStartTime())
+                            .atZone(TimeUtils.getTimeZone().toZoneId()).toLocalDateTime();
+                    return localDateTime.format(DATE_TIME_FORMATTER);
+                } else {
+                    // should not run up here
+                    return LocalDateTime.now().format(DATE_TIME_FORMATTER);
+                }
+            }
+        }
+
         if (defaultValue != null) {
             return defaultValue;
         }
-        if ("now()".equalsIgnoreCase(defaultExpr.getExpr())) {
-            // current transaction time
-            if (ConnectContext.get() != null) {
-                LocalDateTime localDateTime = Instant.ofEpochMilli(ConnectContext.get().getStartTime())
-                        .atZone(TimeUtils.getTimeZone().toZoneId()).toLocalDateTime();
-                return localDateTime.format(DateTimeFormatter.ofPattern(DATE_TIME_FORMAT));
-            } else {
-                // should not run up here
-                return LocalDateTime.now().format(DateTimeFormatter.ofPattern(DATE_TIME_FORMAT));
-            }
-        }
+
         return null;
     }
 
@@ -491,14 +698,18 @@ public class Column implements Writable {
     // This function is only used to a const default value like "-1" or now().
     // If the default value is uuid(), this function is not suitable.
     public String calculatedDefaultValueWithTime(long currentTimestamp) {
+        if (defaultExpr != null) {
+            if ("now()".equalsIgnoreCase(defaultExpr.getExpr())) {
+                LocalDateTime localDateTime = Instant.ofEpochMilli(currentTimestamp)
+                        .atZone(TimeUtils.getTimeZone().toZoneId()).toLocalDateTime();
+                return localDateTime.format(DATE_TIME_FORMATTER);
+            }
+        }
+
         if (defaultValue != null) {
             return defaultValue;
         }
-        if ("now()".equalsIgnoreCase(defaultExpr.getExpr())) {
-            LocalDateTime localDateTime = Instant.ofEpochMilli(currentTimestamp)
-                    .atZone(TimeUtils.getTimeZone().toZoneId()).toLocalDateTime();
-            return localDateTime.format(DateTimeFormatter.ofPattern(DATE_TIME_FORMAT));
-        }
+
         return null;
     }
 
@@ -507,14 +718,21 @@ public class Column implements Writable {
             return defaultValue;
         } else if (defaultExpr != null) {
             if ("now()".equalsIgnoreCase(defaultExpr.getExpr())) {
-                extras.add("DEFAULT_GENERATED");
+                if (extras != null) {
+                    extras.add("DEFAULT_GENERATED");
+                }
                 return "CURRENT_TIMESTAMP";
+            } else {
+                if (extras != null) {
+                    extras.add("DEFAULT_GENERATED");
+                }
+                return defaultExpr.getExpr();
             }
         }
-        return FeConstants.null_string;
+        return null;
     }
 
-    public String toSqlWithoutAggregateTypeName() {
+    public String toSqlWithoutAggregateTypeName(Map<ColumnId, Column> idToColumn) {
         StringBuilder sb = new StringBuilder();
         sb.append("`").append(name).append("` ");
         String typeStr = type.toSql();
@@ -524,9 +742,30 @@ public class Column implements Writable {
         } else {
             sb.append("NOT NULL ");
         }
-        if (defaultValue != null && getPrimitiveType() != PrimitiveType.HLL &&
-                getPrimitiveType() != PrimitiveType.BITMAP) {
-            sb.append("DEFAULT \"").append(defaultValue).append("\" ");
+        if (defaultExpr == null) {
+            if (isAutoIncrement) {
+                sb.append("AUTO_INCREMENT ");
+            }
+            if (defaultValue != null && !type.isOnlyMetricType()) {
+                sb.append("DEFAULT \"").append(new UnicodeUnescaper().translate(StringEscapeUtils.escapeJava(defaultValue)))
+                        .append("\" ");
+            }
+        } else {
+            if ("now()".equalsIgnoreCase(defaultExpr.getExpr())) {
+                // compatible with mysql
+                sb.append("DEFAULT ").append("CURRENT_TIMESTAMP").append(" ");
+            } else {
+                sb.append("DEFAULT ").append("(").append(defaultExpr.getExpr()).append(") ");
+            }
+        }
+        if (isGeneratedColumn()) {
+            String generatedColumnSql;
+            if (idToColumn != null) {
+                generatedColumnSql = AstToSQLBuilder.toSQL(generatedColumnExpr.convertToColumnNameExpr(idToColumn));
+            } else {
+                generatedColumnSql = generatedColumnExpr.toSql();
+            }
+            sb.append("AS ").append(generatedColumnSql).append(" ");
         }
         sb.append("COMMENT \"").append(comment).append("\"");
 
@@ -535,12 +774,12 @@ public class Column implements Writable {
 
     @Override
     public String toString() {
-        return toSql();
+        return toSql(null);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(this.name, this.type);
+        return Objects.hash(this.columnId.getId().toLowerCase(), this.type);
     }
 
     @Override
@@ -563,6 +802,9 @@ public class Column implements Writable {
         if (this.aggregationType != other.getAggregationType()) {
             return false;
         }
+        if (this.aggStateDesc != null && !this.aggStateDesc.equals(other.aggStateDesc)) {
+            return false;
+        }
         if (this.isAggregationTypeImplicit != other.isAggregationTypeImplicit()) {
             return false;
         }
@@ -575,73 +817,114 @@ public class Column implements Writable {
         if (!this.isSameDefaultValue(other)) {
             return false;
         }
-
-        if (this.getStrLen() != other.getStrLen()) {
+        if (this.isGeneratedColumn() && !other.isGeneratedColumn()) {
             return false;
         }
-        if (this.getPrecision() != other.getPrecision()) {
-            return false;
-        }
-        if (this.getScale() != other.getScale()) {
+        if (this.isGeneratedColumn() &&
+                !this.generatedColumnExpr.equals(other.generatedColumnExpr)) {
             return false;
         }
 
-        return comment.equals(other.getComment());
+        return comment == null ? other.comment == null : comment.equals(other.getComment());
+    }
+
+    public boolean isSchemaCompatible(Column other) {
+        if (!this.name.equalsIgnoreCase(other.getName())) {
+            return false;
+        }
+        if (!this.getType().equals(other.getType())) {
+            return false;
+        }
+        if (!(aggregationType == other.aggregationType || (AggregateType.isNullOrNone(aggregationType) &&
+                AggregateType.isNullOrNone(other.getAggregationType())))) {
+            return false;
+        }
+        if (this.aggStateDesc != null && !this.aggStateDesc.equals(other.aggStateDesc)) {
+            return false;
+        }
+        if (this.isAggregationTypeImplicit != other.isAggregationTypeImplicit()) {
+            return false;
+        }
+        if (this.isKey != other.isKey()) {
+            return false;
+        }
+        if (this.isAllowNull != other.isAllowNull) {
+            return false;
+        }
+        return true;
+    }
+
+
+
+    public static Column read(DataInput in) throws IOException {
+        String json = Text.readString(in);
+        return GsonUtils.GSON.fromJson(json, Column.class);
+    }
+
+    public String generatedColumnExprToString() {
+        if (generatedColumnExprSerialized != null && generatedColumnExprSerialized.getExpressionSql() != null) {
+            return generatedColumnExprSerialized.deserialize().toSql();
+        }
+        return null;
     }
 
     @Override
-    public void write(DataOutput out) throws IOException {
-        String json = GsonUtils.GSON.toJson(this);
-        Text.writeString(out, json);
+    public void gsonPostProcess() throws IOException {
+        if (generatedColumnExprSerialized != null && generatedColumnExprSerialized.getExpressionSql() != null) {
+            generatedColumnExpr = generatedColumnExprSerialized.deserialize();
+        }
+
+        if (columnId == null || Strings.isNullOrEmpty(columnId.getId())) {
+            columnId = ColumnId.create(name);
+        }
+        if (this.aggStateDesc != null) {
+            this.type.setAggStateDesc(this.aggStateDesc);
+        }
     }
 
-    private void readFields(DataInput in) throws IOException {
-        name = Text.readString(in);
-        type = ColumnType.read(in);
-        boolean notNull = in.readBoolean();
-        if (notNull) {
-            aggregationType = AggregateType.valueOf(Text.readString(in));
+    @Override
+    public void gsonPreProcess() throws IOException {
+        if (generatedColumnExpr != null) {
+            generatedColumnExprSerialized = ExpressionSerializedObject.create(generatedColumnExpr);
+        }
+    }
 
-            if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_30) {
-                isAggregationTypeImplicit = in.readBoolean();
-            } else {
-                isAggregationTypeImplicit = false;
+    public ColumnId getColumnId() {
+        return columnId;
+    }
+
+    public void setUniqueId(int colUniqueId) {
+        this.uniqueId = colUniqueId;
+    }
+
+    public int getUniqueId() {
+        return this.uniqueId;
+    }
+
+    public String getPhysicalName() {
+        return physicalName;
+    }
+
+    // return max unique id of all fields
+    public int getMaxUniqueId() {
+        return Math.max(this.uniqueId, type.getMaxUniqueId());
+    }
+
+    public void setIndexFlag(TColumn tColumn, List<Index> indexes, Set<ColumnId> bfColumns) {
+        for (Index index : indexes) {
+            if (index.getIndexType() == IndexDef.IndexType.BITMAP) {
+                List<ColumnId> columns = index.getColumns();
+                if (tColumn.getColumn_name().equalsIgnoreCase(columns.get(0).getId())) {
+                    tColumn.setHas_bitmap_index(true);
+                }
             }
         }
-
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_30) {
-            isKey = in.readBoolean();
-        } else {
-            isKey = (aggregationType == null);
-        }
-
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_22) {
-            isAllowNull = in.readBoolean();
-        } else {
-            isAllowNull = false;
-        }
-
-        notNull = in.readBoolean();
-        if (notNull) {
-            defaultValue = Text.readString(in);
-        }
-        stats = ColumnStats.read(in);
-
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_10) {
-            comment = Text.readString(in);
-        } else {
-            comment = "";
+        if (bfColumns != null && bfColumns.contains(this.columnId)) {
+            tColumn.setIs_bloom_filter_column(true);
         }
     }
 
-    public static Column read(DataInput in) throws IOException {
-        if (GlobalStateMgr.getCurrentStateJournalVersion() < FeMetaVersion.VERSION_86) {
-            Column column = new Column();
-            column.readFields(in);
-            return column;
-        } else {
-            String json = Text.readString(in);
-            return GsonUtils.GSON.fromJson(json, Column.class);
-        }
+    public AggStateDesc getAggStateDesc() {
+        return this.aggStateDesc;
     }
 }

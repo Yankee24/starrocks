@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/common/proc/ProcService.java
 
@@ -23,7 +36,9 @@ package com.starrocks.common.proc;
 
 import com.google.common.base.Strings;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.consistency.MetaRecoveryProdDir;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.warehouse.WarehouseProcDir;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -31,13 +46,12 @@ import org.apache.logging.log4j.Logger;
 public final class ProcService {
     private static final Logger LOG = LogManager.getLogger(ProcService.class);
     private static ProcService INSTANCE;
-
     private BaseProcDir root;
 
     private ProcService() {
         root = new BaseProcDir();
-        root.register("auth", new AuthProcDir(GlobalStateMgr.getCurrentState().getAuth()));
-        root.register("backends", new BackendsProcDir(GlobalStateMgr.getCurrentSystemInfo()));
+        root.register("backends", new BackendsProcDir(GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo()));
+        root.register("compute_nodes", new ComputeNodeProcDir(GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo()));
         root.register("dbs", new DbsProcDir(GlobalStateMgr.getCurrentState()));
         root.register("jobs", new JobsDbProcDir(GlobalStateMgr.getCurrentState()));
         root.register("statistic", new StatisticProcDir(GlobalStateMgr.getCurrentState()));
@@ -49,11 +63,17 @@ public final class ProcService {
         root.register("transactions", new TransDbProcDir());
         root.register("monitor", new MonitorProcDir());
         root.register("current_queries", new CurrentQueryStatisticsProcDir());
+        root.register("global_current_queries", new CurrentGlobalQueryStatisticsProcDir());
         root.register("current_backend_instances", new CurrentQueryBackendInstanceProcDir());
         root.register("cluster_balance", new ClusterBalanceProcDir());
         root.register("routine_loads", new RoutineLoadsProcDir());
+        root.register("stream_loads", new StreamLoadsProcDir());
         root.register("colocation_group", new ColocationGroupProcDir());
         root.register("catalog", GlobalStateMgr.getCurrentState().getCatalogMgr().getProcNode());
+        root.register("compactions", new CompactionsProcNode());
+        root.register("warehouses", new WarehouseProcDir());
+        root.register("meta_recovery", new MetaRecoveryProdDir());
+        root.register("replications", new ReplicationsProcNode());
     }
 
     // Get the corresponding PROC Node by the specified path

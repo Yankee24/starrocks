@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/http/action/SystemAction.java
 
@@ -33,7 +46,7 @@ import com.starrocks.http.BaseRequest;
 import com.starrocks.http.BaseResponse;
 import com.starrocks.http.IllegalArgException;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.qe.MasterOpExecutor;
+import com.starrocks.qe.LeaderOpExecutor;
 import com.starrocks.qe.OriginStatement;
 import com.starrocks.qe.ShowResultSet;
 import com.starrocks.server.GlobalStateMgr;
@@ -41,6 +54,7 @@ import io.netty.handler.codec.http.HttpMethod;
 import org.apache.commons.validator.routines.UrlValidator;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.owasp.encoder.Encode;
 
 import java.util.List;
 import java.util.stream.Collectors;
@@ -64,7 +78,9 @@ public class SystemAction extends WebBaseAction {
         if (Strings.isNullOrEmpty(currentPath)) {
             currentPath = "/";
         }
-        appendSystemInfo(response.getContent(), currentPath, currentPath);
+        // HTML encode the path to prevent XSS
+        String encodePath = Encode.forHtml(currentPath);
+        appendSystemInfo(response.getContent(), encodePath, encodePath);
 
         getPageFooter(response.getContent());
         writeResponse(request, response);
@@ -86,20 +102,20 @@ public class SystemAction extends WebBaseAction {
 
         List<String> columnNames = null;
         List<List<String>> rows = null;
-        if (!GlobalStateMgr.getCurrentState().isMaster()) {
+        if (!GlobalStateMgr.getCurrentState().isLeader()) {
             // forward to master
             String showProcStmt = "SHOW PROC \"" + procPath + "\"";
-            MasterOpExecutor masterOpExecutor = new MasterOpExecutor(new OriginStatement(showProcStmt, 0),
+            LeaderOpExecutor leaderOpExecutor = new LeaderOpExecutor(new OriginStatement(showProcStmt, 0),
                     ConnectContext.get(), RedirectStatus.FORWARD_NO_SYNC);
             try {
-                masterOpExecutor.execute();
+                leaderOpExecutor.execute();
             } catch (Exception e) {
                 LOG.warn("Fail to forward. ", e);
                 buffer.append("<p class=\"text-error\"> Failed to forward request to master</p>");
                 return;
             }
 
-            ShowResultSet resultSet = masterOpExecutor.getProxyResultSet();
+            ShowResultSet resultSet = leaderOpExecutor.getProxyResultSet();
             if (resultSet == null) {
                 buffer.append("<p class=\"text-error\"> Failed to get result from master</p>");
                 return;
@@ -150,7 +166,7 @@ public class SystemAction extends WebBaseAction {
                     buffer.append("URL");
                     buffer.append("</a>");
                 } else {
-                    buffer.append(str.replaceAll("\\n", "<br/>"));
+                    buffer.append(str != null ? str.replaceAll("\\n", "<br/>") : "");
                 }
                 buffer.append("</td>");
                 ++columnIndex;
@@ -177,6 +193,9 @@ public class SystemAction extends WebBaseAction {
                     lastSlashIndex = tempIndex;
                     return path.substring(0, lastSlashIndex);
                 }
+            } else {
+                // exist the loop
+                break;
             }
         }
         return "/";

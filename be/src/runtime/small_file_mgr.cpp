@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/small_file_mgr.cpp
 
@@ -21,17 +34,16 @@
 
 #include "runtime/small_file_mgr.h"
 
-#include <boost/algorithm/string/classification.hpp> // boost::is_any_of
-#include <boost/algorithm/string/predicate.hpp>      // boost::algorithm::starts_with
+#include <boost/algorithm/string/predicate.hpp> // boost::algorithm::starts_with
 #include <cstdint>
 #include <cstdio>
 #include <sstream>
 #include <utility>
 
+#include "agent/master_info.h"
 #include "common/status.h"
 #include "fs/fs.h"
 #include "fs/fs_util.h"
-#include "gen_cpp/HeartbeatService.h"
 #include "gutil/strings/split.h"
 #include "gutil/strings/substitute.h"
 #include "http/http_client.h"
@@ -64,7 +76,7 @@ Status SmallFileMgr::_load_local_files() {
         }
         auto st = _load_single_file(_local_path, std::string(file));
         if (!st.ok()) {
-            LOG(WARNING) << "load small file failed: " << st.get_error_msg();
+            LOG(WARNING) << "load small file failed: " << st.message();
         }
         return true;
     };
@@ -158,9 +170,9 @@ Status SmallFileMgr::_download_file(int64_t file_id, const std::string& md5, std
     HttpClient client;
 
     std::stringstream url_ss;
-    TMasterInfo* master_info = _exec_env->master_info();
-    url_ss << master_info->network_address.hostname << ":" << master_info->http_port << "/api/get_small_file?"
-           << "file_id=" << file_id << "&token=" << master_info->token;
+    TMasterInfo master_info = get_master_info();
+    url_ss << master_info.network_address.hostname << ":" << master_info.http_port << "/api/get_small_file?"
+           << "file_id=" << file_id << "&token=" << master_info.token;
 
     std::string url = url_ss.str();
 

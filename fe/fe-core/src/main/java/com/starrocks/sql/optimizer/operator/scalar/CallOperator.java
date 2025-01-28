@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.optimizer.operator.scalar;
 
 import com.google.common.collect.Lists;
@@ -14,14 +27,17 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static java.util.Objects.requireNonNull;
 
 /**
  * Scalar operator support function call
+ * Please be careful when adding new attributes. Rewriting expr operation exists everywhere in the optimizer.
+ * If you add new attributes, please make sure that the new attributes will not be erased by the rewriting operation.
  */
 public class CallOperator extends ScalarOperator {
-    private final String fnName;
+    private String fnName;
     /**
      * TODO:
      * We need a FunctionHandle to store the required information
@@ -31,9 +47,15 @@ public class CallOperator extends ScalarOperator {
 
     protected List<ScalarOperator> arguments;
 
-    private final Function fn;
+    private Function fn;
     // The flag for distinct function
-    private final boolean isDistinct;
+    private boolean isDistinct;
+
+    // The flag for remove distinct agg func because add extra agg steps in SplitMultiPhaseAggRule
+    private boolean removedDistinct;
+
+    // Ignore nulls.
+    private boolean ignoreNulls = false;
 
     public CallOperator(String fnName, Type returnType, List<ScalarOperator> arguments) {
         this(fnName, returnType, arguments, null);
@@ -45,11 +67,25 @@ public class CallOperator extends ScalarOperator {
 
     public CallOperator(String fnName, Type returnType, List<ScalarOperator> arguments, Function fn,
                         boolean isDistinct) {
+        this(fnName, returnType, arguments, fn, isDistinct, false);
+    }
+
+    public CallOperator(String fnName, Type returnType, List<ScalarOperator> arguments, Function fn,
+                        boolean isDistinct, boolean removedDistinct) {
         super(OperatorType.CALL, returnType);
         this.fnName = requireNonNull(fnName, "fnName is null");
         this.arguments = new ArrayList<>(requireNonNull(arguments, "arguments is null"));
         this.fn = fn;
         this.isDistinct = isDistinct;
+        this.removedDistinct = removedDistinct;
+    }
+
+    public void setIgnoreNulls(boolean ignoreNulls) {
+        this.ignoreNulls = ignoreNulls;
+    }
+
+    public boolean getIgnoreNulls() {
+        return ignoreNulls;
     }
 
     public String getFnName() {
@@ -58,6 +94,14 @@ public class CallOperator extends ScalarOperator {
 
     public Function getFunction() {
         return fn;
+    }
+
+    public void setFunction(Function fn) {
+        this.fn = fn;
+    }
+
+    public List<ScalarOperator> getArguments() {
+        return arguments;
     }
 
     public boolean isDistinct() {
@@ -70,6 +114,10 @@ public class CallOperator extends ScalarOperator {
 
     public boolean isAggregate() {
         return fn != null && fn instanceof AggregateFunction;
+    }
+
+    public boolean isRemovedDistinct() {
+        return removedDistinct;
     }
 
     @Override
@@ -124,12 +172,26 @@ public class CallOperator extends ScalarOperator {
         return true;
     }
 
+    @Override
     public ColumnRefSet getUsedColumns() {
         ColumnRefSet used = new ColumnRefSet();
         for (ScalarOperator child : arguments) {
             used.union(child.getUsedColumns());
         }
         return used;
+    }
+
+    @Override
+    public boolean isConstant() {
+        if (FunctionSet.nonDeterministicFunctions.contains(fnName)) {
+            return false;
+        }
+        for (ScalarOperator child : getChildren()) {
+            if (!child.isConstant()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     @Override
@@ -146,16 +208,36 @@ public class CallOperator extends ScalarOperator {
             return false;
         }
         CallOperator other = (CallOperator) obj;
+        return isDistinct == other.isDistinct && removedDistinct == other.removedDistinct &&
+                Objects.equals(fnName, other.fnName) &&
+                Objects.equals(type, other.type) &&
+                Objects.equals(arguments, other.arguments) &&
+                Objects.equals(fn, other.fn);
+    }
 
-        //Non-deterministic functions cannot be equal by default, and expression reuse is disabled
-        if (FunctionSet.nonDeterministicFunctions.contains(fnName)) {
+
+    // Only used for meaning equivalence comparison in iceberg table scan predicate
+    @Override
+    public boolean equivalent(Object obj) {
+        if (this == obj) {
+            return true;
+        }
+        if (obj == null || getClass() != obj.getClass()) {
+            return false;
+        }
+
+        CallOperator other = (CallOperator) obj;
+        if (this.arguments.size() != other.arguments.size()) {
             return false;
         }
 
         return isDistinct == other.isDistinct &&
                 Objects.equals(fnName, other.fnName) &&
                 Objects.equals(type, other.type) &&
-                Objects.equals(arguments, other.arguments);
+                Objects.equals(fn, other.fn) &&
+                IntStream.range(0, this.arguments.size())
+                        .allMatch(i -> this.arguments.get(i).equivalent(other.arguments.get(i)));
+
     }
 
     @Override
@@ -165,6 +247,13 @@ public class CallOperator extends ScalarOperator {
         List<ScalarOperator> newArguments = Lists.newArrayList();
         this.arguments.forEach(p -> newArguments.add(p.clone()));
         operator.arguments = newArguments;
+        // copy fn
+        if (this.fn != null) {
+            operator.fn = this.fn.copy();
+        }
+        operator.fnName = this.fnName;
+        operator.isDistinct = this.isDistinct;
+        operator.ignoreNulls = this.ignoreNulls;
         return operator;
     }
 

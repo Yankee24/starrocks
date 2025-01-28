@@ -19,15 +19,12 @@ package com.starrocks.analysis;
 
 import com.starrocks.catalog.Table;
 import com.starrocks.common.AnalysisException;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 /**
  * An actual table, such as OLAP table or a MySQL table.
  * BaseTableRef.
  */
 public class BaseTableRef extends TableRef {
-    private static final Logger LOG = LogManager.getLogger(BaseTableRef.class);
 
     private Table table;
 
@@ -69,9 +66,6 @@ public class BaseTableRef extends TableRef {
         name.analyze(analyzer);
         desc = analyzer.registerTableRef(this);
         isAnalyzed = true;  // true that we have assigned desc
-        analyzeJoin(analyzer);
-        analyzeSortHints();
-        analyzeHints();
     }
 }
 

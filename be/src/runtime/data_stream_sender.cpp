@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/data_stream_sender.cpp
 
@@ -35,20 +48,21 @@
 #include "gen_cpp/BackendService.h"
 #include "gen_cpp/Types_types.h"
 #include "runtime/client_cache.h"
+#include "runtime/current_thread.h"
 #include "runtime/data_stream_mgr.h"
 #include "runtime/descriptors.h"
-#include "runtime/dpp_sink_internal.h"
 #include "runtime/exec_env.h"
-#include "runtime/raw_value.h"
 #include "runtime/runtime_state.h"
 #include "serde/protobuf_serde.h"
 #include "service/backend_options.h"
 #include "service/brpc.h"
-#include "util/block_compression.h"
 #include "util/brpc_stub_cache.h"
-#include "util/compression_utils.h"
+#include "util/compression/block_compression.h"
+#include "util/compression/compression_utils.h"
+#include "util/internal_service_recoverable_stub.h"
 #include "util/ref_count_closure.h"
 #include "util/thrift_client.h"
+#include "util/uid_util.h"
 
 namespace starrocks {
 
@@ -66,25 +80,16 @@ public:
     // combination. buffer_size is specified in bytes and a soft limit on
     // how much tuple data is getting accumulated before being sent; it only applies
     // when data is added via add_row() and not sent directly via send_batch().
-    Channel(DataStreamSender* parent, const RowDescriptor& row_desc, const TNetworkAddress& brpc_dest,
-            const TUniqueId& fragment_instance_id, PlanNodeId dest_node_id, int buffer_size, bool is_transfer_chain,
-            bool send_query_statistics_with_every_batch)
+    Channel(DataStreamSender* parent, const TNetworkAddress& brpc_dest, const TUniqueId& fragment_instance_id,
+            PlanNodeId dest_node_id, bool is_transfer_chain, bool send_query_statistics_with_every_batch)
             : _parent(parent),
-              _row_desc(row_desc),
               _fragment_instance_id(fragment_instance_id),
               _dest_node_id(dest_node_id),
-              _num_data_bytes_sent(0),
-              _request_seq(0),
-              _need_close(false),
               _brpc_dest_addr(brpc_dest),
               _is_transfer_chain(is_transfer_chain),
               _send_query_statistics_with_every_batch(send_query_statistics_with_every_batch) {}
 
     virtual ~Channel() {
-        if (_closure != nullptr && _closure->unref()) {
-            delete _closure;
-        }
-
         if (_chunk_closure != nullptr && _chunk_closure->unref()) {
             delete _chunk_closure;
         }
@@ -98,13 +103,13 @@ public:
     // This function will copy selective rows in chunks to batch.
     // indexes contains row index of chunk and this function will copy from input
     // 'from' and copy 'size' rows
-    Status add_rows_selective(RuntimeState* state, vectorized::Chunk* chunk, const uint32_t* row_indexes, uint32_t from,
+    Status add_rows_selective(RuntimeState* state, Chunk* chunk, const uint32_t* row_indexes, uint32_t from,
                               uint32_t size);
 
     // Send one chunk to remote, this chunk may be batched in this channel.
     // When the chunk is sent really rather than backend, *is_real_sent will
     // be set to true.
-    Status send_one_chunk(const vectorized::Chunk* chunk, bool eos, bool* is_real_sent);
+    Status send_one_chunk(const Chunk* chunk, bool eos, bool* is_real_sent);
 
     // Channel will sent input request directly without batch it.
     // This function is only used when broadcast, because request can be reused
@@ -115,17 +120,12 @@ public:
     // of close operation, client should call close_wait() to finish channel's close.
     // We split one close operation into two phases in order to make multiple channels
     // can run parallel.
-    void close(RuntimeState* state);
+    void close(RuntimeState* state) {}
 
     // Get close wait's response, to finish channel close operation.
     void close_wait(RuntimeState* state);
 
-    int64_t num_data_bytes_sent() const { return _num_data_bytes_sent; }
-
-    std::string get_fragment_instance_id_str() {
-        UniqueId uid(_fragment_instance_id);
-        return uid.to_string();
-    }
+    std::string get_fragment_instance_id_str() { return print_id(_fragment_instance_id); }
 
     TUniqueId get_fragment_instance_id() { return _fragment_instance_id; }
 
@@ -154,18 +154,15 @@ private:
 
     DataStreamSender* _parent;
 
-    const RowDescriptor& _row_desc;
     TUniqueId _fragment_instance_id;
     PlanNodeId _dest_node_id;
 
-    // the number of TRowBatch.data bytes sent successfully
-    int64_t _num_data_bytes_sent;
-    int64_t _request_seq;
+    int64_t _request_seq{0};
 
-    std::unique_ptr<vectorized::Chunk> _chunk;
+    std::unique_ptr<Chunk> _chunk;
     bool _is_first_chunk = true;
 
-    bool _need_close;
+    bool _need_close{false};
 
     TNetworkAddress _brpc_dest_addr;
 
@@ -182,8 +179,7 @@ private:
 
     size_t _current_request_bytes = 0;
 
-    doris::PBackendService_Stub* _brpc_stub = nullptr;
-    RefCountClosure<PTransmitDataResult>* _closure = nullptr;
+    std::shared_ptr<PInternalService_RecoverableStub> _brpc_stub;
 
     int32_t _brpc_timeout_ms = 500;
     // whether the dest can be treated as query statistics transfer chain.
@@ -201,6 +197,12 @@ Status DataStreamSender::Channel::init(RuntimeState* state) {
         LOG(WARNING) << "there is no brpc destination address's hostname"
                         ", maybe version is not compatible.";
         return Status::InternalError("no brpc destination");
+    }
+    _brpc_stub = state->exec_env()->brpc_stub_cache()->get_stub(_brpc_dest_addr);
+    if (UNLIKELY(_brpc_stub == nullptr)) {
+        auto msg = fmt::format("The brpc stub of {}:{} is null.", _brpc_dest_addr.hostname, _brpc_dest_addr.port);
+        LOG(WARNING) << msg;
+        return Status::InternalError(msg);
     }
 
     // initialize brpc request
@@ -225,7 +227,6 @@ Status DataStreamSender::Channel::init(RuntimeState* state) {
         _is_inited = true;
         return Status::OK();
     }
-    _brpc_stub = state->exec_env()->brpc_stub_cache()->get_stub(_brpc_dest_addr);
 
     _need_close = true;
     _is_inited = true;
@@ -233,7 +234,7 @@ Status DataStreamSender::Channel::init(RuntimeState* state) {
     return Status::OK();
 }
 
-Status DataStreamSender::Channel::send_one_chunk(const vectorized::Chunk* chunk, bool eos, bool* is_real_sent) {
+Status DataStreamSender::Channel::send_one_chunk(const Chunk* chunk, bool eos, bool* is_real_sent) {
     *is_real_sent = false;
 
     // If chunk is not null, append it to request
@@ -293,11 +294,11 @@ Status DataStreamSender::Channel::_do_send_chunk_rpc(PTransmitChunkParams* reque
     return Status::OK();
 }
 
-Status DataStreamSender::Channel::add_rows_selective(RuntimeState* state, vectorized::Chunk* chunk,
-                                                     const uint32_t* indexes, uint32_t from, uint32_t size) {
+Status DataStreamSender::Channel::add_rows_selective(RuntimeState* state, Chunk* chunk, const uint32_t* indexes,
+                                                     uint32_t from, uint32_t size) {
     // TODO(kks): find a way to remove this if condition
     if (UNLIKELY(_chunk == nullptr)) {
-        _chunk = chunk->clone_empty_with_tuple();
+        _chunk = chunk->clone_empty();
     }
 
     if (_chunk->num_rows() + size > state->chunk_size()) {
@@ -340,10 +341,6 @@ Status DataStreamSender::Channel::close_internal() {
     return Status::OK();
 }
 
-void DataStreamSender::Channel::close(RuntimeState* state) {
-    state->log_error(close_internal().get_error_msg());
-}
-
 void DataStreamSender::Channel::close_wait(RuntimeState* state) {
     if (_need_close) {
         auto st = _wait_prev_request();
@@ -363,21 +360,20 @@ void DataStreamSender::Channel::close_wait(RuntimeState* state) {
 DataStreamSender::DataStreamSender(RuntimeState* state, int sender_id, const RowDescriptor& row_desc,
                                    const TDataStreamSink& sink,
                                    const std::vector<TPlanFragmentDestination>& destinations,
-                                   int per_channel_buffer_size, bool send_query_statistics_with_every_batch,
-                                   bool enable_exchange_pass_through)
+                                   bool send_query_statistics_with_every_batch, bool enable_exchange_pass_through,
+                                   bool enable_exchange_perf)
         : _sender_id(sender_id),
           _state(state),
           _pool(state->obj_pool()),
-          _row_desc(row_desc),
           _current_channel_idx(0),
           _part_type(sink.output_partition.type),
-          _ignore_not_found(!sink.__isset.ignore_not_found || sink.ignore_not_found),
           _profile(nullptr),
           _serialize_chunk_timer(nullptr),
           _bytes_sent_counter(nullptr),
           _dest_node_id(sink.dest_node_id),
           _destinations(destinations),
           _enable_exchange_pass_through(enable_exchange_pass_through),
+          _enable_exchange_perf(enable_exchange_perf),
           _output_columns(sink.output_columns) {
     DCHECK_GT(destinations.size(), 0);
     DCHECK(sink.output_partition.type == TPartitionType::UNPARTITIONED ||
@@ -393,9 +389,9 @@ DataStreamSender::DataStreamSender(RuntimeState* state, int sender_id, const Row
         bool is_transfer_chain = (i == 0);
         const auto& fragment_instance_id = destinations[i].fragment_instance_id;
         if (fragment_id_to_channel_index.find(fragment_instance_id.lo) == fragment_id_to_channel_index.end()) {
-            _channel_shared_ptrs.emplace_back(
-                    new Channel(this, row_desc, destinations[i].brpc_server, fragment_instance_id, sink.dest_node_id,
-                                per_channel_buffer_size, is_transfer_chain, send_query_statistics_with_every_batch));
+            _channel_shared_ptrs.emplace_back(new Channel(this, destinations[i].brpc_server, fragment_instance_id,
+                                                          sink.dest_node_id, is_transfer_chain,
+                                                          send_query_statistics_with_every_batch));
             fragment_id_to_channel_index.insert({fragment_instance_id.lo, _channel_shared_ptrs.size() - 1});
             _channels.push_back(_channel_shared_ptrs.back().get());
         } else {
@@ -407,37 +403,16 @@ DataStreamSender::DataStreamSender(RuntimeState* state, int sender_id, const Row
     _request_bytes_threshold = config::max_transmit_batched_bytes;
 }
 
-// We use the PartitionRange to compare here. It should not be a member function of PartitionInfo
-// class because there are some other member in it.
-static bool compare_part_use_range(const PartitionInfo* v1, const PartitionInfo* v2) {
-    return v1->range() < v2->range();
-}
-
-Status DataStreamSender::init(const TDataSink& tsink) {
-    RETURN_IF_ERROR(DataSink::init(tsink));
+Status DataStreamSender::init(const TDataSink& tsink, RuntimeState* state) {
+    RETURN_IF_ERROR(DataSink::init(tsink, state));
     const TDataStreamSink& t_stream_sink = tsink.stream_sink;
     if (_part_type == TPartitionType::HASH_PARTITIONED ||
         _part_type == TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED) {
-        RETURN_IF_ERROR(
-                Expr::create_expr_trees(_pool, t_stream_sink.output_partition.partition_exprs, &_partition_expr_ctxs));
+        RETURN_IF_ERROR(Expr::create_expr_trees(_pool, t_stream_sink.output_partition.partition_exprs,
+                                                &_partition_expr_ctxs, state));
     } else if (_part_type == TPartitionType::RANGE_PARTITIONED) {
-        // Range partition
-        // Partition Exprs
-        RETURN_IF_ERROR(
-                Expr::create_expr_trees(_pool, t_stream_sink.output_partition.partition_exprs, &_partition_expr_ctxs));
-        // Partition infos
-        int num_parts = t_stream_sink.output_partition.partition_infos.size();
-        if (num_parts == 0) {
-            return Status::InternalError("Empty partition info.");
-        }
-        for (int i = 0; i < num_parts; ++i) {
-            PartitionInfo* info = _pool->add(new PartitionInfo());
-            RETURN_IF_ERROR(PartitionInfo::from_thrift(_pool, t_stream_sink.output_partition.partition_infos[i], info,
-                                                       _state->chunk_size()));
-            _partition_infos.push_back(info);
-        }
-        // partitions should be in ascending order
-        std::sort(_partition_infos.begin(), _partition_infos.end(), compare_part_use_range);
+        // NOTE: should never go here
+        return Status::NotSupported("Range partition is not supported anymore.");
     } else {
     }
 
@@ -478,11 +453,6 @@ Status DataStreamSender::prepare(RuntimeState* state) {
     if (_part_type == TPartitionType::HASH_PARTITIONED ||
         _part_type == TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED) {
         RETURN_IF_ERROR(Expr::prepare(_partition_expr_ctxs, state));
-    } else {
-        RETURN_IF_ERROR(Expr::prepare(_partition_expr_ctxs, state));
-        for (auto iter : _partition_infos) {
-            RETURN_IF_ERROR(iter->prepare(state, _row_desc));
-        }
     }
 
     // Randomize the order we open/transmit to channels to avoid thundering herd problems.
@@ -529,13 +499,10 @@ Status DataStreamSender::open(RuntimeState* state) {
     // RETURN_IF_ERROR(DataSink::open(state));
     DCHECK(state != nullptr);
     RETURN_IF_ERROR(Expr::open(_partition_expr_ctxs, state));
-    for (auto iter : _partition_infos) {
-        RETURN_IF_ERROR(iter->open(state));
-    }
     return Status::OK();
 }
 
-Status DataStreamSender::send_chunk(RuntimeState* state, vectorized::Chunk* chunk) {
+Status DataStreamSender::send_chunk(RuntimeState* state, Chunk* chunk) {
     SCOPED_TIMER(_profile->total_time_counter());
     uint16_t num_rows = chunk->num_rows();
     if (num_rows == 0) {
@@ -598,11 +565,13 @@ Status DataStreamSender::send_chunk(RuntimeState* state, vectorized::Chunk* chun
 
             // compute row indexes for each channel
             _channel_row_idx_start_points.assign(num_channels + 1, 0);
+
             for (uint16_t i = 0; i < num_rows; ++i) {
                 uint16_t channel_index = _hash_values[i] % num_channels;
                 _channel_row_idx_start_points[channel_index]++;
                 _hash_values[i] = channel_index;
             }
+
             // NOTE:
             // we make the last item equal with number of rows of this chunk
             for (int i = 1; i <= num_channels; ++i) {
@@ -648,7 +617,7 @@ Status DataStreamSender::close(RuntimeState* state, Status exec_status) {
         butil::IOBuf attachment;
         construct_brpc_attachment(&_chunk_request, &attachment);
         for (auto& _channel : _channels) {
-            _channel->send_chunk_request(&_chunk_request, attachment);
+            (void)_channel->send_chunk_request(&_chunk_request, attachment);
         }
     } else {
         for (auto& _channel : _channels) {
@@ -660,34 +629,26 @@ Status DataStreamSender::close(RuntimeState* state, Status exec_status) {
     for (auto& _channel : _channels) {
         _channel->close_wait(state);
     }
-    for (auto iter : _partition_infos) {
-        auto st = iter->close(state);
-        if (!st.ok()) {
-            LOG(WARNING) << "fail to close sender partition, st=" << st.to_string();
-            if (_close_status.ok()) {
-                _close_status = st;
-            }
-        }
-    }
     Expr::close(_partition_expr_ctxs, state);
 
     return _close_status;
 }
 
-Status DataStreamSender::serialize_chunk(const vectorized::Chunk* src, ChunkPB* dst, bool* is_first_chunk,
-                                         int num_receivers) {
+Status DataStreamSender::serialize_chunk(const Chunk* src, ChunkPB* dst, bool* is_first_chunk, int num_receivers) {
     VLOG_ROW << "serializing " << src->num_rows() << " rows";
 
     {
         SCOPED_TIMER(_serialize_chunk_timer);
         // We only serialize chunk meta for first chunk
         if (*is_first_chunk) {
-            StatusOr<ChunkPB> res = serde::ProtobufChunkSerde::serialize(*src);
+            StatusOr<ChunkPB> res = Status::OK();
+            TRY_CATCH_BAD_ALLOC(res = serde::ProtobufChunkSerde::serialize(*src));
             if (!res.ok()) return res.status();
             res->Swap(dst);
             *is_first_chunk = false;
         } else {
-            StatusOr<ChunkPB> res = serde::ProtobufChunkSerde::serialize_without_meta(*src);
+            StatusOr<ChunkPB> res = Status::OK();
+            TRY_CATCH_BAD_ALLOC(res = serde::ProtobufChunkSerde::serialize_without_meta(*src));
             if (!res.ok()) return res.status();
             res->Swap(dst);
         }
@@ -706,23 +667,32 @@ Status DataStreamSender::serialize_chunk(const vectorized::Chunk* src, ChunkPB* 
     if (_compress_codec != nullptr && uncompressed_size > 0) {
         SCOPED_TIMER(_compress_timer);
 
-        // Try compressing data to _compression_scratch, swap if compressed data is smaller
-        int max_compressed_size = _compress_codec->max_compressed_len(uncompressed_size);
+        if (use_compression_pool(_compress_codec->type())) {
+            Slice compressed_slice;
+            Slice input(dst->data());
+            RETURN_IF_ERROR(_compress_codec->compress(input, &compressed_slice, true, uncompressed_size, nullptr,
+                                                      &_compression_scratch));
+        } else {
+            int max_compressed_size = _compress_codec->max_compressed_len(uncompressed_size);
 
-        if (_compression_scratch.size() < max_compressed_size) {
-            _compression_scratch.resize(max_compressed_size);
+            if (_compression_scratch.size() < max_compressed_size) {
+                _compression_scratch.resize(max_compressed_size);
+            }
+
+            Slice compressed_slice{_compression_scratch.data(), _compression_scratch.size()};
+
+            Slice input(dst->data());
+            RETURN_IF_ERROR(_compress_codec->compress(input, &compressed_slice));
+            _compression_scratch.resize(compressed_slice.size);
         }
 
-        Slice compressed_slice{_compression_scratch.data(), _compression_scratch.size()};
-        _compress_codec->compress(dst->data(), &compressed_slice);
-        double compress_ratio = (static_cast<double>(uncompressed_size)) / compressed_slice.size;
+        double compress_ratio = (static_cast<double>(uncompressed_size)) / _compression_scratch.size();
         if (LIKELY(compress_ratio > config::rpc_compress_ratio_threshold)) {
-            _compression_scratch.resize(compressed_slice.size);
             dst->mutable_data()->swap(reinterpret_cast<std::string&>(_compression_scratch));
             dst->set_compress_type(_compress_type);
         }
 
-        VLOG_ROW << "uncompressed size: " << uncompressed_size << ", compressed size: " << compressed_slice.size;
+        VLOG_ROW << "uncompressed size: " << uncompressed_size << ", compressed size: " << _compression_scratch.size();
     }
     size_t chunk_size = dst->data().size();
     VLOG_ROW << "chunk data size " << chunk_size;
@@ -739,18 +709,6 @@ void DataStreamSender::construct_brpc_attachment(PTransmitChunkParams* params, b
         attachment->append(chunk->data());
         chunk->clear_data();
     }
-}
-
-int64_t DataStreamSender::get_num_data_bytes_sent() const {
-    // TODO: do we need synchronization here or are reads & writes to 8-byte ints
-    // atomic?
-    int64_t result = 0;
-
-    for (auto _channel : _channels) {
-        result += _channel->num_data_bytes_sent();
-    }
-
-    return result;
 }
 
 } // namespace starrocks

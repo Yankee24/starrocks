@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -9,6 +21,7 @@
 namespace starrocks {
 
 typedef __int128 int128_t;
+typedef unsigned __int128 uint128_t;
 
 template <typename T>
 inline constexpr bool is_underlying_type_of_decimal = false;
@@ -112,10 +125,14 @@ inline constexpr T get_min_decimal() {
     return -get_max_decimal<T>();
 }
 
+static const uint128_t UINT128_MAX = uint128_t(int128_t(-1L));
+static const int128_t INT128_MAX = UINT128_MAX >> 1;
+static const int128_t INT128_MIN = -INT128_MAX - 1;
+
 template <typename T>
 inline constexpr T get_max() {
     if constexpr (std::is_same_v<T, int128_t>) {
-        return ~(static_cast<int128_t>(1ll) << 127);
+        return INT128_MAX;
     } else {
         return std::numeric_limits<T>::max();
     }
@@ -124,7 +141,7 @@ inline constexpr T get_max() {
 template <typename T>
 inline constexpr T get_min() {
     if constexpr (std::is_same_v<T, int128_t>) {
-        return static_cast<int128_t>(1ll) << 127;
+        return INT128_MIN;
     } else {
         return std::numeric_limits<T>::lowest();
     }

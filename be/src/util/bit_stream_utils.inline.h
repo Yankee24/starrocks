@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/util/bit_stream_utils.inline.h
 
@@ -25,6 +38,7 @@
 #include "glog/logging.h"
 #include "util/alignment.h"
 #include "util/bit_packing.inline.h"
+#include "util/bit_packing_adapter.h"
 #include "util/bit_stream_utils.h"
 
 using starrocks::BitUtil;
@@ -192,18 +206,24 @@ inline bool BitReader::GetAligned(int num_bytes, T* v) {
     return true;
 }
 
+// Copy the same logic from arrow, we need to return false instead of DCHECK(false) when facing corrupted files
 inline bool BitReader::GetVlqInt(uint32_t* v) {
-    *v = 0;
-    int shift = 0;
-    [[maybe_unused]] int num_bytes = 0;
-    uint8_t byte = 0;
-    do {
-        if (!GetAligned<uint8_t>(1, &byte)) return false;
-        *v |= (byte & 0x7F) << shift;
-        shift += 7;
-        DCHECK_LE(++num_bytes, MAX_VLQ_BYTE_LEN);
-    } while ((byte & 0x80) != 0);
-    return true;
+    uint32_t tmp = 0;
+
+    for (int i = 0; i < MAX_VLQ_BYTE_LEN; i++) {
+        uint8_t byte = 0;
+        if (PREDICT_FALSE(!GetAligned<uint8_t>(1, &byte))) {
+            return false;
+        }
+        tmp |= static_cast<uint32_t>(byte & 0x7F) << (7 * i);
+
+        if ((byte & 0x80) == 0) {
+            *v = tmp;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 template <typename UINT_T>
@@ -240,10 +260,19 @@ inline bool BatchedBitReader::get_bytes(int num_bytes, T* v) {
     return true;
 }
 
+inline bool BatchedBitReader::skip_bytes(int num_bytes) {
+    if (UNLIKELY(_buffer_pos + num_bytes > _buffer_end)) {
+        return false;
+    }
+    _buffer_pos += num_bytes;
+    return true;
+}
+
 template <typename T>
 inline int BatchedBitReader::unpack_batch(int bit_width, int num_values, T* v) {
     int64_t num_read;
-    std::tie(_buffer_pos, num_read) = BitPacking::UnpackValues(bit_width, _buffer_pos, _bytes_left(), num_values, v);
+    std::tie(_buffer_pos, num_read) =
+            BitPackingAdapter::UnpackValues(bit_width, _buffer_pos, _bytes_left(), num_values, v);
     return static_cast<int>(num_read);
 }
 

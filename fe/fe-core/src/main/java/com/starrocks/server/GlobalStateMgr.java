@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/Catalog.java
 
@@ -24,235 +37,232 @@ package com.starrocks.server;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.google.common.collect.Queues;
-import com.google.common.collect.Range;
-import com.starrocks.alter.Alter;
-import com.starrocks.alter.AlterJob;
-import com.starrocks.alter.AlterJob.JobType;
-import com.starrocks.alter.AlterJobV2;
+import com.starrocks.alter.AlterJobMgr;
 import com.starrocks.alter.MaterializedViewHandler;
 import com.starrocks.alter.SchemaChangeHandler;
 import com.starrocks.alter.SystemHandler;
-import com.starrocks.analysis.AddPartitionClause;
-import com.starrocks.analysis.AdminCheckTabletsStmt;
-import com.starrocks.analysis.AdminSetConfigStmt;
-import com.starrocks.analysis.AdminSetReplicaStatusStmt;
-import com.starrocks.analysis.AlterDatabaseQuotaStmt;
-import com.starrocks.analysis.AlterDatabaseQuotaStmt.QuotaType;
-import com.starrocks.analysis.AlterDatabaseRename;
-import com.starrocks.analysis.AlterSystemStmt;
-import com.starrocks.analysis.AlterTableStmt;
-import com.starrocks.analysis.AlterViewStmt;
-import com.starrocks.analysis.BackupStmt;
-import com.starrocks.analysis.CancelAlterSystemStmt;
-import com.starrocks.analysis.CancelAlterTableStmt;
-import com.starrocks.analysis.CancelBackupStmt;
-import com.starrocks.analysis.ColumnRenameClause;
-import com.starrocks.analysis.CreateDbStmt;
-import com.starrocks.analysis.CreateFunctionStmt;
-import com.starrocks.analysis.CreateMaterializedViewStmt;
-import com.starrocks.analysis.CreateTableLikeStmt;
-import com.starrocks.analysis.CreateTableStmt;
-import com.starrocks.analysis.CreateViewStmt;
-import com.starrocks.analysis.DropDbStmt;
-import com.starrocks.analysis.DropFunctionStmt;
-import com.starrocks.analysis.DropMaterializedViewStmt;
-import com.starrocks.analysis.DropPartitionClause;
-import com.starrocks.analysis.DropTableStmt;
-import com.starrocks.analysis.FunctionName;
-import com.starrocks.analysis.InstallPluginStmt;
-import com.starrocks.analysis.ModifyFrontendAddressClause;
-import com.starrocks.analysis.PartitionRenameClause;
-import com.starrocks.analysis.RecoverDbStmt;
-import com.starrocks.analysis.RecoverPartitionStmt;
-import com.starrocks.analysis.RecoverTableStmt;
-import com.starrocks.analysis.ReplacePartitionClause;
-import com.starrocks.analysis.RestoreStmt;
-import com.starrocks.analysis.RollupRenameClause;
+import com.starrocks.analysis.LiteralExpr;
 import com.starrocks.analysis.TableName;
-import com.starrocks.analysis.TableRenameClause;
-import com.starrocks.analysis.TruncateTableStmt;
-import com.starrocks.analysis.UninstallPluginStmt;
+import com.starrocks.authentication.AuthenticationMgr;
+import com.starrocks.authorization.AccessControlProvider;
+import com.starrocks.authorization.AuthorizationMgr;
+import com.starrocks.authorization.DefaultAuthorizationProvider;
+import com.starrocks.authorization.NativeAccessController;
+import com.starrocks.authorization.PrivilegeException;
+import com.starrocks.authorization.ranger.starrocks.RangerStarRocksAccessController;
 import com.starrocks.backup.BackupHandler;
+import com.starrocks.binlog.BinlogManager;
 import com.starrocks.catalog.BrokerMgr;
-import com.starrocks.catalog.BrokerTable;
 import com.starrocks.catalog.CatalogIdGenerator;
 import com.starrocks.catalog.CatalogRecycleBin;
 import com.starrocks.catalog.ColocateTableIndex;
-import com.starrocks.catalog.ColocateTableIndex.GroupId;
 import com.starrocks.catalog.Column;
-import com.starrocks.catalog.DataProperty;
 import com.starrocks.catalog.Database;
-import com.starrocks.catalog.DistributionInfo;
+import com.starrocks.catalog.DictionaryMgr;
 import com.starrocks.catalog.DomainResolver;
-import com.starrocks.catalog.EsTable;
-import com.starrocks.catalog.ExternalOlapTable;
 import com.starrocks.catalog.Function;
-import com.starrocks.catalog.FunctionSearchDesc;
 import com.starrocks.catalog.FunctionSet;
-import com.starrocks.catalog.HiveMetaStoreTable;
-import com.starrocks.catalog.HiveTable;
-import com.starrocks.catalog.HudiTable;
-import com.starrocks.catalog.IcebergTable;
-import com.starrocks.catalog.Index;
-import com.starrocks.catalog.JDBCTable;
-import com.starrocks.catalog.KeysType;
-import com.starrocks.catalog.MaterializedIndexMeta;
+import com.starrocks.catalog.GlobalFunctionMgr;
+import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.catalog.MaterializedView;
 import com.starrocks.catalog.MetaReplayState;
-import com.starrocks.catalog.MetaVersion;
-import com.starrocks.catalog.MysqlTable;
-import com.starrocks.catalog.OlapTable;
-import com.starrocks.catalog.Partition;
-import com.starrocks.catalog.PartitionInfo;
-import com.starrocks.catalog.PartitionKey;
-import com.starrocks.catalog.PartitionType;
 import com.starrocks.catalog.PrimitiveType;
-import com.starrocks.catalog.RangePartitionInfo;
+import com.starrocks.catalog.RefreshDictionaryCacheTaskDaemon;
+import com.starrocks.catalog.ResourceGroupMgr;
 import com.starrocks.catalog.ResourceMgr;
-import com.starrocks.catalog.StarOSAgent;
 import com.starrocks.catalog.Table;
-import com.starrocks.catalog.Table.TableType;
 import com.starrocks.catalog.TabletInvertedIndex;
 import com.starrocks.catalog.TabletStatMgr;
-import com.starrocks.catalog.View;
-import com.starrocks.catalog.WorkGroupMgr;
+import com.starrocks.catalog.Type;
+import com.starrocks.catalog.constraint.GlobalConstraintManager;
 import com.starrocks.clone.ColocateTableBalancer;
 import com.starrocks.clone.DynamicPartitionScheduler;
 import com.starrocks.clone.TabletChecker;
 import com.starrocks.clone.TabletScheduler;
 import com.starrocks.clone.TabletSchedulerStat;
-import com.starrocks.cluster.Cluster;
-import com.starrocks.cluster.ClusterNamespace;
+import com.starrocks.common.AlreadyExistsException;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
+import com.starrocks.common.ConfigRefreshDaemon;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.FeConstants;
-import com.starrocks.common.FeMetaVersion;
-import com.starrocks.common.MetaNotFoundException;
-import com.starrocks.common.Pair;
+import com.starrocks.common.InvalidConfException;
+import com.starrocks.common.StarRocksException;
 import com.starrocks.common.ThreadPoolManager;
-import com.starrocks.common.UserException;
+import com.starrocks.common.io.Text;
+import com.starrocks.common.io.Writable;
 import com.starrocks.common.util.Daemon;
-import com.starrocks.common.util.MasterDaemon;
-import com.starrocks.common.util.PrintableMap;
+import com.starrocks.common.util.FrontendDaemon;
+import com.starrocks.common.util.LogUtil;
 import com.starrocks.common.util.PropertyAnalyzer;
-import com.starrocks.common.util.QueryableReentrantLock;
 import com.starrocks.common.util.SmallFileMgr;
+import com.starrocks.common.util.UUIDUtil;
 import com.starrocks.common.util.Util;
+import com.starrocks.common.util.concurrent.QueryableReentrantLock;
+import com.starrocks.common.util.concurrent.lock.LockManager;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.connector.ConnectorMgr;
+import com.starrocks.connector.ConnectorTblMetaInfoMgr;
+import com.starrocks.connector.elasticsearch.EsRepository;
+import com.starrocks.connector.exception.StarRocksConnectorException;
+import com.starrocks.connector.hive.ConnectorTableMetadataProcessor;
+import com.starrocks.connector.hive.events.MetastoreEventsProcessor;
+import com.starrocks.connector.statistics.ConnectorTableTriggerAnalyzeMgr;
 import com.starrocks.consistency.ConsistencyChecker;
-import com.starrocks.external.elasticsearch.EsRepository;
-import com.starrocks.external.hive.HiveRepository;
-import com.starrocks.external.hive.events.MetastoreEventsProcessor;
-import com.starrocks.external.iceberg.IcebergRepository;
-import com.starrocks.external.starrocks.StarRocksRepository;
-import com.starrocks.ha.BDBHA;
+import com.starrocks.consistency.LockChecker;
+import com.starrocks.consistency.MetaRecoveryDaemon;
+import com.starrocks.encryption.KeyMgr;
+import com.starrocks.encryption.KeyRotationDaemon;
 import com.starrocks.ha.FrontendNodeType;
 import com.starrocks.ha.HAProtocol;
-import com.starrocks.ha.MasterInfo;
+import com.starrocks.ha.LeaderInfo;
+import com.starrocks.ha.StateChangeExecution;
+import com.starrocks.healthchecker.SafeModeChecker;
+import com.starrocks.journal.CheckpointWorker;
+import com.starrocks.journal.GlobalStateCheckpointWorker;
+import com.starrocks.journal.Journal;
 import com.starrocks.journal.JournalCursor;
 import com.starrocks.journal.JournalEntity;
 import com.starrocks.journal.JournalException;
+import com.starrocks.journal.JournalFactory;
 import com.starrocks.journal.JournalInconsistentException;
+import com.starrocks.journal.JournalTask;
 import com.starrocks.journal.JournalWriter;
 import com.starrocks.journal.bdbje.Timestamp;
-import com.starrocks.load.DeleteHandler;
+import com.starrocks.lake.ShardManager;
+import com.starrocks.lake.StarMgrMetaSyncer;
+import com.starrocks.lake.StarOSAgent;
+import com.starrocks.lake.compaction.CompactionControlScheduler;
+import com.starrocks.lake.compaction.CompactionMgr;
+import com.starrocks.lake.snapshot.ClusterSnapshotMgr;
+import com.starrocks.lake.vacuum.AutovacuumDaemon;
+import com.starrocks.leader.CheckpointController;
+import com.starrocks.leader.ReportHandler;
+import com.starrocks.leader.TabletCollector;
+import com.starrocks.leader.TaskRunStateSynchronizer;
+import com.starrocks.listener.GlobalLoadJobListenerBus;
+import com.starrocks.load.DeleteMgr;
 import com.starrocks.load.ExportChecker;
 import com.starrocks.load.ExportMgr;
-import com.starrocks.load.InsertOverwriteJobManager;
+import com.starrocks.load.InsertOverwriteJobMgr;
 import com.starrocks.load.Load;
+import com.starrocks.load.batchwrite.BatchWriteMgr;
 import com.starrocks.load.loadv2.LoadEtlChecker;
 import com.starrocks.load.loadv2.LoadJobScheduler;
 import com.starrocks.load.loadv2.LoadLoadingChecker;
-import com.starrocks.load.loadv2.LoadManager;
+import com.starrocks.load.loadv2.LoadMgr;
 import com.starrocks.load.loadv2.LoadTimeoutChecker;
-import com.starrocks.load.routineload.RoutineLoadManager;
+import com.starrocks.load.loadv2.LoadsHistorySyncer;
+import com.starrocks.load.pipe.PipeListener;
+import com.starrocks.load.pipe.PipeManager;
+import com.starrocks.load.pipe.PipeScheduler;
+import com.starrocks.load.routineload.RoutineLoadMgr;
 import com.starrocks.load.routineload.RoutineLoadScheduler;
 import com.starrocks.load.routineload.RoutineLoadTaskScheduler;
-import com.starrocks.master.Checkpoint;
-import com.starrocks.meta.MetaContext;
+import com.starrocks.load.streamload.StreamLoadMgr;
+import com.starrocks.memory.MemoryUsageTracker;
+import com.starrocks.memory.ProcProfileCollector;
+import com.starrocks.meta.SqlBlackList;
 import com.starrocks.metric.MetricRepo;
-import com.starrocks.mysql.privilege.Auth;
-import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.persist.BackendIdsUpdateInfo;
-import com.starrocks.persist.BackendTabletsInfo;
-import com.starrocks.persist.ChangeMaterializedViewRefreshSchemeLog;
-import com.starrocks.persist.DropPartitionInfo;
 import com.starrocks.persist.EditLog;
-import com.starrocks.persist.GlobalVarPersistInfo;
-import com.starrocks.persist.ModifyTableColumnOperationLog;
-import com.starrocks.persist.ModifyTablePropertyOperationLog;
-import com.starrocks.persist.MultiEraseTableInfo;
-import com.starrocks.persist.PartitionPersistInfo;
-import com.starrocks.persist.RecoverInfo;
-import com.starrocks.persist.RenameMaterializedViewLog;
-import com.starrocks.persist.ReplacePartitionOperationLog;
-import com.starrocks.persist.ReplicaPersistInfo;
-import com.starrocks.persist.SetReplicaStatusOperationLog;
+import com.starrocks.persist.ImageFormatVersion;
+import com.starrocks.persist.ImageHeader;
+import com.starrocks.persist.ImageLoader;
+import com.starrocks.persist.ImageWriter;
+import com.starrocks.persist.OperationType;
 import com.starrocks.persist.Storage;
-import com.starrocks.persist.TableInfo;
-import com.starrocks.persist.TablePropertyInfo;
-import com.starrocks.persist.TruncateTableInfo;
-import com.starrocks.plugin.PluginInfo;
+import com.starrocks.persist.gson.GsonUtils;
+import com.starrocks.persist.gson.SubtypeNotFoundException;
+import com.starrocks.persist.metablock.SRMetaBlockEOFException;
+import com.starrocks.persist.metablock.SRMetaBlockException;
+import com.starrocks.persist.metablock.SRMetaBlockID;
+import com.starrocks.persist.metablock.SRMetaBlockLoader;
+import com.starrocks.persist.metablock.SRMetaBlockReader;
 import com.starrocks.plugin.PluginMgr;
 import com.starrocks.qe.AuditEventProcessor;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.DDLStmtExecutor;
 import com.starrocks.qe.JournalObservable;
+import com.starrocks.qe.QueryStatisticsInfo;
 import com.starrocks.qe.SessionVariable;
-import com.starrocks.qe.ShowResultSet;
+import com.starrocks.qe.ShowExecutor;
 import com.starrocks.qe.VariableMgr;
-import com.starrocks.rpc.FrontendServiceProxy;
+import com.starrocks.qe.scheduler.slot.GlobalSlotProvider;
+import com.starrocks.qe.scheduler.slot.LocalSlotProvider;
+import com.starrocks.qe.scheduler.slot.ResourceUsageMonitor;
+import com.starrocks.qe.scheduler.slot.SlotManager;
+import com.starrocks.qe.scheduler.slot.SlotProvider;
+import com.starrocks.replication.ReplicationMgr;
+import com.starrocks.rpc.ThriftConnectionPool;
+import com.starrocks.rpc.ThriftRPCRequestExecutor;
+import com.starrocks.scheduler.MVActiveChecker;
 import com.starrocks.scheduler.TaskManager;
-import com.starrocks.sql.ast.AlterMaterializedViewStatement;
-import com.starrocks.sql.ast.CreateMaterializedViewStatement;
+import com.starrocks.scheduler.history.TableKeeper;
+import com.starrocks.scheduler.mv.MVJobExecutor;
+import com.starrocks.scheduler.mv.MaterializedViewMgr;
+import com.starrocks.sql.analyzer.Analyzer;
+import com.starrocks.sql.analyzer.Authorizer;
+import com.starrocks.sql.analyzer.AuthorizerStmtVisitor;
 import com.starrocks.sql.ast.RefreshTableStmt;
+import com.starrocks.sql.ast.SetType;
+import com.starrocks.sql.ast.SystemVariable;
 import com.starrocks.sql.optimizer.statistics.CachedStatisticStorage;
 import com.starrocks.sql.optimizer.statistics.StatisticStorage;
-import com.starrocks.statistic.AnalyzeManager;
+import com.starrocks.sql.parser.AstBuilder;
+import com.starrocks.sql.parser.SqlParser;
+import com.starrocks.staros.StarMgrServer;
+import com.starrocks.statistic.AnalyzeMgr;
 import com.starrocks.statistic.StatisticAutoCollector;
 import com.starrocks.statistic.StatisticsMetaManager;
+import com.starrocks.statistic.columns.PredicateColumnsMgr;
+import com.starrocks.system.Backend;
+import com.starrocks.system.ComputeNode;
 import com.starrocks.system.Frontend;
 import com.starrocks.system.HeartbeatMgr;
+import com.starrocks.system.PortConnectivityChecker;
 import com.starrocks.system.SystemInfoService;
-import com.starrocks.task.AgentBatchTask;
-import com.starrocks.task.MasterTaskExecutor;
+import com.starrocks.task.LeaderTaskExecutor;
+import com.starrocks.task.PriorityLeaderTaskExecutor;
 import com.starrocks.thrift.TNetworkAddress;
+import com.starrocks.thrift.TNodeInfo;
+import com.starrocks.thrift.TNodesInfo;
 import com.starrocks.thrift.TRefreshTableRequest;
 import com.starrocks.thrift.TRefreshTableResponse;
 import com.starrocks.thrift.TStatus;
 import com.starrocks.thrift.TStatusCode;
-import com.starrocks.thrift.TStorageMedium;
-import com.starrocks.thrift.TTabletMetaType;
 import com.starrocks.transaction.GlobalTransactionMgr;
+import com.starrocks.transaction.GtidGenerator;
 import com.starrocks.transaction.PublishVersionDaemon;
 import com.starrocks.transaction.UpdateDbUsedDataQuotaDaemon;
-import org.apache.commons.collections.CollectionUtils;
+import com.starrocks.warehouse.WarehouseIdleChecker;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.io.BufferedInputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
 import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
@@ -263,17 +273,17 @@ public class GlobalStateMgr {
     private static final Logger LOG = LogManager.getLogger(GlobalStateMgr.class);
     // 0 ~ 9999 used for qe
     public static final long NEXT_ID_INIT_VALUE = 10000;
-    private static final int STATE_CHANGE_CHECK_INTERVAL_MS = 100;
     private static final int REPLAY_INTERVAL_MS = 1;
-    private static final String BDB_DIR = "/bdb";
-    private static final String IMAGE_DIR = "/image";
+    public static final String IMAGE_DIR = "/image";
+    // will break the loop and refresh in-memory data after at most 10w logs or at most 1 seconds
+    private static final long REPLAYER_MAX_MS_PER_LOOP = 1000L;
+    private static final long REPLAYER_MAX_LOGS_PER_LOOP = 100000L;
 
-    private String metaDir;
-    private String bdbDir;
+    /**
+     * Meta and Image context
+     */
     private String imageDir;
-
-    private MetaContext metaContext;
-    private long epoch = 0;
+    private volatile long epoch = 0;
 
     // Lock to perform atomic modification on map like 'idToDb' and 'fullNameToDb'.
     // These maps are all thread safe, we only use lock to perform atomic operations.
@@ -281,113 +291,142 @@ public class GlobalStateMgr {
     // We use fair ReentrantLock to avoid starvation. Do not use this lock in critical code pass
     // because fair lock has poor performance.
     // Using QueryableReentrantLock to print owner thread in debug mode.
-    private QueryableReentrantLock lock;
+    private final QueryableReentrantLock lock;
 
-    private Load load;
-    private LoadManager loadManager;
-    private RoutineLoadManager routineLoadManager;
-    private ExportMgr exportMgr;
-    private Alter alter;
-    private ConsistencyChecker consistencyChecker;
-    private BackupHandler backupHandler;
-    private PublishVersionDaemon publishVersionDaemon;
-    private DeleteHandler deleteHandler;
-    private UpdateDbUsedDataQuotaDaemon updateDbUsedDataQuotaDaemon;
+    /**
+     * System Manager
+     */
+    private final NodeMgr nodeMgr;
+    private final HeartbeatMgr heartbeatMgr;
 
-    private MasterDaemon labelCleaner; // To clean old LabelInfo, ExportJobInfos
-    private MasterDaemon txnTimeoutChecker; // To abort timeout txns
-    private MasterDaemon taskCleaner;   // To clean expire Task/TaskRun
-    private JournalWriter journalWriter; // master only: write journal log
+    /**
+     * Alter Job Manager
+     */
+    private final AlterJobMgr alterJobMgr;
+
+    private final PortConnectivityChecker portConnectivityChecker;
+
+    private final Load load;
+    private final LoadMgr loadMgr;
+    private final RoutineLoadMgr routineLoadMgr;
+    private final StreamLoadMgr streamLoadMgr;
+    private final BatchWriteMgr batchWriteMgr;
+    private final ExportMgr exportMgr;
+    private final MaterializedViewMgr materializedViewMgr;
+
+    private final ConsistencyChecker consistencyChecker;
+    private final BackupHandler backupHandler;
+    private final PublishVersionDaemon publishVersionDaemon;
+    private final DeleteMgr deleteMgr;
+    private final UpdateDbUsedDataQuotaDaemon updateDbUsedDataQuotaDaemon;
+
+    private FrontendDaemon labelCleaner; // To clean old LabelInfo, ExportJobInfos
+    private FrontendDaemon txnTimeoutChecker; // To abort timeout txns
+    private FrontendDaemon taskCleaner;   // To clean expire Task/TaskRun
+    private FrontendDaemon tableKeeper;   // Maintain internal history tables
+    private JournalWriter journalWriter; // leader only: write journal log
     private Daemon replayer;
     private Daemon timePrinter;
-    private Daemon listener;
-    private EsRepository esRepository;  // it is a daemon, so add it here
-    private StarRocksRepository starRocksRepository;
-    private HiveRepository hiveRepository;
-    private MetastoreEventsProcessor metastoreEventsProcessor;
-    private IcebergRepository icebergRepository;
+    private final EsRepository esRepository;  // it is a daemon, so add it here
+    private final MetastoreEventsProcessor metastoreEventsProcessor;
+    private final ConnectorTableMetadataProcessor connectorTableMetadataProcessor;
 
     // set to true after finished replay all meta and ready to serve
     // set to false when globalStateMgr is not ready.
-    private AtomicBoolean isReady = new AtomicBoolean(false);
+    private final AtomicBoolean isReady = new AtomicBoolean(false);
     // set to true if FE can offer READ service.
     // canRead can be true even if isReady is false.
     // for example: OBSERVER transfer to UNKNOWN, then isReady will be set to false, but canRead can still be true
-    private AtomicBoolean canRead = new AtomicBoolean(false);
-    private BlockingQueue<FrontendNodeType> typeTransferQueue;
+    private final AtomicBoolean canRead = new AtomicBoolean(false);
 
-    // false if default_cluster is not created.
-    private boolean isDefaultClusterCreated = false;
+    // True indicates that the node is transferring to the leader, using this state avoids forwarding stmt to its own node.
+    private volatile boolean isInTransferringToLeader = false;
+
+    // false if default_warehouse is not created.
+    private boolean isDefaultWarehouseCreated = false;
 
     private FrontendNodeType feType;
+
+    // The time when this node becomes leader.
+    private long dominationStartTimeMs;
+
     // replica and observer use this value to decide provide read service or not
     private long synchronizedTimeMs;
 
-    private CatalogIdGenerator idGenerator = new CatalogIdGenerator(NEXT_ID_INIT_VALUE);
+    private final CatalogIdGenerator idGenerator = new CatalogIdGenerator(NEXT_ID_INIT_VALUE);
 
     private EditLog editLog;
+    private Journal journal;
     // For checkpoint and observer memory replayed marker
-    private AtomicLong replayedJournalId;
+    private final AtomicLong replayedJournalId;
 
     private static GlobalStateMgr CHECKPOINT = null;
     private static long checkpointThreadId = -1;
-    private Checkpoint checkpointer;
+    private CheckpointController checkpointController;
+    private CheckpointWorker checkpointWorker;
+    private boolean checkpointWorkerStarted = false;
 
     private HAProtocol haProtocol = null;
 
-    private JournalObservable journalObservable;
+    private final JournalObservable journalObservable;
 
-    private TabletInvertedIndex tabletInvertedIndex;
+    private final TabletInvertedIndex tabletInvertedIndex;
     private ColocateTableIndex colocateTableIndex;
 
-    private CatalogRecycleBin recycleBin;
-    private FunctionSet functionSet;
+    private final CatalogRecycleBin recycleBin;
+    private final FunctionSet functionSet;
 
-    private MetaReplayState metaReplayState;
+    private final MetaReplayState metaReplayState;
 
-    private ResourceMgr resourceMgr;
+    private final ResourceMgr resourceMgr;
 
-    private GlobalTransactionMgr globalTransactionMgr;
+    private final GlobalTransactionMgr globalTransactionMgr;
 
-    private TabletStatMgr tabletStatMgr;
+    private final TabletStatMgr tabletStatMgr;
 
-    private Auth auth;
+    private AuthenticationMgr authenticationMgr;
+    private AuthorizationMgr authorizationMgr;
 
     private DomainResolver domainResolver;
 
-    private TabletSchedulerStat stat;
+    private final TabletSchedulerStat stat;
 
-    private TabletScheduler tabletScheduler;
+    private final TabletScheduler tabletScheduler;
 
-    private TabletChecker tabletChecker;
+    private final TabletChecker tabletChecker;
 
     // Thread pools for pending and loading task, separately
-    private MasterTaskExecutor pendingLoadTaskScheduler;
-    private MasterTaskExecutor loadingLoadTaskScheduler;
+    private final LeaderTaskExecutor pendingLoadTaskScheduler;
+    private final PriorityLeaderTaskExecutor loadingLoadTaskScheduler;
 
-    private LoadJobScheduler loadJobScheduler;
+    private final LoadJobScheduler loadJobScheduler;
 
-    private LoadTimeoutChecker loadTimeoutChecker;
-    private LoadEtlChecker loadEtlChecker;
-    private LoadLoadingChecker loadLoadingChecker;
+    private final LoadTimeoutChecker loadTimeoutChecker;
+    private final LoadsHistorySyncer loadsHistorySyncer;
+    private final LoadEtlChecker loadEtlChecker;
+    private final LoadLoadingChecker loadLoadingChecker;
+    private final LockChecker lockChecker;
 
-    private RoutineLoadScheduler routineLoadScheduler;
+    private final RoutineLoadScheduler routineLoadScheduler;
+    private final RoutineLoadTaskScheduler routineLoadTaskScheduler;
 
-    private RoutineLoadTaskScheduler routineLoadTaskScheduler;
+    private final MVJobExecutor mvMVJobExecutor;
 
-    private SmallFileMgr smallFileMgr;
+    private final SmallFileMgr smallFileMgr;
 
-    private DynamicPartitionScheduler dynamicPartitionScheduler;
+    private final DynamicPartitionScheduler dynamicPartitionScheduler;
 
-    private PluginMgr pluginMgr;
+    private final PluginMgr pluginMgr;
 
-    private AuditEventProcessor auditEventProcessor;
+    private final AuditEventProcessor auditEventProcessor;
 
     private final StatisticsMetaManager statisticsMetaManager;
 
     private final StatisticAutoCollector statisticAutoCollector;
 
-    private AnalyzeManager analyzeManager;
+    private final SafeModeChecker safeModeChecker;
+
+    private final AnalyzeMgr analyzeMgr;
 
     private StatisticStorage statisticStorage;
 
@@ -395,41 +434,126 @@ public class GlobalStateMgr {
 
     private long feStartTime;
 
-    private WorkGroupMgr workGroupMgr;
+    private boolean isSafeMode = false;
+
+    private final ResourceGroupMgr resourceGroupMgr;
 
     private StarOSAgent starOSAgent;
 
+    private final StarMgrMetaSyncer starMgrMetaSyncer;
+
     private MetadataMgr metadataMgr;
-    private CatalogMgr catalogMgr;
-    private ConnectorMgr connectorMgr;
-    private TaskManager taskManager;
-    private InsertOverwriteJobManager insertOverwriteJobManager;
+    private final CatalogMgr catalogMgr;
+    private final ConnectorMgr connectorMgr;
+    private final ConnectorTblMetaInfoMgr connectorTblMetaInfoMgr;
+    private ConnectorTableTriggerAnalyzeMgr connectorTableTriggerAnalyzeMgr;
 
-    private LocalMetastore localMetastore;
-    private NodeMgr nodeMgr;
+    private final TaskManager taskManager;
+    private final InsertOverwriteJobMgr insertOverwriteJobMgr;
 
-    public List<Frontend> getFrontends(FrontendNodeType nodeType) {
-        return nodeMgr.getFrontends(nodeType);
-    }
+    private final LocalMetastore localMetastore;
+    private final GlobalFunctionMgr globalFunctionMgr;
 
-    public List<String> getRemovedFrontendNames() {
-        return nodeMgr.getRemovedFrontendNames();
+    @Deprecated
+    private final ShardManager shardManager;
+
+    private final StateChangeExecution execution;
+
+    private TaskRunStateSynchronizer taskRunStateSynchronizer;
+
+    private final BinlogManager binlogManager;
+
+    // For LakeTable
+    private final CompactionMgr compactionMgr;
+
+    // For compaction forbidden policy
+    private final CompactionControlScheduler compactionControlScheduler;
+
+    private final WarehouseManager warehouseMgr;
+
+    private final ConfigRefreshDaemon configRefreshDaemon;
+
+    private final StorageVolumeMgr storageVolumeMgr;
+
+    private AutovacuumDaemon autovacuumDaemon;
+
+    private final PipeManager pipeManager;
+    private final PipeListener pipeListener;
+    private final PipeScheduler pipeScheduler;
+    private final MVActiveChecker mvActiveChecker;
+
+    private final ReplicationMgr replicationMgr;
+
+    private final KeyMgr keyMgr;
+    private final KeyRotationDaemon keyRotationDaemon;
+
+    private LockManager lockManager;
+
+    private final ResourceUsageMonitor resourceUsageMonitor = new ResourceUsageMonitor();
+    private final SlotManager slotManager = new SlotManager(resourceUsageMonitor);
+    private final GlobalSlotProvider globalSlotProvider = new GlobalSlotProvider();
+    private final SlotProvider localSlotProvider = new LocalSlotProvider();
+    private final GlobalLoadJobListenerBus operationListenerBus = new GlobalLoadJobListenerBus();
+
+    private final DictionaryMgr dictionaryMgr = new DictionaryMgr();
+    private final RefreshDictionaryCacheTaskDaemon refreshDictionaryCacheTaskDaemon;
+
+    private MemoryUsageTracker memoryUsageTracker;
+
+    private ProcProfileCollector procProfileCollector;
+
+    private final MetaRecoveryDaemon metaRecoveryDaemon = new MetaRecoveryDaemon();
+
+    private TemporaryTableMgr temporaryTableMgr;
+    private TemporaryTableCleaner temporaryTableCleaner;
+
+    private final GtidGenerator gtidGenerator;
+    private final GlobalConstraintManager globalConstraintManager;
+
+    private final VariableMgr variableMgr;
+
+    private final SqlParser sqlParser;
+    private final Analyzer analyzer;
+    private final Authorizer authorizer;
+    private final DDLStmtExecutor ddlStmtExecutor;
+    private final ShowExecutor showExecutor;
+    private final ExecutorService queryDeployExecutor;
+    private final WarehouseIdleChecker warehouseIdleChecker;
+
+    private final ClusterSnapshotMgr clusterSnapshotMgr;
+
+    private final SqlBlackList sqlBlackList;
+    private final ReportHandler reportHandler;
+    private final TabletCollector tabletCollector;
+
+    public NodeMgr getNodeMgr() {
+        return nodeMgr;
     }
 
     public JournalObservable getJournalObservable() {
         return journalObservable;
     }
 
-    public SystemInfoService getOrCreateSystemInfo(Integer clusterId) {
-        return nodeMgr.getOrCreateSystemInfo(clusterId);
+    public TNodesInfo createNodesInfo(long warehouseId, SystemInfoService systemInfoService) {
+        TNodesInfo nodesInfo = new TNodesInfo();
+        if (RunMode.isSharedDataMode()) {
+            List<Long> computeNodeIds = warehouseMgr.getAllComputeNodeIds(warehouseId);
+            for (Long cnId : computeNodeIds) {
+                ComputeNode cn = systemInfoService.getBackendOrComputeNode(cnId);
+                nodesInfo.addToNodes(new TNodeInfo(cnId, 0, cn.getIP(), cn.getBrpcPort()));
+            }
+        } else {
+            for (Long id : systemInfoService.getBackendIds(false)) {
+                Backend backend = systemInfoService.getBackend(id);
+                nodesInfo.addToNodes(new TNodeInfo(backend.getId(), 0, backend.getIP(), backend.getBrpcPort()));
+            }
+        }
+
+        return nodesInfo;
     }
 
-    public SystemInfoService getClusterInfo() {
-        return nodeMgr.getClusterInfo();
-    }
-
-    private HeartbeatMgr getHeartbeatMgr() {
-        return nodeMgr.getHeartbeatMgr();
+    public HeartbeatMgr getHeartbeatMgr() {
+        return heartbeatMgr;
     }
 
     public TabletInvertedIndex getTabletInvertedIndex() {
@@ -462,34 +586,91 @@ public class GlobalStateMgr {
         return feStartTime;
     }
 
+    public LocalMetastore getLocalMetastore() {
+        return localMetastore;
+    }
+
+    public TemporaryTableMgr getTemporaryTableMgr() {
+        return temporaryTableMgr;
+    }
+
+    public CompactionMgr getCompactionMgr() {
+        return compactionMgr;
+    }
+
+    public CompactionControlScheduler getCompactionControlScheduler() {
+        return compactionControlScheduler;
+    }
+
+    public ConfigRefreshDaemon getConfigRefreshDaemon() {
+        return configRefreshDaemon;
+    }
+
+    public RefreshDictionaryCacheTaskDaemon getRefreshDictionaryCacheTaskDaemon() {
+        return refreshDictionaryCacheTaskDaemon;
+    }
+
     private static class SingletonHolder {
         private static final GlobalStateMgr INSTANCE = new GlobalStateMgr();
     }
 
-    private GlobalStateMgr() {
-        this(false);
+    @VisibleForTesting
+    protected GlobalStateMgr() {
+        this(new NodeMgr());
     }
 
-    // if isCheckpointCatalog is true, it means that we should not collect thread pool metric
-    private GlobalStateMgr(boolean isCheckpointCatalog) {
+    @VisibleForTesting
+    protected GlobalStateMgr(NodeMgr nodeMgr) {
+        this(false, nodeMgr);
+    }
+
+    private GlobalStateMgr(boolean isCkptGlobalState) {
+        this(isCkptGlobalState, new NodeMgr());
+    }
+
+    // if isCkptGlobalState is true, it means that we should not collect thread pool metric
+    private GlobalStateMgr(boolean isCkptGlobalState, NodeMgr nodeMgr) {
+        if (!isCkptGlobalState) {
+            RunMode.detectRunMode();
+        }
+
+        if (RunMode.isSharedDataMode()) {
+            this.starOSAgent = new StarOSAgent();
+        }
+
+        // System Manager
+        this.nodeMgr = Objects.requireNonNullElseGet(nodeMgr, NodeMgr::new);
+        this.heartbeatMgr = new HeartbeatMgr(!isCkptGlobalState);
+        this.portConnectivityChecker = new PortConnectivityChecker();
+
+        // Alter Job Manager
+        // Alter Job Manager
+        this.alterJobMgr = new AlterJobMgr(
+                new SchemaChangeHandler(),
+                new MaterializedViewHandler(),
+                new SystemHandler());
+
         this.load = new Load();
-        this.routineLoadManager = new RoutineLoadManager();
+        this.streamLoadMgr = new StreamLoadMgr();
+        this.routineLoadMgr = new RoutineLoadMgr();
+        this.batchWriteMgr = new BatchWriteMgr();
         this.exportMgr = new ExportMgr();
-        this.alter = new Alter();
+        this.materializedViewMgr = new MaterializedViewMgr();
+
         this.consistencyChecker = new ConsistencyChecker();
         this.lock = new QueryableReentrantLock(true);
         this.backupHandler = new BackupHandler(this);
         this.publishVersionDaemon = new PublishVersionDaemon();
-        this.deleteHandler = new DeleteHandler();
+        this.deleteMgr = new DeleteMgr();
         this.updateDbUsedDataQuotaDaemon = new UpdateDbUsedDataQuotaDaemon();
         this.statisticsMetaManager = new StatisticsMetaManager();
         this.statisticAutoCollector = new StatisticAutoCollector();
+        this.safeModeChecker = new SafeModeChecker();
         this.statisticStorage = new CachedStatisticStorage();
 
         this.replayedJournalId = new AtomicLong(0L);
         this.synchronizedTimeMs = 0;
         this.feType = FrontendNodeType.INIT;
-        this.typeTransferQueue = Queues.newLinkedBlockingDeque();
 
         this.journalObservable = new JournalObservable();
 
@@ -501,46 +682,45 @@ public class GlobalStateMgr {
 
         this.metaReplayState = new MetaReplayState();
 
-        this.isDefaultClusterCreated = false;
-
         this.resourceMgr = new ResourceMgr();
 
         this.globalTransactionMgr = new GlobalTransactionMgr(this);
         this.tabletStatMgr = new TabletStatMgr();
+        this.authenticationMgr = new AuthenticationMgr();
+        this.domainResolver = new DomainResolver(authenticationMgr);
+        this.authorizationMgr = new AuthorizationMgr(this, new DefaultAuthorizationProvider());
 
-        this.auth = new Auth();
-        this.domainResolver = new DomainResolver(auth);
-
-        this.workGroupMgr = new WorkGroupMgr(this);
+        this.resourceGroupMgr = new ResourceGroupMgr();
 
         this.esRepository = new EsRepository();
-        this.starRocksRepository = new StarRocksRepository();
-        this.hiveRepository = new HiveRepository();
-        this.icebergRepository = new IcebergRepository();
-        this.metastoreEventsProcessor = new MetastoreEventsProcessor(hiveRepository);
-
-        this.metaContext = new MetaContext();
-        this.metaContext.setThreadLocalInfo();
+        this.metastoreEventsProcessor = new MetastoreEventsProcessor();
+        this.connectorTableMetadataProcessor = new ConnectorTableMetadataProcessor();
 
         this.stat = new TabletSchedulerStat();
-        this.nodeMgr = new NodeMgr(isCheckpointCatalog, this);
-        this.tabletScheduler = new TabletScheduler(this, nodeMgr.getClusterInfo(), tabletInvertedIndex, stat);
-        this.tabletChecker = new TabletChecker(this, nodeMgr.getClusterInfo(), tabletScheduler, stat);
+
+        this.globalFunctionMgr = new GlobalFunctionMgr();
+        this.tabletScheduler = new TabletScheduler(stat);
+        this.tabletChecker = new TabletChecker(tabletScheduler, stat);
 
         this.pendingLoadTaskScheduler =
-                new MasterTaskExecutor("pending_load_task_scheduler", Config.async_load_task_pool_size,
-                        Config.desired_max_waiting_jobs, !isCheckpointCatalog);
-        // One load job will be split into multiple loading tasks, the queue size is not determined, so set Integer.MAX_VALUE.
-        this.loadingLoadTaskScheduler =
-                new MasterTaskExecutor("loading_load_task_scheduler", Config.async_load_task_pool_size,
-                        Integer.MAX_VALUE, !isCheckpointCatalog);
+                new LeaderTaskExecutor("pending_load_task_scheduler", Config.max_broker_load_job_concurrency,
+                        Config.desired_max_waiting_jobs, !isCkptGlobalState);
+        // One load job will be split into multiple loading tasks, the queue size is not
+        // determined, so set desired_max_waiting_jobs * 10
+        this.loadingLoadTaskScheduler = new PriorityLeaderTaskExecutor("loading_load_task_scheduler",
+                Config.max_broker_load_job_concurrency,
+                Config.desired_max_waiting_jobs * 10, !isCkptGlobalState);
+
         this.loadJobScheduler = new LoadJobScheduler();
-        this.loadManager = new LoadManager(loadJobScheduler);
-        this.loadTimeoutChecker = new LoadTimeoutChecker(loadManager);
-        this.loadEtlChecker = new LoadEtlChecker(loadManager);
-        this.loadLoadingChecker = new LoadLoadingChecker(loadManager);
-        this.routineLoadScheduler = new RoutineLoadScheduler(routineLoadManager);
-        this.routineLoadTaskScheduler = new RoutineLoadTaskScheduler(routineLoadManager);
+        this.loadMgr = new LoadMgr(loadJobScheduler);
+        this.loadTimeoutChecker = new LoadTimeoutChecker(loadMgr);
+        this.loadsHistorySyncer = new LoadsHistorySyncer();
+        this.loadEtlChecker = new LoadEtlChecker(loadMgr);
+        this.loadLoadingChecker = new LoadLoadingChecker(loadMgr);
+        this.lockChecker = new LockChecker();
+        this.routineLoadScheduler = new RoutineLoadScheduler(routineLoadMgr);
+        this.routineLoadTaskScheduler = new RoutineLoadTaskScheduler(routineLoadMgr);
+        this.mvMVJobExecutor = new MVJobExecutor();
 
         this.smallFileMgr = new SmallFileMgr();
 
@@ -551,29 +731,125 @@ public class GlobalStateMgr {
 
         this.pluginMgr = new PluginMgr();
         this.auditEventProcessor = new AuditEventProcessor(this.pluginMgr);
-        this.analyzeManager = new AnalyzeManager();
+        this.analyzeMgr = new AnalyzeMgr();
+        this.localMetastore = new LocalMetastore(this, recycleBin, colocateTableIndex);
+        this.temporaryTableMgr = new TemporaryTableMgr();
+        this.warehouseMgr = new WarehouseManager();
+        this.connectorMgr = new ConnectorMgr();
+        this.connectorTblMetaInfoMgr = new ConnectorTblMetaInfoMgr();
+        this.metadataMgr = new MetadataMgr(localMetastore, temporaryTableMgr, connectorMgr, connectorTblMetaInfoMgr);
+        this.catalogMgr = new CatalogMgr(connectorMgr);
+        this.connectorTableTriggerAnalyzeMgr = new ConnectorTableTriggerAnalyzeMgr();
 
-        if (Config.use_staros) {
-            this.starOSAgent = new StarOSAgent();
+        this.taskManager = new TaskManager();
+        this.insertOverwriteJobMgr = new InsertOverwriteJobMgr();
+        this.shardManager = new ShardManager();
+        this.compactionMgr = new CompactionMgr();
+        this.compactionControlScheduler = new CompactionControlScheduler();
+        this.configRefreshDaemon = new ConfigRefreshDaemon();
+        this.starMgrMetaSyncer = new StarMgrMetaSyncer();
+        this.refreshDictionaryCacheTaskDaemon = new RefreshDictionaryCacheTaskDaemon();
+
+        this.binlogManager = new BinlogManager();
+        this.pipeManager = new PipeManager();
+        this.pipeListener = new PipeListener(this.pipeManager);
+        this.pipeScheduler = new PipeScheduler(this.pipeManager);
+        this.mvActiveChecker = new MVActiveChecker();
+
+        if (RunMode.isSharedDataMode()) {
+            this.storageVolumeMgr = new SharedDataStorageVolumeMgr();
+            this.autovacuumDaemon = new AutovacuumDaemon();
+        } else {
+            this.storageVolumeMgr = new SharedNothingStorageVolumeMgr();
         }
 
-        this.localMetastore = new LocalMetastore(this, recycleBin, colocateTableIndex, nodeMgr.getClusterInfo());
-        this.metadataMgr = new MetadataMgr(localMetastore);
-        this.connectorMgr = new ConnectorMgr(metadataMgr);
-        this.catalogMgr = new CatalogMgr(connectorMgr);
-        this.taskManager = new TaskManager();
-        this.insertOverwriteJobManager = new InsertOverwriteJobManager();
+        this.lockManager = new LockManager();
+
+        this.gtidGenerator = new GtidGenerator();
+        this.globalConstraintManager = new GlobalConstraintManager();
+
+        this.clusterSnapshotMgr = new ClusterSnapshotMgr();
+
+        GlobalStateMgr gsm = this;
+        this.execution = new StateChangeExecution() {
+            @Override
+            public void transferToLeader() {
+                isInTransferringToLeader = true;
+                try {
+                    gsm.transferToLeader();
+                } finally {
+                    isInTransferringToLeader = false;
+                }
+            }
+
+            @Override
+            public void transferToNonLeader(FrontendNodeType newType) {
+                gsm.transferToNonLeader(newType);
+            }
+        };
+
+        getConfigRefreshDaemon().registerListener(() -> {
+            try {
+                if (Config.max_broker_load_job_concurrency != loadingLoadTaskScheduler.getCorePoolSize()) {
+                    loadingLoadTaskScheduler.setPoolSize(Config.max_broker_load_job_concurrency);
+                }
+                if (Config.max_broker_load_job_concurrency != pendingLoadTaskScheduler.getCorePoolSize()) {
+                    pendingLoadTaskScheduler.setPoolSize(Config.max_broker_load_job_concurrency);
+                }
+            } catch (Exception e) {
+                LOG.warn("check config failed", e);
+            }
+        });
+
+        this.replicationMgr = new ReplicationMgr();
+
+        this.keyMgr = new KeyMgr();
+        this.keyRotationDaemon = new KeyRotationDaemon(keyMgr);
+
+        this.variableMgr = new VariableMgr();
+
+        nodeMgr.registerLeaderChangeListener(globalSlotProvider::leaderChangeListener);
+
+        this.memoryUsageTracker = new MemoryUsageTracker();
+        this.procProfileCollector = new ProcProfileCollector();
+
+        this.sqlParser = new SqlParser(AstBuilder.getInstance());
+        this.analyzer = new Analyzer(Analyzer.AnalyzerVisitor.getInstance());
+        AccessControlProvider accessControlProvider;
+        if (Config.access_control.equals("ranger")) {
+            accessControlProvider = new AccessControlProvider(new AuthorizerStmtVisitor(), new RangerStarRocksAccessController());
+        } else {
+            accessControlProvider = new AccessControlProvider(new AuthorizerStmtVisitor(), new NativeAccessController());
+        }
+        this.authorizer = new Authorizer(accessControlProvider);
+        this.ddlStmtExecutor = new DDLStmtExecutor(DDLStmtExecutor.StmtExecutorVisitor.getInstance());
+        this.showExecutor = new ShowExecutor(ShowExecutor.ShowExecutorVisitor.getInstance());
+        this.sqlBlackList = new SqlBlackList();
+        this.temporaryTableCleaner = new TemporaryTableCleaner();
+        this.queryDeployExecutor =
+                ThreadPoolManager.newDaemonFixedThreadPool(Config.query_deploy_threadpool_size, Integer.MAX_VALUE,
+                        "query-deploy", true);
+
+        this.warehouseIdleChecker = new WarehouseIdleChecker();
+
+        this.reportHandler = new ReportHandler();
+        this.tabletCollector = new TabletCollector();
     }
 
     public static void destroyCheckpoint() {
         if (CHECKPOINT != null) {
+            try {
+                CHECKPOINT.shutdown();
+            } catch (Exception e) {
+                LOG.warn("exception when destroy checkpoint", e);
+            }
             CHECKPOINT = null;
         }
     }
 
     public static GlobalStateMgr getCurrentState() {
         if (isCheckpointThread()) {
-            // only checkpoint thread it self will goes here.
+            // only checkpoint thread itself will go here.
             // so no need to care about the thread safe.
             if (CHECKPOINT == null) {
                 CHECKPOINT = new GlobalStateMgr(true);
@@ -584,9 +860,12 @@ public class GlobalStateMgr {
         }
     }
 
-    @VisibleForTesting
-    public ConcurrentHashMap<Long, Database> getIdToDb() {
-        return localMetastore.getIdToDb();
+    public boolean isSafeMode() {
+        return isSafeMode;
+    }
+
+    public void setSafeMode(boolean isSafeMode) {
+        this.isSafeMode = isSafeMode;
     }
 
     // NOTICE: in most case, we should use getCurrentState() to get the right globalStateMgr.
@@ -603,8 +882,8 @@ public class GlobalStateMgr {
         return resourceMgr;
     }
 
-    public static GlobalTransactionMgr getCurrentGlobalTransactionMgr() {
-        return getCurrentState().globalTransactionMgr;
+    public GlobalFunctionMgr getGlobalFunctionMgr() {
+        return globalFunctionMgr;
     }
 
     public GlobalTransactionMgr getGlobalTransactionMgr() {
@@ -615,16 +894,28 @@ public class GlobalStateMgr {
         return pluginMgr;
     }
 
-    public AnalyzeManager getAnalyzeManager() {
-        return analyzeManager;
+    public AnalyzeMgr getAnalyzeMgr() {
+        return analyzeMgr;
     }
 
-    public Auth getAuth() {
-        return auth;
+    public AuthenticationMgr getAuthenticationMgr() {
+        return authenticationMgr;
     }
 
-    public WorkGroupMgr getWorkGroupMgr() {
-        return workGroupMgr;
+    public void setAuthenticationMgr(AuthenticationMgr authenticationMgr) {
+        this.authenticationMgr = authenticationMgr;
+    }
+
+    public AuthorizationMgr getAuthorizationMgr() {
+        return authorizationMgr;
+    }
+
+    public void setAuthorizationMgr(AuthorizationMgr authorizationMgr) {
+        this.authorizationMgr = authorizationMgr;
+    }
+
+    public ResourceGroupMgr getResourceGroupMgr() {
+        return resourceGroupMgr;
     }
 
     public TabletScheduler getTabletScheduler() {
@@ -635,60 +926,24 @@ public class GlobalStateMgr {
         return tabletChecker;
     }
 
-    public ConcurrentHashMap<String, Database> getFullNameToDb() {
-        return localMetastore.getFullNameToDb();
-    }
-
     public AuditEventProcessor getAuditEventProcessor() {
         return auditEventProcessor;
-    }
-
-    // use this to get correct ClusterInfoService instance
-    public static SystemInfoService getCurrentSystemInfo() {
-        return getCurrentState().getClusterInfo();
-    }
-
-    public static HeartbeatMgr getCurrentHeartbeatMgr() {
-        return getCurrentState().getHeartbeatMgr();
-    }
-
-    // use this to get correct TabletInvertedIndex instance
-    public static TabletInvertedIndex getCurrentInvertedIndex() {
-        return getCurrentState().getTabletInvertedIndex();
-    }
-
-    // use this to get correct ColocateTableIndex instance
-    public static ColocateTableIndex getCurrentColocateIndex() {
-        return getCurrentState().getColocateTableIndex();
-    }
-
-    public static CatalogRecycleBin getCurrentRecycleBin() {
-        return getCurrentState().getRecycleBin();
-    }
-
-    // use this to get correct GlobalStateMgr's journal version
-    public static int getCurrentStateJournalVersion() {
-        return MetaContext.get().getMetaVersion();
-    }
-
-    public static int getCurrentStateStarRocksJournalVersion() {
-        return MetaContext.get().getStarRocksMetaVersion();
     }
 
     public static boolean isCheckpointThread() {
         return Thread.currentThread().getId() == checkpointThreadId;
     }
 
-    public static PluginMgr getCurrentPluginMgr() {
-        return getCurrentState().getPluginMgr();
+    public StatisticStorage getStatisticStorage() {
+        return statisticStorage;
     }
 
-    public static AnalyzeManager getCurrentAnalyzeMgr() {
-        return getCurrentState().getAnalyzeManager();
+    public StatisticAutoCollector getStatisticAutoCollector() {
+        return statisticAutoCollector;
     }
 
-    public static StatisticStorage getCurrentStatisticStorage() {
-        return getCurrentState().statisticStorage;
+    public TabletStatMgr getTabletStatMgr() {
+        return tabletStatMgr;
     }
 
     // Only used in UT
@@ -696,12 +951,12 @@ public class GlobalStateMgr {
         this.statisticStorage = statisticStorage;
     }
 
-    public static AuditEventProcessor getCurrentAuditEventProcessor() {
-        return getCurrentState().getAuditEventProcessor();
-    }
-
     public StarOSAgent getStarOSAgent() {
         return starOSAgent;
+    }
+
+    public StarMgrMetaSyncer getStarMgrMetaSyncer() {
+        return starMgrMetaSyncer;
     }
 
     public CatalogMgr getCatalogMgr() {
@@ -716,20 +971,121 @@ public class GlobalStateMgr {
         return metadataMgr;
     }
 
+    public ConnectorTableTriggerAnalyzeMgr getConnectorTableTriggerAnalyzeMgr() {
+        return connectorTableTriggerAnalyzeMgr;
+    }
+
     @VisibleForTesting
     public void setMetadataMgr(MetadataMgr metadataMgr) {
         this.metadataMgr = metadataMgr;
+    }
+
+    @VisibleForTesting
+    public void setStarOSAgent(StarOSAgent starOSAgent) {
+        this.starOSAgent = starOSAgent;
     }
 
     public TaskManager getTaskManager() {
         return taskManager;
     }
 
-    public InsertOverwriteJobManager getInsertOverwriteJobManager() {
-        return insertOverwriteJobManager;
+    public BinlogManager getBinlogManager() {
+        return binlogManager;
     }
 
-    // Use tryLock to avoid potential dead lock
+    public InsertOverwriteJobMgr getInsertOverwriteJobMgr() {
+        return insertOverwriteJobMgr;
+    }
+
+    public WarehouseManager getWarehouseMgr() {
+        return warehouseMgr;
+    }
+
+    public List<QueryStatisticsInfo> getQueryStatisticsInfoFromOtherFEs() {
+        return nodeMgr.getQueryStatisticsInfoFromOtherFEs();
+    }
+
+    public StorageVolumeMgr getStorageVolumeMgr() {
+        return storageVolumeMgr;
+    }
+
+    public PipeManager getPipeManager() {
+        return pipeManager;
+    }
+
+    public PipeScheduler getPipeScheduler() {
+        return pipeScheduler;
+    }
+
+    public PipeListener getPipeListener() {
+        return pipeListener;
+    }
+
+    public MVActiveChecker getMvActiveChecker() {
+        return mvActiveChecker;
+    }
+
+    public ConnectorTblMetaInfoMgr getConnectorTblMetaInfoMgr() {
+        return connectorTblMetaInfoMgr;
+    }
+
+    public ConnectorTableMetadataProcessor getConnectorTableMetadataProcessor() {
+        return connectorTableMetadataProcessor;
+    }
+
+    public ReplicationMgr getReplicationMgr() {
+        return replicationMgr;
+    }
+
+    public KeyMgr getKeyMgr() {
+        return keyMgr;
+    }
+
+    public LockManager getLockManager() {
+        return lockManager;
+    }
+
+    public void setLockManager(LockManager lockManager) {
+        this.lockManager = lockManager;
+    }
+
+    public SqlParser getSqlParser() {
+        return sqlParser;
+    }
+
+    public Analyzer getAnalyzer() {
+        return analyzer;
+    }
+
+    public Authorizer getAuthorizer() {
+        return authorizer;
+    }
+
+    public DDLStmtExecutor getDdlStmtExecutor() {
+        return ddlStmtExecutor;
+    }
+
+    public ShowExecutor getShowExecutor() {
+        return showExecutor;
+    }
+
+    public ExecutorService getQueryDeployExecutor() {
+        return queryDeployExecutor;
+    }
+
+    public GtidGenerator getGtidGenerator() {
+        return gtidGenerator;
+    }
+
+    public GlobalConstraintManager getGlobalConstraintManager() {
+        return globalConstraintManager;
+    }
+
+    public ClusterSnapshotMgr getClusterSnapshotMgr() {
+        return clusterSnapshotMgr;
+    }
+
+    // Use tryLock to avoid potential deadlock
     public boolean tryLock(boolean mustLock) {
         while (true) {
             try {
@@ -737,7 +1093,7 @@ public class GlobalStateMgr {
                     // to see which thread held this lock for long time.
                     Thread owner = lock.getOwner();
                     if (owner != null) {
-                        LOG.warn("globalStateMgr lock is held by: {}", Util.dumpThread(owner, 50));
+                        LOG.warn("globalStateMgr lock is held by: {}", LogUtil.dumpThread(owner, 50));
                     }
 
                     if (mustLock) {
@@ -764,8 +1120,8 @@ public class GlobalStateMgr {
         }
     }
 
-    public String getBdbDir() {
-        return bdbDir;
+    public static String getImageDirPath() {
+        return Config.meta_dir + IMAGE_DIR;
     }
 
     public String getImageDir() {
@@ -773,9 +1129,7 @@ public class GlobalStateMgr {
     }
 
     private void setMetaDir() {
-        this.metaDir = Config.meta_dir;
-        this.bdbDir = this.metaDir + BDB_DIR;
-        this.imageDir = this.metaDir + IMAGE_DIR;
+        this.imageDir = Config.meta_dir + IMAGE_DIR;
         nodeMgr.setImageDir(imageDir);
     }
 
@@ -784,62 +1138,82 @@ public class GlobalStateMgr {
         // we already set these variables in constructor. but GlobalStateMgr is a singleton class.
         // so they may be set before Config is initialized.
         // set them here again to make sure these variables use values in fe.conf.
-
         setMetaDir();
 
-        // 0. get local node and helper node info
-        nodeMgr.initialize(args);
+        // must judge whether it is first time start here before initializing GlobalStateMgr.
+        // Possibly remove clusterId and role to ensure that the system is not left in a half-initialized state.
+        boolean isFirstTimeStart = nodeMgr.isVersionAndRoleFilesNotExist();
+        try {
+            // 0. get local node and helper node info
+            nodeMgr.initialize(args);
 
-        // 1. create dirs and files
-        if (Config.edit_log_type.equalsIgnoreCase("bdb")) {
-            File bdbDir = new File(this.bdbDir);
-            if (!bdbDir.exists()) {
-                bdbDir.mkdirs();
+            // 1. create dirs and files
+            if (Config.edit_log_type.equalsIgnoreCase("bdb")) {
+                File imageDir = new File(this.imageDir);
+                if (!imageDir.exists()) {
+                    imageDir.mkdirs();
+                }
+                File imageV2Dir = new File(this.imageDir + "/v2");
+                if (!imageV2Dir.exists()) {
+                    imageV2Dir.mkdirs();
+                }
+            } else {
+                LOG.error("Invalid edit log type: {}", Config.edit_log_type);
+                System.exit(-1);
             }
 
-            File imageDir = new File(this.imageDir);
-            if (!imageDir.exists()) {
-                imageDir.mkdirs();
+            // init plugin manager
+            pluginMgr.init();
+            auditEventProcessor.start();
+
+            // 2. get cluster id and role (Observer or Follower)
+            nodeMgr.getClusterIdAndRoleOnStartup();
+
+            // 3. Load image first and replay edits
+            initJournal();
+            loadImage(this.imageDir); // load image file
+
+            // 4. create load and export job label cleaner thread
+            createLabelCleaner();
+
+            // 5. create txn timeout checker thread
+            createTxnTimeoutChecker();
+
+            // 6. start task cleaner thread
+            createTaskCleaner();
+            createTableKeeper();
+
+            // 7. init starosAgent
+            if (RunMode.isSharedDataMode() && !starOSAgent.init(null)) {
+                LOG.error("init starOSAgent failed");
+                System.exit(-1);
             }
-        } else {
-            LOG.error("Invalid edit log type: {}", Config.edit_log_type);
-            System.exit(-1);
+        } catch (Exception e) {
+            try {
+                if (isFirstTimeStart) {
+                    // If it is the first time we start, we remove the cluster ID and role
+                    // to prevent leaving the system in an inconsistent state.
+                    nodeMgr.removeClusterIdAndRole();
+                }
+            } catch (Throwable t) {
+                e.addSuppressed(t);
+            }
+            throw e;
         }
+    }
 
-        // init plugin manager
-        pluginMgr.init();
-        auditEventProcessor.start();
+    protected void initJournal() throws JournalException, InterruptedException {
+        BlockingQueue<JournalTask> journalQueue =
+                new ArrayBlockingQueue<JournalTask>(Config.metadata_journal_queue_size);
+        journal = JournalFactory.create(nodeMgr.getNodeName());
+        journalWriter = new JournalWriter(journal, journalQueue);
 
-        // 2. get cluster id and role (Observer or Follower)
-        nodeMgr.getClusterIdAndRole();
-
-        // 3. Load image first and replay edits
-        this.editLog = new EditLog(nodeMgr.getNodeName());
-        loadImage(this.imageDir); // load image file
-
-        editLog.open(); // open bdb env
-        this.globalTransactionMgr.setEditLog(editLog);
-        this.idGenerator.setEditLog(editLog);
-        this.localMetastore.setEditLog(editLog);
-        // init journal writer
-        journalWriter = new JournalWriter(this.editLog.getJournal(), this.editLog.getJournalQueue());
-
-        // 4. create load and export job label cleaner thread
-        createLabelCleaner();
-
-        // 5. create txn timeout checker thread
-        createTxnTimeoutChecker();
-
-        // 6. start task cleaner thread
-        createTaskCleaner();
-
-        // 7. start state listener thread
-        createStateListener();
-        listener.start();
+        editLog = new EditLog(journalQueue);
     }
 
     // wait until FE is ready.
     public void waitForReady() throws InterruptedException {
+        long lastLoggingTimeMs = System.currentTimeMillis();
         while (true) {
             if (isReady()) {
                 LOG.info("globalStateMgr is ready. FE type: {}", feType);
@@ -849,6 +1223,22 @@ public class GlobalStateMgr {
 
             Thread.sleep(2000);
             LOG.info("wait globalStateMgr to be ready. FE type: {}. is ready: {}", feType, isReady.get());
+
+            if (System.currentTimeMillis() - lastLoggingTimeMs > 60000L) {
+                lastLoggingTimeMs = System.currentTimeMillis();
+                LOG.warn("It took too much time for FE to transfer to a stable state(LEADER/FOLLOWER), " +
+                        "it maybe caused by one of the following reasons: " +
+                        "1. There are too many BDB logs to replay, because of previous failure of checkpoint" +
+                        "(you can check the create time of image file under meta/image dir). " +
+                        "2. Majority voting members(LEADER or FOLLOWER) of the FE cluster haven't started completely. " +
+                        "3. FE node has multiple IPs, you should configure the priority_networks in fe.conf " +
+                        "to match the ip record in meta/image/ROLE. And we don't support change the ip of FE node. " +
+                        "Ignore this reason if you are using FQDN. " +
+                        "4. The time deviation between FE nodes is greater than 5s, " +
+                        "please use ntp or other tools to keep clock synchronized. " +
+                        "5. The configuration of edit_log_port has changed, please reset to the original value. " +
+                        "6. The replayer thread may get stuck, please use jstack to find the details.");
+            }
         }
     }
 
@@ -856,19 +1246,11 @@ public class GlobalStateMgr {
         return isReady.get();
     }
 
-    public static String genFeNodeName(String host, int port, boolean isOldStyle) {
-        String name = host + "_" + port;
-        if (isOldStyle) {
-            return name;
-        } else {
-            return name + "_" + System.currentTimeMillis();
-        }
-    }
-
-    private void transferToMaster(FrontendNodeType oldType) {
+    private void transferToLeader() {
+        FrontendNodeType oldType = feType;
         // stop replayer
         if (replayer != null) {
-            replayer.exit();
+            replayer.setStop();
             try {
                 replayer.join();
             } catch (InterruptedException e) {
@@ -879,100 +1261,116 @@ public class GlobalStateMgr {
 
         // set this after replay thread stopped. to avoid replay thread modify them.
         isReady.set(false);
-        canRead.set(false);
 
-        editLog.open();
-
-        if (!haProtocol.fencing()) {
-            LOG.error("fencing failed. will exit.");
+        // setup for journal
+        try {
+            journal.open();
+            if (!haProtocol.fencing()) {
+                throw new Exception("fencing failed. will exit");
+            }
+            long maxJournalId = journal.getMaxJournalId();
+            replayJournal(maxJournalId);
+            nodeMgr.checkCurrentNodeExist();
+            journalWriter.init(maxJournalId);
+        } catch (Exception e) {
+            // TODO: gracefully exit
+            LOG.error("failed to init journal after transfer to leader! will exit", e);
             System.exit(-1);
         }
 
-        long replayStartTime = System.currentTimeMillis();
-        // replay journals. -1 means replay all the journals larger than current journal id.
-        replayJournal(-1);
-        long replayEndTime = System.currentTimeMillis();
-        LOG.info("finish replay in " + (replayEndTime - replayStartTime) + " msec");
-
-        nodeMgr.checkCurrentNodeExist();
-
-        journalWriter.init(editLog.getMaxJournalId());
         journalWriter.startDaemon();
 
-        // Set the feType to MASTER before writing edit log, because the feType must be Master when writing edit log.
+        // Set the feType to LEADER before writing edit log, because the feType must be Leader when writing edit log.
         // It will be set to the old type if any error happens in the following procedure
-        feType = FrontendNodeType.MASTER;
+        feType = FrontendNodeType.LEADER;
+        dominationStartTimeMs = System.currentTimeMillis();
+
         try {
-            // Log meta_version
-            int communityMetaVersion = MetaContext.get().getMetaVersion();
-            int starrocksMetaVersion = MetaContext.get().getStarRocksMetaVersion();
-            if (communityMetaVersion < FeConstants.meta_version ||
-                    starrocksMetaVersion < FeConstants.starrocks_meta_version) {
-                editLog.logMetaVersion(new MetaVersion(FeConstants.meta_version, FeConstants.starrocks_meta_version));
-                MetaContext.get().setMetaVersion(FeConstants.meta_version);
-                MetaContext.get().setStarRocksMetaVersion(FeConstants.starrocks_meta_version);
+            if (Config.bdbje_reset_election_group || nodeMgr.isFirstTimeStartUp()) {
+                nodeMgr.resetFrontends();
             }
 
-            // Log the first frontend
-            if (nodeMgr.isFirstTimeStartUp()) {
-                // if isFirstTimeStartUp is true, frontends must contains this Node.
-                Frontend self = nodeMgr.getMySelf();
-                Preconditions.checkNotNull(self);
-                // OP_ADD_FIRST_FRONTEND is emitted, so it can write to BDBJE even if canWrite is false
-                editLog.logAddFirstFrontend(self);
-            }
-
-            if (!isDefaultClusterCreated) {
-                initDefaultCluster();
-            }
-
-            // MUST set master ip before starting checkpoint thread.
-            // because checkpoint thread need this info to select non-master FE to push image
-            nodeMgr.setMasterInfo();
+            // MUST set leader ip before starting checkpoint thread.
+            // because checkpoint thread need this info to select non-leader FE to push image
+            nodeMgr.setLeaderInfo();
 
             // start all daemon threads that only running on MASTER FE
-            startMasterOnlyDaemonThreads();
-            // start other daemon threads that should running on all FE
-            startNonMasterDaemonThreads();
-            insertOverwriteJobManager.cancelRunningJobs();
+            startLeaderOnlyDaemonThreads();
+            // start other daemon threads that should run on all FEs
+            startAllNodeTypeDaemonThreads();
+            insertOverwriteJobMgr.cancelRunningJobs();
+
+            if (!isDefaultWarehouseCreated) {
+                initDefaultWarehouse();
+            }
 
             MetricRepo.init();
 
-            canRead.set(true);
             isReady.set(true);
 
-            String msg = "master finished to replay journal, can write now.";
+            String msg = "leader finished to replay journal, can write now.";
             Util.stdoutWithTime(msg);
             LOG.info(msg);
-            // for master, there are some new thread pools need to register metric
+
+            // for leader, there are some new thread pools need to register metric
             ThreadPoolManager.registerAllThreadPoolMetric();
+
+            if (nodeMgr.isFirstTimeStartUp()) {
+                // When the cluster is initially deployed, we set ENABLE_ADAPTIVE_SINK_DOP so
+                // that the load is automatically configured as the best performance
+                // configuration. If it is upgraded from an old version, the original
+                // configuration is retained to avoid system stability problems caused by
+                // changes in concurrency
+                variableMgr.setSystemVariable(variableMgr.getDefaultSessionVariable(), new SystemVariable(SetType.GLOBAL,
+                                SessionVariable.ENABLE_ADAPTIVE_SINK_DOP,
+                                LiteralExpr.create("true", Type.BOOLEAN)),
+                        false);
+            }
+        } catch (StarRocksException e) {
+            LOG.warn("Failed to set ENABLE_ADAPTIVE_SINK_DOP", e);
         } catch (Throwable t) {
-            LOG.warn("transfer to master failed with error", t);
+            LOG.warn("transfer to leader failed with error", t);
             feType = oldType;
             throw t;
         }
+
+        createBuiltinStorageVolume();
+        resourceGroupMgr.createBuiltinResourceGroupsIfNotExist();
+        keyMgr.initDefaultMasterKey();
+    }
+
+    public void setFrontendNodeType(FrontendNodeType newType) {
+        // just for test, don't call it directly
+        feType = newType;
     }
 
     // start all daemon threads only running on Master
-    private void startMasterOnlyDaemonThreads() {
-        // start checkpoint thread
-        checkpointer = new Checkpoint(editLog);
-        checkpointer.setMetaContext(metaContext);
-        // set "checkpointThreadId" before the checkpoint thread start, because the thread
-        // need to check the "checkpointThreadId" when running.
-        checkpointThreadId = checkpointer.getId();
+    private void startLeaderOnlyDaemonThreads() {
+        if (RunMode.isSharedDataMode()) {
+            // register service to starMgr
+            if (!getStarOSAgent().registerAndBootstrapService()) {
+                System.exit(-1);
+            }
 
-        checkpointer.start();
-        LOG.info("checkpointer thread started. thread id is {}", checkpointThreadId);
+            StarMgrServer.getCurrentState().startCheckpointController();
+        }
+
+        // start checkpoint thread
+        checkpointController = new CheckpointController("global_state_checkpoint_controller", journal, "");
+        checkpointController.start();
+
+        keyRotationDaemon.start();
 
         // heartbeat mgr
-        nodeMgr.startHearbeat(epoch);
+        heartbeatMgr.setLeader(nodeMgr.getClusterId(), nodeMgr.getToken(), getEpoch());
+        heartbeatMgr.start();
         // New load scheduler
         pendingLoadTaskScheduler.start();
         loadingLoadTaskScheduler.start();
-        loadManager.prepareJobs();
+        loadMgr.prepareJobs();
         loadJobScheduler.start();
         loadTimeoutChecker.start();
+        loadsHistorySyncer.start();
         loadEtlChecker.start();
         loadLoadingChecker.start();
         // Export checker
@@ -988,7 +1386,7 @@ public class GlobalStateMgr {
         // Start txn timeout checker
         txnTimeoutChecker.start();
         // Alter
-        getAlterInstance().start();
+        getAlterJobMgr().start();
         // Consistency checker
         getConsistencyChecker().start();
         // Backup handler
@@ -1001,460 +1399,433 @@ public class GlobalStateMgr {
         // start routine load scheduler
         routineLoadScheduler.start();
         routineLoadTaskScheduler.start();
+        batchWriteMgr.start();
         // start dynamic partition task
         dynamicPartitionScheduler.start();
-        // start daemon thread to update db used data quota for db txn manager periodly
+        // start daemon thread to update db used data quota for db txn manager periodically
         updateDbUsedDataQuotaDaemon.start();
         statisticsMetaManager.start();
         statisticAutoCollector.start();
         taskManager.start();
         taskCleaner.start();
-        // register service to starMgr
-        if (Config.integrate_starmgr) {
-            int clusterId = getCurrentState().getClusterId();
-            getStarOSAgent().registerAndBootstrapService(Integer.toString(clusterId));
+        mvMVJobExecutor.start();
+        pipeListener.start();
+        pipeScheduler.start();
+        mvActiveChecker.start();
+
+        // start daemon thread to report the progress of RunningTaskRun to the follower by editlog
+        taskRunStateSynchronizer = new TaskRunStateSynchronizer();
+        taskRunStateSynchronizer.start();
+
+        if (RunMode.isSharedDataMode()) {
+            starMgrMetaSyncer.start();
+            autovacuumDaemon.start();
         }
+
+        if (Config.enable_safe_mode) {
+            LOG.info("Start safe mode checker!");
+            safeModeChecker.start();
+        }
+
+        replicationMgr.start();
+
+        if (Config.metadata_enable_recovery_mode) {
+            LOG.info("run system in recovery mode");
+            metaRecoveryDaemon.start();
+        }
+        temporaryTableCleaner.start();
+
+        connectorTableTriggerAnalyzeMgr.start();
+
+        if (RunMode.isSharedDataMode()) {
+            clusterSnapshotMgr.startCheckpointScheduler(checkpointController,
+                                                        StarMgrServer.getCurrentState().getCheckpointController());
+        }
+        reportHandler.start();
+        tabletCollector.start();
     }
 
-    // start threads that should running on all FE
-    private void startNonMasterDaemonThreads() {
+    // start threads that should run on all FE
+    private void startAllNodeTypeDaemonThreads() {
+        if (!checkpointWorkerStarted) {
+            checkpointWorker = new GlobalStateCheckpointWorker(journal);
+            // set "checkpointThreadId" before the checkpoint thread start, because the thread
+            // need to check the "checkpointThreadId" when running.
+            checkpointThreadId = checkpointWorker.getId();
+            checkpointWorker.start();
+            checkpointWorkerStarted = true;
+            LOG.info("global state mgr checkpoint worker thread started. thread id is {}", checkpointThreadId);
+        }
+
+        portConnectivityChecker.start();
         tabletStatMgr.start();
         // load and export job label cleaner thread
         labelCleaner.start();
         // ES state store
         esRepository.start();
-        starRocksRepository.start();
 
         if (Config.enable_hms_events_incremental_sync) {
-            // load hive table to event processor and start to process hms events.
-            metastoreEventsProcessor.init();
             metastoreEventsProcessor.start();
         }
+
+        connectorTableMetadataProcessor.start();
+
         // domain resolver
         domainResolver.start();
+        if (RunMode.isSharedDataMode()) {
+            compactionMgr.start();
+            StarMgrServer.getCurrentState().startCheckpointWorker();
+        }
+        configRefreshDaemon.start();
+
+        slotManager.start();
+
+        lockChecker.start();
+
+        refreshDictionaryCacheTaskDaemon.start();
+
+        procProfileCollector.start();
+
+        warehouseIdleChecker.start();
+
+        // The memory tracker should be placed at the end
+        memoryUsageTracker.start();
+
+        PredicateColumnsMgr.getInstance().startDaemon();
     }
 
-    private void transferToNonMaster(FrontendNodeType newType) {
+    private void transferToNonLeader(FrontendNodeType newType) {
         isReady.set(false);
 
         if (feType == FrontendNodeType.OBSERVER || feType == FrontendNodeType.FOLLOWER) {
             Preconditions.checkState(newType == FrontendNodeType.UNKNOWN);
             LOG.warn("{} to UNKNOWN, still offer read service", feType.name());
-            // not set canRead here, leave canRead as what is was.
+            // not set canRead here, leave canRead as what it was.
             // if meta out of date, canRead will be set to false in replayer thread.
             metaReplayState.setTransferToUnknown();
-            // get serviceId from starMgr
-            if (Config.integrate_starmgr) {
-                int clusterId = getCurrentState().getClusterId();
-                getStarOSAgent().getServiceId(Integer.toString(clusterId));
-            }
+            feType = newType;
             return;
         }
 
         // transfer from INIT/UNKNOWN to OBSERVER/FOLLOWER
-
-        // add helper sockets
-        if (Config.edit_log_type.equalsIgnoreCase("BDB")) {
-            for (Frontend fe : nodeMgr.getFrontends().values()) {
-                if (fe.getRole() == FrontendNodeType.FOLLOWER) {
-                    if (getHaProtocol() instanceof BDBHA) {
-                        ((BDBHA) getHaProtocol()).addHelperSocket(fe.getHost(), fe.getEditLogPort());
-                    }
-                }
-            }
-        }
 
         if (replayer == null) {
             createReplayer();
             replayer.start();
         }
 
-        startNonMasterDaemonThreads();
+        startAllNodeTypeDaemonThreads();
+
+        if (!isDefaultWarehouseCreated) {
+            initDefaultWarehouse();
+        }
 
         MetricRepo.init();
+
+        feType = newType;
     }
 
-    public void loadImage(String imageDir) throws IOException, DdlException {
-        Storage storage = new Storage(imageDir);
-        nodeMgr.setClusterId(storage.getClusterID());
-        File curFile = storage.getCurrentImageFile();
+    // The manager that loads meta from image must be a member of GlobalStateMgr and cannot be SINGLETON,
+    // since Checkpoint uses a separate memory.
+    public void loadImage(String imageDir) throws IOException {
+        ImageLoader imageLoader = new ImageLoader(imageDir);
+        File curFile = imageLoader.getImageFile();
         if (!curFile.exists()) {
             // image.0 may not exist
             LOG.info("image does not exist: {}", curFile.getAbsolutePath());
             return;
         }
-        replayedJournalId.set(storage.getImageJournalId());
+        replayedJournalId.set(imageLoader.getImageJournalId());
         LOG.info("start load image from {}. is ckpt: {}", curFile.getAbsolutePath(),
                 GlobalStateMgr.isCheckpointThread());
         long loadImageStartTime = System.currentTimeMillis();
-        DataInputStream dis = new DataInputStream(new BufferedInputStream(new FileInputStream(curFile)));
 
-        long checksum = 0;
-        long remoteChecksum = 0;
+        Map<SRMetaBlockID, SRMetaBlockLoader> loadImages = ImmutableMap.<SRMetaBlockID, SRMetaBlockLoader>builder()
+                .put(SRMetaBlockID.NODE_MGR, nodeMgr::load)
+                .put(SRMetaBlockID.LOCAL_META_STORE, localMetastore::load)
+                .put(SRMetaBlockID.ALTER_MGR, alterJobMgr::load)
+                .put(SRMetaBlockID.CATALOG_RECYCLE_BIN, recycleBin::load)
+                .put(SRMetaBlockID.VARIABLE_MGR, variableMgr::load)
+                .put(SRMetaBlockID.RESOURCE_MGR, resourceMgr::loadResourcesV2)
+                .put(SRMetaBlockID.EXPORT_MGR, exportMgr::loadExportJobV2)
+                .put(SRMetaBlockID.BACKUP_MGR, backupHandler::loadBackupHandlerV2)
+                .put(SRMetaBlockID.GLOBAL_TRANSACTION_MGR, globalTransactionMgr::loadTransactionStateV2)
+                .put(SRMetaBlockID.COLOCATE_TABLE_INDEX, colocateTableIndex::loadColocateTableIndexV2)
+                .put(SRMetaBlockID.ROUTINE_LOAD_MGR, routineLoadMgr::loadRoutineLoadJobsV2)
+                .put(SRMetaBlockID.LOAD_MGR, loadMgr::loadLoadJobsV2JsonFormat)
+                .put(SRMetaBlockID.SMALL_FILE_MGR, smallFileMgr::loadSmallFilesV2)
+                .put(SRMetaBlockID.PLUGIN_MGR, pluginMgr::load)
+                .put(SRMetaBlockID.DELETE_MGR, deleteMgr::load)
+                .put(SRMetaBlockID.ANALYZE_MGR, analyzeMgr::load)
+                .put(SRMetaBlockID.RESOURCE_GROUP_MGR, resourceGroupMgr::load)
+                .put(SRMetaBlockID.AUTHENTICATION_MGR, authenticationMgr::loadV2)
+                .put(SRMetaBlockID.AUTHORIZATION_MGR, authorizationMgr::loadV2)
+                .put(SRMetaBlockID.TASK_MGR, taskManager::loadTasksV2)
+                .put(SRMetaBlockID.CATALOG_MGR, catalogMgr::load)
+                .put(SRMetaBlockID.INSERT_OVERWRITE_JOB_MGR, insertOverwriteJobMgr::load)
+                .put(SRMetaBlockID.COMPACTION_MGR, compactionMgr::load)
+                .put(SRMetaBlockID.STREAM_LOAD_MGR, streamLoadMgr::load)
+                .put(SRMetaBlockID.MATERIALIZED_VIEW_MGR, materializedViewMgr::load)
+                .put(SRMetaBlockID.GLOBAL_FUNCTION_MGR, globalFunctionMgr::load)
+                .put(SRMetaBlockID.STORAGE_VOLUME_MGR, storageVolumeMgr::load)
+                .put(SRMetaBlockID.DICTIONARY_MGR, dictionaryMgr::load)
+                .put(SRMetaBlockID.REPLICATION_MGR, replicationMgr::load)
+                .put(SRMetaBlockID.KEY_MGR, keyMgr::load)
+                .put(SRMetaBlockID.PIPE_MGR, pipeManager.getRepo()::load)
+                .put(SRMetaBlockID.WAREHOUSE_MGR, warehouseMgr::load)
+                .put(SRMetaBlockID.CLUSTER_SNAPSHOT_MGR, clusterSnapshotMgr::load)
+                .put(SRMetaBlockID.BLACKLIST_MGR, sqlBlackList::load)
+                .build();
+
+        Set<SRMetaBlockID> metaMgrMustExists = new HashSet<>(loadImages.keySet());
+        InputStream in = Files.newInputStream(curFile.toPath());
         try {
-            checksum = loadHeader(dis, checksum);
-            checksum = nodeMgr.loadMasterInfo(dis, checksum);
-            checksum = nodeMgr.loadFrontends(dis, checksum);
-            checksum = nodeMgr.loadBackends(dis, checksum);
-            checksum = localMetastore.loadDb(dis, checksum);
-            // ATTN: this should be done after load Db, and before loadAlterJob
-            localMetastore.recreateTabletInvertIndex();
-            // rebuild es state state
-            esRepository.loadTableFromCatalog();
-            starRocksRepository.loadTableFromCatalog();
+            imageLoader.setInputStream(in);
+            loadHeader(new DataInputStream(imageLoader.getCheckedInputStream()));
+            while (true) {
+                SRMetaBlockReader reader = imageLoader.getBlockReader();
+                SRMetaBlockID srMetaBlockID = reader.getHeader().getSrMetaBlockID();
 
-            checksum = load.loadLoadJob(dis, checksum);
-            checksum = loadAlterJob(dis, checksum);
-            checksum = recycleBin.loadRecycleBin(dis, checksum);
-            checksum = VariableMgr.loadGlobalVariable(dis, checksum);
-            checksum = localMetastore.loadCluster(dis, checksum);
-            checksum = nodeMgr.loadBrokers(dis, checksum);
-            checksum = loadResources(dis, checksum);
-            checksum = exportMgr.loadExportJob(dis, checksum);
-            checksum = backupHandler.loadBackupHandler(dis, checksum, this);
-            checksum = auth.loadAuth(dis, checksum);
-            // global transaction must be replayed before load jobs v2
-            checksum = globalTransactionMgr.loadTransactionState(dis, checksum);
-            checksum = colocateTableIndex.loadColocateTableIndex(dis, checksum);
-            checksum = routineLoadManager.loadRoutineLoadJobs(dis, checksum);
-            checksum = loadManager.loadLoadJobsV2(dis, checksum);
-            checksum = smallFileMgr.loadSmallFiles(dis, checksum);
-            checksum = pluginMgr.loadPlugins(dis, checksum);
-            checksum = loadDeleteHandler(dis, checksum);
-            remoteChecksum = dis.readLong();
-            checksum = analyzeManager.loadAnalyze(dis, checksum);
-            remoteChecksum = dis.readLong();
-            checksum = workGroupMgr.loadWorkGroups(dis, checksum);
-            checksum = auth.readAsGson(dis, checksum);
-            remoteChecksum = dis.readLong();
-            checksum = taskManager.loadTasks(dis, checksum);
-            remoteChecksum = dis.readLong();
-            checksum = catalogMgr.loadCatalogs(dis, checksum);
-            remoteChecksum = dis.readLong();
-            checksum = loadInsertOverwriteJobs(dis, checksum);
+                try {
+                    SRMetaBlockLoader metaBlockLoader = loadImages.get(srMetaBlockID);
+                    if (metaBlockLoader == null) {
+                        /*
+                         * The expected read module does not match the module stored in the image,
+                         * and the json chunk is skipped directly. This usually occurs in several situations.
+                         * 1. When the obsolete image code is deleted.
+                         * 2. When the new version rolls back to the old version,
+                         *    the old version ignores the functions of the new version
+                         */
+                        LOG.warn(String.format("Ignore this invalid meta block, sr meta block id mismatch" +
+                                "(expect sr meta block id %s)", srMetaBlockID));
+                        continue;
+                    }
+
+                    metaBlockLoader.apply(reader);
+                    metaMgrMustExists.remove(srMetaBlockID);
+                    LOG.info("Success load StarRocks meta block " + srMetaBlockID + " from image");
+                } catch (SRMetaBlockEOFException srMetaBlockEOFException) {
+                    /*
+                     * The number of json expected to be read is more than the number of json actually stored in the image
+                     */
+                    metaMgrMustExists.remove(srMetaBlockID);
+                    LOG.warn("Got EOF exception, ignore, ", srMetaBlockEOFException);
+                } catch (Throwable t) {
+                    LOG.warn("load meta block {} failed", srMetaBlockID, t);
+                    // throw the exception again, because the following steps will depend on this error.
+                    throw t;
+                } finally {
+                    reader.close();
+                }
+            }
         } catch (EOFException exception) {
-            LOG.warn("load image eof.", exception);
+            if (!metaMgrMustExists.isEmpty()) {
+                LOG.warn("Miss meta block [" + Joiner.on(",").join(new ArrayList<>(metaMgrMustExists)) + "], " +
+                        "This may not be a fatal error. It may be because there are new features in the version " +
+                        "you upgraded this time, but there is no relevant metadata.");
+            } else {
+                LOG.info("Load meta-image EOF, successful loading all requires meta module");
+            }
+        } catch (SRMetaBlockException e) {
+            LOG.error("load meta block failed ", e);
+            throw new IOException("load meta block failed ", e);
         } finally {
-            dis.close();
+            imageLoader.readTheRemainingBytes();
+            in.close();
         }
 
-        Preconditions.checkState(remoteChecksum == checksum, remoteChecksum + " vs. " + checksum);
+        imageLoader.checkCheckSum();
+
+        try {
+            postLoadImage();
+        } catch (Exception t) {
+            LOG.warn("there is an exception during processing after load image. exception:", t);
+        }
 
         long loadImageEndTime = System.currentTimeMillis();
-        this.imageJournalId = storage.getImageJournalId();
+        this.imageJournalId = imageLoader.getImageJournalId();
         LOG.info("finished to load image in " + (loadImageEndTime - loadImageStartTime) + " ms");
     }
 
-    public long loadHeader(DataInputStream dis, long checksum) throws IOException {
-        // for community, version schema is [int], and the int value must be positive
-        // for starrocks, version schema is [-1, int, int]
+    private void postLoadImage() {
+        onReloadTables();
+        processMvRelatedMeta();
+    }
+
+    /**
+     * Call Table::onReload after load all tables, some properties like FK may depend on other databases/catalogs
+     */
+    private void onReloadTables() {
+        TemporaryTableMgr temporaryTableMgr = GlobalStateMgr.getCurrentState().getTemporaryTableMgr();
+        List<String> dbNames = metadataMgr.listDbNames(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME);
+        for (String dbName : dbNames) {
+            Database db = metadataMgr.getDb(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, dbName);
+            if (db == null) {
+                continue;
+            }
+            for (Table table : db.getTables()) {
+                try {
+                    table.onReload();
+
+                    if (table.isTemporaryTable()) {
+                        temporaryTableMgr.addTemporaryTable(UUIDUtil.genUUID(), db.getId(), table.getName(),
+                                table.getId());
+                    }
+                } catch (Throwable e) {
+                    LOG.error("reload table failed: {}", table, e);
+                }
+            }
+        }
+    }
+
+    private void processMvRelatedMeta() {
+        List<String> dbNames = metadataMgr.listDbNames(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME);
+
+        long startMillis = System.currentTimeMillis();
+        for (String dbName : dbNames) {
+            Database db = metadataMgr.getDb(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME, dbName);
+            for (MaterializedView mv : db.getMaterializedViews()) {
+                mv.onReload();
+            }
+        }
+
+        long duration = System.currentTimeMillis() - startMillis;
+        LOG.info("finish processing all tables' related materialized views in {}ms", duration);
+    }
+
+    public void loadHeader(DataInputStream dis) throws IOException {
+        // for new format, version schema is [starrocksMetaVersion], and the int value must be positive
+        // for old format, version schema is [-1, metaVersion, starrocksMetaVersion]
         // so we can check the first int to determine the version schema
         int flag = dis.readInt();
-        long newChecksum = checksum ^ flag;
+        int starrocksMetaVersion;
         if (flag < 0) {
-            int communityMetaVersion = dis.readInt();
-            if (communityMetaVersion > FeConstants.meta_version) {
-                LOG.error("invalid meta data version found, cat not bigger than FeConstants.meta_version."
-                                + "please update FeConstants.meta_version bigger or equal to {} and restart.",
-                        communityMetaVersion);
-                System.exit(-1);
-            }
-            newChecksum ^= communityMetaVersion;
-            MetaContext.get().setMetaVersion(communityMetaVersion);
-            int starrocksMetaVersion = dis.readInt();
-            if (starrocksMetaVersion > FeConstants.starrocks_meta_version) {
-                LOG.error("invalid meta data version found, cat not bigger than FeConstants.starrocks_meta_version."
-                                + "please update FeConstants.starrocks_meta_version bigger or equal to {} and restart.",
-                        starrocksMetaVersion);
-                System.exit(-1);
-            }
-            newChecksum ^= starrocksMetaVersion;
-            MetaContext.get().setStarRocksMetaVersion(starrocksMetaVersion);
+            dis.readInt();
+            starrocksMetaVersion = dis.readInt();
         } else {
-            // when flag is positive, this is community image structure
-            int metaVersion = flag;
-            if (metaVersion > FeConstants.meta_version) {
-                LOG.error("invalid meta data version found, cat not bigger than FeConstants.meta_version."
-                                + "please update FeConstants.meta_version bigger or equal to {} and restart.",
-                        metaVersion);
-                System.exit(-1);
-            }
-            MetaContext.get().setMetaVersion(metaVersion);
+            // when flag is positive, this is new version format
+            starrocksMetaVersion = flag;
         }
 
-        long replayedJournalId = dis.readLong();
-        newChecksum ^= replayedJournalId;
-
-        long catalogId = dis.readLong();
-        newChecksum ^= catalogId;
-        idGenerator.setId(catalogId);
-
-        if (MetaContext.get().getMetaVersion() >= FeMetaVersion.VERSION_32) {
-            isDefaultClusterCreated = dis.readBoolean();
+        if (starrocksMetaVersion != FeConstants.STARROCKS_META_VERSION) {
+            LOG.error("Not compatible with meta version {}, current version is {}",
+                    starrocksMetaVersion, FeConstants.STARROCKS_META_VERSION);
+            System.exit(-1);
         }
 
-        LOG.info("finished replay header from image");
-        return newChecksum;
-    }
-
-    public long loadAlterJob(DataInputStream dis, long checksum) throws IOException {
-        long newChecksum = checksum;
-        for (JobType type : JobType.values()) {
-            if (type == JobType.DECOMMISSION_BACKEND) {
-                if (GlobalStateMgr.getCurrentStateJournalVersion() >= 5) {
-                    newChecksum = loadAlterJob(dis, newChecksum, type);
-                }
-            } else {
-                newChecksum = loadAlterJob(dis, newChecksum, type);
-            }
-        }
-        LOG.info("finished replay alterJob from image");
-        return newChecksum;
-    }
-
-    public long loadAlterJob(DataInputStream dis, long checksum, JobType type) throws IOException {
-        Map<Long, AlterJob> alterJobs = null;
-        ConcurrentLinkedQueue<AlterJob> finishedOrCancelledAlterJobs = null;
-        Map<Long, AlterJobV2> alterJobsV2 = Maps.newHashMap();
-        if (type == JobType.ROLLUP) {
-            alterJobs = this.getRollupHandler().unprotectedGetAlterJobs();
-            finishedOrCancelledAlterJobs = this.getRollupHandler().unprotectedGetFinishedOrCancelledAlterJobs();
-        } else if (type == JobType.SCHEMA_CHANGE) {
-            alterJobs = this.getSchemaChangeHandler().unprotectedGetAlterJobs();
-            finishedOrCancelledAlterJobs = this.getSchemaChangeHandler().unprotectedGetFinishedOrCancelledAlterJobs();
-            alterJobsV2 = this.getSchemaChangeHandler().getAlterJobsV2();
-        } else if (type == JobType.DECOMMISSION_BACKEND) {
-            alterJobs = this.getClusterHandler().unprotectedGetAlterJobs();
-            finishedOrCancelledAlterJobs = this.getClusterHandler().unprotectedGetFinishedOrCancelledAlterJobs();
-        }
-
-        // alter jobs
-        int size = dis.readInt();
-        long newChecksum = checksum ^ size;
-        for (int i = 0; i < size; i++) {
-            long tableId = dis.readLong();
-            newChecksum ^= tableId;
-            AlterJob job = AlterJob.read(dis);
-            alterJobs.put(tableId, job);
-
-            // init job
-            Database db = getDb(job.getDbId());
-            // should check job state here because the job is finished but not removed from alter jobs list
-            if (db != null && (job.getState() == com.starrocks.alter.AlterJob.JobState.PENDING
-                    || job.getState() == com.starrocks.alter.AlterJob.JobState.RUNNING)) {
-                job.replayInitJob(db);
-            }
-        }
-
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= 2) {
-            // finished or cancelled jobs
-            long currentTimeMs = System.currentTimeMillis();
-            size = dis.readInt();
-            newChecksum ^= size;
-            for (int i = 0; i < size; i++) {
-                long tableId = dis.readLong();
-                newChecksum ^= tableId;
-                AlterJob job = AlterJob.read(dis);
-                if ((currentTimeMs - job.getCreateTimeMs()) / 1000 <= Config.history_job_keep_max_second) {
-                    // delete history jobs
-                    finishedOrCancelledAlterJobs.add(job);
-                }
-            }
-        }
-
-        // alter job v2
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_61) {
-            size = dis.readInt();
-            newChecksum ^= size;
-            for (int i = 0; i < size; i++) {
-                AlterJobV2 alterJobV2 = AlterJobV2.read(dis);
-                if (type == JobType.ROLLUP || type == JobType.SCHEMA_CHANGE) {
-                    if (type == JobType.ROLLUP) {
-                        this.getRollupHandler().addAlterJobV2(alterJobV2);
-                    } else {
-                        alterJobsV2.put(alterJobV2.getJobId(), alterJobV2);
-                    }
-                    // ATTN : we just want to add tablet into TabletInvertedIndex when only PendingJob is checkpointed
-                    // to prevent TabletInvertedIndex data loss,
-                    // So just use AlterJob.replay() instead of AlterHandler.replay().
-                    if (alterJobV2.getJobState() == AlterJobV2.JobState.PENDING) {
-                        alterJobV2.replay(alterJobV2);
-                        LOG.info("replay pending alter job when load alter job {} ", alterJobV2.getJobId());
-                    }
-                } else {
-                    alterJobsV2.put(alterJobV2.getJobId(), alterJobV2);
-                }
-            }
-        }
-
-        return newChecksum;
-    }
-
-    public long loadDeleteHandler(DataInputStream dis, long checksum) throws IOException {
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_82) {
-            this.deleteHandler = DeleteHandler.read(dis);
-        }
-        LOG.info("finished replay deleteHandler from image");
-        return checksum;
-    }
-
-    public long loadInsertOverwriteJobs(DataInputStream dis, long checksum) throws IOException {
-        try {
-            this.insertOverwriteJobManager = InsertOverwriteJobManager.read(dis);
-        } catch (EOFException e) {
-            LOG.warn("no InsertOverwriteJobManager to replay.", e);
-        }
-        return checksum;
-    }
-
-    public long saveInsertOverwriteJobs(DataOutputStream dos, long checksum) throws IOException {
-        getInsertOverwriteJobManager().write(dos);
-        return checksum;
-    }
-
-    public long loadResources(DataInputStream in, long checksum) throws IOException {
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_87) {
-            resourceMgr = ResourceMgr.read(in);
-        }
-        LOG.info("finished replay resources from image");
-        return checksum;
+        ImageHeader header = GsonUtils.GSON.fromJson(Text.readString(dis), ImageHeader.class);
+        idGenerator.setId(header.getBatchEndId());
+        LOG.info("finished to replay header from image");
     }
 
     // Only called by checkpoint thread
     public void saveImage() throws IOException {
+        try {
+            saveImage(ImageFormatVersion.v1);
+        } catch (Throwable t) {
+            // image v1 may fail because of byte[] size overflow, ignore
+            LOG.warn("save image v1 failed, ignore", t);
+        }
+        saveImage(ImageFormatVersion.v2);
+    }
+
+    public void saveImage(ImageFormatVersion formatVersion) throws IOException {
+        String destDir;
+        if (formatVersion == ImageFormatVersion.v1) {
+            destDir = this.imageDir;
+        } else {
+            destDir = this.imageDir + "/v2";
+        }
         // Write image.ckpt
-        Storage storage = new Storage(this.imageDir);
+        Storage storage = new Storage(destDir);
         File curFile = storage.getImageFile(replayedJournalId.get());
-        File ckpt = new File(this.imageDir, Storage.IMAGE_NEW);
-        saveImage(ckpt, replayedJournalId.get());
+        File ckpt = new File(destDir, Storage.IMAGE_NEW);
+        saveImage(new ImageWriter(destDir, formatVersion, replayedJournalId.get()), ckpt);
 
         // Move image.ckpt to image.dataVersion
         LOG.info("Move " + ckpt.getAbsolutePath() + " to " + curFile.getAbsolutePath());
         if (!ckpt.renameTo(curFile)) {
-            curFile.delete();
+            if (!curFile.delete()) {
+                LOG.warn("Failed to delete file, filepath={}", curFile.getAbsolutePath());
+            }
             throw new IOException();
         }
     }
 
-    public void saveImage(File curFile, long replayedJournalId) throws IOException {
+    // The manager that saves meta to image must be a member of GlobalStateMgr and cannot be SINGLETON,
+    // since Checkpoint uses a separate memory.
+    public void saveImage(ImageWriter imageWriter, File curFile) throws IOException {
         if (!curFile.exists()) {
-            curFile.createNewFile();
+            if (!curFile.createNewFile()) {
+                LOG.warn("Failed to create file, filepath={}", curFile.getAbsolutePath());
+            }
         }
 
         // save image does not need any lock. because only checkpoint thread will call this method.
         LOG.info("start save image to {}. is ckpt: {}", curFile.getAbsolutePath(), GlobalStateMgr.isCheckpointThread());
 
-        long checksum = 0;
         long saveImageStartTime = System.currentTimeMillis();
-        try (DataOutputStream dos = new DataOutputStream(new FileOutputStream(curFile))) {
-            checksum = saveHeader(dos, replayedJournalId, checksum);
-            checksum = nodeMgr.saveMasterInfo(dos, checksum);
-            checksum = nodeMgr.saveFrontends(dos, checksum);
-            checksum = nodeMgr.saveBackends(dos, checksum);
-            checksum = localMetastore.saveDb(dos, checksum);
-            checksum = load.saveLoadJob(dos, checksum);
-            checksum = saveAlterJob(dos, checksum);
-            checksum = recycleBin.saveRecycleBin(dos, checksum);
-            checksum = VariableMgr.saveGlobalVariable(dos, checksum);
-            checksum = localMetastore.saveCluster(dos, checksum);
-            checksum = nodeMgr.saveBrokers(dos, checksum);
-            checksum = resourceMgr.saveResources(dos, checksum);
-            checksum = exportMgr.saveExportJob(dos, checksum);
-            checksum = backupHandler.saveBackupHandler(dos, checksum);
-            checksum = auth.saveAuth(dos, checksum);
-            checksum = globalTransactionMgr.saveTransactionState(dos, checksum);
-            checksum = colocateTableIndex.saveColocateTableIndex(dos, checksum);
-            checksum = routineLoadManager.saveRoutineLoadJobs(dos, checksum);
-            checksum = loadManager.saveLoadJobsV2(dos, checksum);
-            checksum = smallFileMgr.saveSmallFiles(dos, checksum);
-            checksum = pluginMgr.savePlugins(dos, checksum);
-            checksum = deleteHandler.saveDeleteHandler(dos, checksum);
-            dos.writeLong(checksum);
-            checksum = analyzeManager.saveAnalyze(dos, checksum);
-            dos.writeLong(checksum);
-            checksum = workGroupMgr.saveWorkGroups(dos, checksum);
-            checksum = auth.writeAsGson(dos, checksum);
-            dos.writeLong(checksum);
-            checksum = taskManager.saveTasks(dos, checksum);
-            dos.writeLong(checksum);
-            checksum = catalogMgr.saveCatalogs(dos, checksum);
-            dos.writeLong(checksum);
-            checksum = saveInsertOverwriteJobs(dos, checksum);
-        }
+        try (OutputStream outputStream = Files.newOutputStream(curFile.toPath())) {
+            imageWriter.setOutputStream(outputStream);
+            try {
+                saveHeader(imageWriter.getDataOutputStream());
+                nodeMgr.save(imageWriter);
+                localMetastore.save(imageWriter);
+                alterJobMgr.save(imageWriter);
+                recycleBin.save(imageWriter);
+                variableMgr.save(imageWriter);
+                resourceMgr.saveResourcesV2(imageWriter);
+                exportMgr.saveExportJobV2(imageWriter);
+                backupHandler.saveBackupHandlerV2(imageWriter);
+                globalTransactionMgr.saveTransactionStateV2(imageWriter);
+                colocateTableIndex.saveColocateTableIndexV2(imageWriter);
+                routineLoadMgr.saveRoutineLoadJobsV2(imageWriter);
+                loadMgr.saveLoadJobsV2JsonFormat(imageWriter);
+                smallFileMgr.saveSmallFilesV2(imageWriter);
+                pluginMgr.save(imageWriter);
+                deleteMgr.save(imageWriter);
+                analyzeMgr.save(imageWriter);
+                resourceGroupMgr.save(imageWriter);
+                authenticationMgr.saveV2(imageWriter);
+                authorizationMgr.saveV2(imageWriter);
+                taskManager.saveTasksV2(imageWriter);
+                catalogMgr.save(imageWriter);
+                insertOverwriteJobMgr.save(imageWriter);
+                compactionMgr.save(imageWriter);
+                streamLoadMgr.save(imageWriter);
+                materializedViewMgr.save(imageWriter);
+                globalFunctionMgr.save(imageWriter);
+                storageVolumeMgr.save(imageWriter);
+                dictionaryMgr.save(imageWriter);
+                replicationMgr.save(imageWriter);
+                keyMgr.save(imageWriter);
+                pipeManager.getRepo().save(imageWriter);
+                warehouseMgr.save(imageWriter);
+                sqlBlackList.save(imageWriter);
+                clusterSnapshotMgr.save(imageWriter);
+            } catch (SRMetaBlockException e) {
+                LOG.error("Save meta block failed ", e);
+                throw new IOException("Save meta block failed ", e);
+            }
 
-        long saveImageEndTime = System.currentTimeMillis();
-        LOG.info("finished save image {} in {} ms. checksum is {}",
-                curFile.getAbsolutePath(), (saveImageEndTime - saveImageStartTime), checksum);
+            imageWriter.saveChecksum();
+
+            long saveImageEndTime = System.currentTimeMillis();
+            LOG.info("Finished save meta block {} in {} ms.",
+                    curFile.getAbsolutePath(), (saveImageEndTime - saveImageStartTime));
+        }
     }
 
-    public long saveHeader(DataOutputStream dos, long replayedJournalId, long checksum) throws IOException {
-        // Write meta version
-        // community meta version is a positive integer, so we write -1 to distinguish old image structure
-        checksum ^= -1;
-        dos.writeInt(-1);
-        checksum ^= FeConstants.meta_version;
-        dos.writeInt(FeConstants.meta_version);
-        checksum ^= FeConstants.starrocks_meta_version;
-        dos.writeInt(FeConstants.starrocks_meta_version);
-
-        // Write replayed journal id
-        checksum ^= replayedJournalId;
-        dos.writeLong(replayedJournalId);
-
-        // Write id
+    public void saveHeader(DataOutputStream dos) throws IOException {
+        dos.writeInt(FeConstants.STARROCKS_META_VERSION);
+        ImageHeader header = new ImageHeader();
         long id = idGenerator.getBatchEndId();
-        checksum ^= id;
-        dos.writeLong(id);
-
-        dos.writeBoolean(isDefaultClusterCreated);
-
-        return checksum;
-    }
-
-    public long saveAlterJob(DataOutputStream dos, long checksum) throws IOException {
-        for (JobType type : JobType.values()) {
-            checksum = saveAlterJob(dos, checksum, type);
-        }
-        return checksum;
-    }
-
-    public long saveAlterJob(DataOutputStream dos, long checksum, JobType type) throws IOException {
-        Map<Long, AlterJobV2> alterJobsV2 = Maps.newHashMap();
-        if (type == JobType.ROLLUP) {
-            alterJobsV2 = this.getRollupHandler().getAlterJobsV2();
-        } else if (type == JobType.SCHEMA_CHANGE) {
-            alterJobsV2 = this.getSchemaChangeHandler().getAlterJobsV2();
-        }
-
-        // alter jobs just for compatibility
-        int size = 0;
-        checksum ^= size;
-        dos.writeInt(size);
-        // finished or cancelled jobs just for compatibility
-        checksum ^= size;
-        dos.writeInt(size);
-
-        // alter job v2
-        size = alterJobsV2.size();
-        checksum ^= size;
-        dos.writeInt(size);
-        for (AlterJobV2 alterJobV2 : alterJobsV2.values()) {
-            alterJobV2.write(dos);
-        }
-
-        return checksum;
-    }
-
-    public void replayGlobalVariable(SessionVariable variable) throws IOException, DdlException {
-        VariableMgr.replayGlobalVariable(variable);
-    }
-
-    public void replayGlobalVariableV2(GlobalVarPersistInfo info) throws IOException, DdlException {
-        VariableMgr.replayGlobalVariableV2(info);
+        header.setBatchEndId(id);
+        Text.writeString(dos, GsonUtils.GSON.toJson(header));
     }
 
     public void createLabelCleaner() {
-        labelCleaner = new MasterDaemon("LoadLabelCleaner", Config.label_clean_interval_second * 1000L) {
+        labelCleaner = new FrontendDaemon("LoadLabelCleaner", Config.label_clean_interval_second * 1000L) {
             @Override
             protected void runAfterCatalogReady() {
                 clearExpiredJobs();
@@ -1463,34 +1834,66 @@ public class GlobalStateMgr {
     }
 
     public void createTaskCleaner() {
-        taskCleaner = new MasterDaemon("TaskCleaner", Config.task_check_interval_second * 1000L) {
+        taskCleaner = new FrontendDaemon("TaskCleaner", Config.task_check_interval_second * 1000L) {
             @Override
             protected void runAfterCatalogReady() {
                 doTaskBackgroundJob();
+                setInterval(Config.task_check_interval_second * 1000L);
             }
         };
     }
 
+    public void createTableKeeper() {
+        tableKeeper = TableKeeper.startDaemon();
+    }
+
     public void createTxnTimeoutChecker() {
-        txnTimeoutChecker = new MasterDaemon("txnTimeoutChecker", Config.transaction_clean_interval_second) {
+        txnTimeoutChecker = new FrontendDaemon("txnTimeoutChecker",
+                Config.transaction_clean_interval_second * 1000L) {
             @Override
             protected void runAfterCatalogReady() {
                 globalTransactionMgr.abortTimeoutTxns();
+
+                try {
+                    loadMgr.cancelResidualJob();
+                } catch (Throwable t) {
+                    LOG.warn("load manager cancel residual job failed", t);
+                }
             }
         };
     }
 
     public void createReplayer() {
         replayer = new Daemon("replayer", REPLAY_INTERVAL_MS) {
+            private JournalCursor cursor = null;
+            // avoid numerous 'meta out of date' log
+            private long lastMetaOutOfDateLogTime = 0;
+
             @Override
+            @java.lang.SuppressWarnings("squid:S2142")  // allow catch InterruptedException
             protected void runOneCycle() {
                 boolean err = false;
                 boolean hasLog = false;
                 try {
-                    hasLog = replayJournal(-1);
+                    if (cursor == null) {
+                        // 1. set replay to the end
+                        LOG.info("start to replay from {}", replayedJournalId.get());
+                        cursor = journal.read(replayedJournalId.get() + 1, JournalCursor.CURSOR_END_KEY);
+                    } else {
+                        cursor.refresh();
+                    }
+                    // 2. replay with flow control
+                    hasLog = replayJournalInner(cursor, true);
                     metaReplayState.setOk();
+                } catch (JournalInconsistentException | InterruptedException e) {
+                    LOG.warn("got interrupt exception or inconsistent exception when replay journal {}, will exit, ",
+                            replayedJournalId.get() + 1, e);
+                    // TODO exit gracefully
+                    Util.stdoutWithTime(e.getMessage());
+                    System.exit(-1);
                 } catch (Throwable e) {
-                    LOG.error("replayer thread catch an exception when replay journal.", e);
+                    LOG.error("replayer thread catch an exception when replay journal {}.",
+                            replayedJournalId.get() + 1, e);
                     metaReplayState.setException(e);
                     try {
                         Thread.sleep(5000);
@@ -1502,228 +1905,243 @@ public class GlobalStateMgr {
 
                 setCanRead(hasLog, err);
             }
-        };
-        replayer.setMetaContext(metaContext);
-    }
 
-    private void setCanRead(boolean hasLog, boolean err) {
-        if (err) {
-            canRead.set(false);
-            isReady.set(false);
-            return;
-        }
-
-        if (Config.ignore_meta_check) {
-            // can still offer read, but is not ready
-            canRead.set(true);
-            isReady.set(false);
-            return;
-        }
-
-        long currentTimeMs = System.currentTimeMillis();
-        if (currentTimeMs - synchronizedTimeMs > Config.meta_delay_toleration_second * 1000L) {
-            // we still need this log to observe this situation
-            // but service may be continued when there is no log being replayed.
-            LOG.warn("meta out of date. current time: {}, synchronized time: {}, has log: {}, fe type: {}",
-                    currentTimeMs, synchronizedTimeMs, hasLog, feType);
-            if (hasLog || feType == FrontendNodeType.UNKNOWN) {
-                // 1. if we read log from BDB, which means master is still alive.
-                // So we need to set meta out of date.
-                // 2. if we didn't read any log from BDB and feType is UNKNOWN,
-                // which means this non-master node is disconnected with master.
-                // So we need to set meta out of date either.
-                metaReplayState.setOutOfDate(currentTimeMs, synchronizedTimeMs);
-                canRead.set(false);
-                isReady.set(false);
-            }
-
-            // sleep 5s to avoid numerous 'meta out of date' log
-            try {
-                Thread.sleep(5000L);
-            } catch (InterruptedException e) {
-                LOG.error("unhandled exception when sleep", e);
-            }
-
-        } else {
-            canRead.set(true);
-            isReady.set(true);
-        }
-    }
-
-    public void notifyNewFETypeTransfer(FrontendNodeType newType) {
-        try {
-            String msg = "notify new FE type transfer: " + newType;
-            LOG.warn(msg);
-            Util.stdoutWithTime(msg);
-            this.typeTransferQueue.put(newType);
-        } catch (InterruptedException e) {
-            LOG.error("failed to put new FE type: {}", newType, e);
-        }
-    }
-
-    public void createStateListener() {
-        listener = new Daemon("stateListener", STATE_CHANGE_CHECK_INTERVAL_MS) {
-            @Override
-            protected synchronized void runOneCycle() {
-
-                while (true) {
-                    FrontendNodeType newType = null;
-                    try {
-                        newType = typeTransferQueue.take();
-                    } catch (InterruptedException e) {
-                        LOG.error("got exception when take FE type from queue", e);
-                        Util.stdoutWithTime("got exception when take FE type from queue. " + e.getMessage());
-                        System.exit(-1);
-                    }
-                    Preconditions.checkNotNull(newType);
-                    LOG.info("begin to transfer FE type from {} to {}", feType, newType);
-                    if (feType == newType) {
-                        return;
-                    }
-
-                    /*
-                     * INIT -> MASTER: transferToMaster
-                     * INIT -> FOLLOWER/OBSERVER: transferToNonMaster
-                     * UNKNOWN -> MASTER: transferToMaster
-                     * UNKNOWN -> FOLLOWER/OBSERVER: transferToNonMaster
-                     * FOLLOWER -> MASTER: transferToMaster
-                     * FOLLOWER/OBSERVER -> INIT/UNKNOWN: set isReady to false
-                     */
-                    switch (feType) {
-                        case INIT: {
-                            switch (newType) {
-                                case MASTER: {
-                                    transferToMaster(feType);
-                                    break;
-                                }
-                                case FOLLOWER:
-                                case OBSERVER: {
-                                    transferToNonMaster(newType);
-                                    break;
-                                }
-                                case UNKNOWN:
-                                    break;
-                                default:
-                                    break;
-                            }
-                            break;
-                        }
-                        case UNKNOWN: {
-                            switch (newType) {
-                                case MASTER: {
-                                    transferToMaster(feType);
-                                    break;
-                                }
-                                case FOLLOWER:
-                                case OBSERVER: {
-                                    transferToNonMaster(newType);
-                                    break;
-                                }
-                                default:
-                                    break;
-                            }
-                            break;
-                        }
-                        case FOLLOWER: {
-                            switch (newType) {
-                                case MASTER: {
-                                    transferToMaster(feType);
-                                    break;
-                                }
-                                case UNKNOWN: {
-                                    transferToNonMaster(newType);
-                                    break;
-                                }
-                                default:
-                                    break;
-                            }
-                            break;
-                        }
-                        case OBSERVER: {
-                            if (newType == FrontendNodeType.UNKNOWN) {
-                                transferToNonMaster(newType);
-                            }
-                            break;
-                        }
-                        case MASTER: {
-                            // exit if master changed to any other type
-                            String msg = "transfer FE type from MASTER to " + newType.name() + ". exit";
-                            LOG.error(msg);
-                            Util.stdoutWithTime(msg);
-                            System.exit(-1);
-                        }
-                        default:
-                            break;
-                    } // end switch formerFeType
-
-                    feType = newType;
-                    LOG.info("finished to transfer FE type to {}", feType);
+            private void setCanRead(boolean hasLog, boolean err) {
+                if (err) {
+                    canRead.set(false);
+                    isReady.set(false);
+                    return;
                 }
-            } // end runOneCycle
-        };
 
-        listener.setMetaContext(metaContext);
+                if (Config.ignore_meta_check) {
+                    // can still offer read, but is not ready
+                    canRead.set(true);
+                    isReady.set(false);
+                    return;
+                }
+
+                long currentTimeMs = System.currentTimeMillis();
+                if (currentTimeMs - synchronizedTimeMs > Config.meta_delay_toleration_second * 1000L) {
+                    if (currentTimeMs - lastMetaOutOfDateLogTime > 5 * 1000L) {
+                        // we still need this log to observe this situation
+                        // but service may be continued when there is no log being replayed.
+                        LOG.warn("meta out of date. current time: {}, synchronized time: {}, has log: {}, fe type: {}",
+                                currentTimeMs, synchronizedTimeMs, hasLog, feType);
+                        lastMetaOutOfDateLogTime = currentTimeMs;
+                    }
+                    if (hasLog || feType == FrontendNodeType.UNKNOWN) {
+                        // 1. if we read log from BDB, which means leader is still alive.
+                        // So we need to set meta out of date.
+                        // 2. if we didn't read any log from BDB and feType is UNKNOWN,
+                        // which means this non-leader node is disconnected with leader.
+                        // So we need to set meta out of date either.
+                        metaReplayState.setOutOfDate(currentTimeMs, synchronizedTimeMs);
+                        canRead.set(false);
+                        isReady.set(false);
+                    }
+                } else {
+                    canRead.set(true);
+                    isReady.set(true);
+                }
+            }
+
+            // close current db after replayer finished
+            @Override
+            public void run() {
+                super.run();
+                if (cursor != null) {
+                    cursor.close();
+                    LOG.info("quit replay at {}", replayedJournalId.get());
+                }
+            }
+        };
     }
 
-    public synchronized boolean replayJournal(long toJournalId) {
-        long newToJournalId = toJournalId;
-        if (newToJournalId == -1) {
-            newToJournalId = getMaxJournalId();
-        }
-        if (newToJournalId <= replayedJournalId.get()) {
-            return false;
+    /**
+     * Replay journal from replayedJournalId + 1 to toJournalId
+     * used by checkpointer/replay after state change
+     * toJournalId is a definite number and cannot set to -1/JournalCursor.CURSOR_END_KEY
+     */
+    public void replayJournal(long toJournalId) throws JournalException {
+        if (toJournalId <= replayedJournalId.get()) {
+            LOG.info("skip replay journal because {} <= {}", toJournalId, replayedJournalId.get());
+            return;
         }
 
-        LOG.info("replayed journal id is {}, replay to journal id is {}", replayedJournalId, newToJournalId);
+        long startJournalId = replayedJournalId.get() + 1;
+        long replayStartTime = System.currentTimeMillis();
+        LOG.info("start to replay journal from {} to {}", startJournalId, toJournalId);
+
         JournalCursor cursor = null;
         try {
-            cursor = editLog.read(replayedJournalId.get() + 1, newToJournalId);
-        } catch (JournalException e) {
-            LOG.warn("failed to get cursor from {} to {}", replayedJournalId.get() + 1, newToJournalId, e);
-            return false;
+            cursor = journal.read(startJournalId, toJournalId);
+            replayJournalInner(cursor, false);
+        } catch (InterruptedException | JournalInconsistentException e) {
+            LOG.warn("got interrupt exception or inconsistent exception when replay journal {}, will exit, ",
+                    replayedJournalId.get() + 1,
+                    e);
+            // TODO exit gracefully
+            Util.stdoutWithTime(e.getMessage());
+            System.exit(-1);
+
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
         }
 
+        // verify if all log is replayed
+        if (toJournalId != replayedJournalId.get()) {
+            throw new JournalException(String.format(
+                    "should replay to %d but actual replayed journal id is %d",
+                    toJournalId, replayedJournalId.get()));
+        }
+
+        streamLoadMgr.cancelUnDurableTaskAfterRestart();
+
+        long replayInterval = System.currentTimeMillis() - replayStartTime;
+        LOG.info("finish replay from {} to {} in {} msec", startJournalId, toJournalId, replayInterval);
+    }
+
+    /**
+     * replay journal until cursor returns null(suggest EOF)
+     * return true if any journal is replayed
+     */
+    protected boolean replayJournalInner(JournalCursor cursor, boolean flowControl)
+            throws JournalException, InterruptedException, JournalInconsistentException {
+        long startReplayId = replayedJournalId.get();
         long startTime = System.currentTimeMillis();
-        boolean hasLog = false;
+        long lineCnt = 0;
         while (true) {
             JournalEntity entity = null;
+            boolean readSucc = false;
             try {
                 entity = cursor.next();
-            } catch (InterruptedException | JournalException | JournalInconsistentException e) {
-                LOG.warn("got exception when get next, will exit, ", e);
-                // TODO exit gracefully
-                Util.stdoutWithTime(e.getMessage());
-                System.exit(-1);
+
+                // EOF or aggressive retry
+                if (entity == null) {
+                    break;
+                }
+
+                readSucc = true;
+
+                // apply
+                editLog.loadJournal(this, entity);
+            } catch (Throwable e) {
+                if (canSkipBadReplayedJournal(e)) {
+                    LOG.error("!!! DANGER: SKIP JOURNAL, id: {}, data: {} !!!",
+                            replayedJournalId.incrementAndGet(), journalEntityToReadableString(entity), e);
+                    if (!readSucc) {
+                        cursor.skipNext();
+                    }
+                    continue;
+                }
+                // handled in outer loop
+                LOG.warn("catch exception when replaying journal, id: {}, data: {},",
+                        replayedJournalId.get() + 1, journalEntityToReadableString(entity), e);
+                throw e;
             }
 
-            // EOF or aggressive retry
-            if (entity == null) {
-                break;
-            }
-
-            hasLog = true;
-            EditLog.loadJournal(this, entity);
             replayedJournalId.incrementAndGet();
             LOG.debug("journal {} replayed.", replayedJournalId);
-            if (feType != FrontendNodeType.MASTER) {
+
+            if (feType != FrontendNodeType.LEADER) {
                 journalObservable.notifyObservers(replayedJournalId.get());
             }
-            if (MetricRepo.isInit) {
+            if (MetricRepo.hasInit) {
                 // Metric repo may not init after this replay thread start
                 MetricRepo.COUNTER_EDIT_LOG_READ.increase(1L);
             }
+
+            if (flowControl) {
+                // cost too much time
+                long cost = System.currentTimeMillis() - startTime;
+                if (cost > REPLAYER_MAX_MS_PER_LOOP) {
+                    LOG.warn("replay journal cost too much time: {} replayedJournalId: {}", cost, replayedJournalId);
+                    break;
+                }
+                // consume too much lines
+                lineCnt += 1;
+                if (lineCnt > REPLAYER_MAX_LOGS_PER_LOOP) {
+                    LOG.warn("replay too many journals: lineCnt {}, replayedJournalId: {}", lineCnt, replayedJournalId);
+                    break;
+                }
+            }
+
         }
-        long cost = System.currentTimeMillis() - startTime;
-        if (cost >= 1000) {
-            LOG.warn("replay journal cost too much time: {} replayedJournalId: {}", cost, replayedJournalId);
+        if (replayedJournalId.get() - startReplayId > 0) {
+            LOG.debug("replayed journal from {} - {}", startReplayId, replayedJournalId);
+            return true;
+        }
+        return false;
+    }
+
+    private String journalEntityToReadableString(JournalEntity entity) {
+        if (entity == null) {
+            return "null";
+        }
+        Writable data = entity.data();
+        try {
+            return GsonUtils.GSON.toJson(data);
+        } catch (Exception e) {
+            // In older version, data may not be json, here we just return the class name.
+            return data.getClass().getName();
+        }
+    }
+
+    protected boolean canSkipBadReplayedJournal(Throwable t) {
+        // 1. metadata_enable_recovery_mode = true will skip all kind of failure
+        if (Config.metadata_enable_recovery_mode) {
+            LOG.warn("skip journal load failure because cluster is in recovery mode");
+            return true;
         }
 
-        return hasLog;
+        // 2. metadata_journal_skip_bad_journal_ids will skip the failure of specified journal ids
+        try {
+            for (String idStr : Config.metadata_journal_skip_bad_journal_ids.split(",")) {
+                if (!StringUtils.isEmpty(idStr) && Long.parseLong(idStr) == replayedJournalId.get() + 1) {
+                    LOG.warn("skip bad replayed journal id {} because configured {}",
+                            idStr, Config.metadata_journal_skip_bad_journal_ids);
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            LOG.warn("failed to parse metadata_journal_skip_bad_journal_ids: {}",
+                    Config.metadata_journal_skip_bad_journal_ids, e);
+        }
+
+        // 3. ignore_unknown_subtype = true will skip the subtype not found failure which happens on downgrading
+        if (t.getCause() != null && t.getCause() instanceof SubtypeNotFoundException) {
+            LOG.warn("ignore unknown subtype: {}", (((SubtypeNotFoundException) t.getCause()).getSubtype()));
+            return true;
+        }
+
+        // 4. metadata_journal_ignore_replay_failure = true will skip the failure of ignorable operations.
+        short opCode = OperationType.OP_INVALID;
+        if (t instanceof JournalException) {
+            opCode = ((JournalException) t).getOpCode();
+        }
+        if (t instanceof JournalInconsistentException) {
+            opCode = ((JournalInconsistentException) t).getOpCode();
+        }
+
+        if (opCode != OperationType.OP_INVALID
+                && OperationType.IGNORABLE_OPERATIONS.contains(opCode)) {
+            if (Config.metadata_journal_ignore_replay_failure) {
+                LOG.warn("skip ignorable journal load failure, opCode: {}", opCode);
+                return true;
+            } else {
+                LOG.warn("the failure of opCode: {} is ignorable, " +
+                        "you can set metadata_journal_ignore_replay_failure to true to ignore this failure", opCode);
+                return false;
+            }
+        }
+        return false;
     }
 
     public void createTimePrinter() {
         // time printer will write timestamp edit log every 10 seconds
-        timePrinter = new MasterDaemon("timePrinter", 10 * 1000L) {
+        timePrinter = new FrontendDaemon("timePrinter", 10 * 1000L) {
             @Override
             protected void runAfterCatalogReady() {
                 Timestamp stamp = new Timestamp();
@@ -1732,670 +2150,69 @@ public class GlobalStateMgr {
         };
     }
 
-    public void addFrontend(FrontendNodeType role, String host, int editLogPort) throws DdlException {
-        nodeMgr.addFrontend(role, host, editLogPort);
-    }
-
-    public void modifyFrontendHost(ModifyFrontendAddressClause modifyFrontendAddressClause) throws DdlException {
-        nodeMgr.modifyFrontendHost(modifyFrontendAddressClause);
-    }
-
-    public void dropFrontend(FrontendNodeType role, String host, int port) throws DdlException {
-        nodeMgr.dropFrontend(role, host, port);
-    }
-
-    public Frontend checkFeExist(String host, int port) {
-        return nodeMgr.checkFeExist(host, port);
-    }
-
-    public Frontend getFeByHost(String host) {
-        return nodeMgr.getFeByHost(host);
-    }
-
-    public Frontend getFeByName(String name) {
-        return nodeMgr.getFeByName(name);
-    }
-
-    public int getFollowerCnt() {
-        return nodeMgr.getFollowerCnt();
-    }
-
-    // The interface which DdlExecutor needs.
-    public void createDb(CreateDbStmt stmt) throws DdlException {
-        localMetastore.createDb(stmt);
-    }
-
-    // For replay edit log, needn't lock metadata
-    public void unprotectCreateDb(Database db) {
-        localMetastore.unprotectCreateDb(db);
-    }
-
-    public void replayCreateDb(Database db) {
-        localMetastore.replayCreateDb(db);
-    }
-
-    public void dropDb(DropDbStmt stmt) throws DdlException {
-        localMetastore.dropDb(stmt);
-    }
-
-    public void replayDropDb(String dbName, boolean isForceDrop) throws DdlException {
-        localMetastore.replayDropDb(dbName, isForceDrop);
-    }
-
-    public void recoverDatabase(RecoverDbStmt recoverStmt) throws DdlException {
-        localMetastore.recoverDatabase(recoverStmt);
-    }
-
-    public void recoverTable(RecoverTableStmt recoverStmt) throws DdlException {
-        localMetastore.recoverTable(recoverStmt);
-    }
-
-    public void recoverPartition(RecoverPartitionStmt recoverStmt) throws DdlException {
-        localMetastore.recoverPartition(recoverStmt);
-    }
-
-    public void replayEraseDatabase(long dbId) {
-        localMetastore.replayEraseDatabase(dbId);
-    }
-
-    public void replayRecoverDatabase(RecoverInfo info) {
-        localMetastore.replayRecoverDatabase(info);
-    }
-
-    public void alterDatabaseQuota(AlterDatabaseQuotaStmt stmt) throws DdlException {
-        localMetastore.alterDatabaseQuota(stmt);
-    }
-
-    public void replayAlterDatabaseQuota(String dbName, long quota, QuotaType quotaType) {
-        localMetastore.replayAlterDatabaseQuota(dbName, quota, quotaType);
-    }
-
-    public void renameDatabase(AlterDatabaseRename stmt) throws DdlException {
-        localMetastore.renameDatabase(stmt);
-    }
-
-    public void replayRenameDatabase(String dbName, String newDbName) {
-        localMetastore.replayRenameDatabase(dbName, newDbName);
-    }
-
-    public void createTable(CreateTableStmt stmt) throws DdlException {
-        localMetastore.createTable(stmt);
-    }
-
-    public void createTableLike(CreateTableLikeStmt stmt) throws DdlException {
-        localMetastore.createTableLike(stmt);
-    }
-
-    public void addPartitions(Database db, String tableName, AddPartitionClause addPartitionClause)
-            throws DdlException, AnalysisException {
-        localMetastore.addPartitions(db, tableName, addPartitionClause);
-    }
-
-    public void replayAddPartition(PartitionPersistInfo info) throws DdlException {
-        localMetastore.replayAddPartition(info);
-    }
-
-    public void dropPartition(Database db, OlapTable olapTable, DropPartitionClause clause) throws DdlException {
-        localMetastore.dropPartition(db, olapTable, clause);
-    }
-
-    public void replayDropPartition(DropPartitionInfo info) {
-        localMetastore.replayDropPartition(info);
-    }
-
-    public void replayErasePartition(long partitionId) throws DdlException {
-        localMetastore.replayErasePartition(partitionId);
-    }
-
-    public void replayRecoverPartition(RecoverInfo info) {
-        localMetastore.replayRecoverPartition(info);
-    }
-
-    public static void getDdlStmt(Table table, List<String> createTableStmt, List<String> addPartitionStmt,
-                                  List<String> createRollupStmt, boolean separatePartition,
-                                  boolean hidePassword) {
-        getDdlStmt(null, table, createTableStmt, addPartitionStmt, createRollupStmt, separatePartition, hidePassword);
-    }
-
-    public static void getDdlStmt(String dbName, Table table, List<String> createTableStmt,
-                                  List<String> addPartitionStmt,
-                                  List<String> createRollupStmt, boolean separatePartition, boolean hidePassword) {
-        StringBuilder sb = new StringBuilder();
-
-        // 1. create table
-        // 1.1 materialized view
-        if (table.getType() == TableType.MATERIALIZED_VIEW) {
-            MaterializedView mv = (MaterializedView) table;
-            sb.append(mv.getViewDefineSql());
-            createTableStmt.add(sb.toString());
-            return;
-        }
-        // 1.2 view
-        if (table.getType() == TableType.VIEW) {
-            View view = (View) table;
-            sb.append("CREATE VIEW `").append(table.getName()).append("` (");
-            List<String> colDef = Lists.newArrayList();
-            for (Column column : table.getBaseSchema()) {
-                StringBuilder colSb = new StringBuilder();
-                colSb.append(column.getName());
-                if (!Strings.isNullOrEmpty(column.getComment())) {
-                    colSb.append(" COMMENT ").append("\"").append(column.getComment()).append("\"");
-                }
-                colDef.add(colSb.toString());
-            }
-            sb.append(Joiner.on(", ").join(colDef));
-            sb.append(")");
-            if (!Strings.isNullOrEmpty(view.getComment())) {
-                sb.append(" COMMENT \"").append(view.getComment()).append("\"");
-            }
-            sb.append(" AS ").append(view.getInlineViewDef()).append(";");
-            createTableStmt.add(sb.toString());
-            return;
-        }
-
-        // 1.3 other table type
-        sb.append("CREATE ");
-        if (table.getType() == TableType.MYSQL || table.getType() == TableType.ELASTICSEARCH
-                || table.getType() == TableType.BROKER || table.getType() == TableType.HIVE
-                || table.getType() == TableType.HUDI || table.getType() == TableType.ICEBERG
-                || table.getType() == TableType.OLAP_EXTERNAL || table.getType() == TableType.JDBC) {
-            sb.append("EXTERNAL ");
-        }
-        sb.append("TABLE ");
-        if (!Strings.isNullOrEmpty(dbName)) {
-            sb.append("`").append(dbName).append("`.");
-        }
-        sb.append("`").append(table.getName()).append("` (\n");
-        int idx = 0;
-        for (Column column : table.getBaseSchema()) {
-            if (idx++ != 0) {
-                sb.append(",\n");
-            }
-            // There MUST BE 2 space in front of each column description line
-            // sqlalchemy requires this to parse SHOW CREATE TAEBL stmt.
-            if (table.getType() == TableType.OLAP || table.getType() == TableType.OLAP_EXTERNAL) {
-                OlapTable olapTable = (OlapTable) table;
-                if (olapTable.getKeysType() == KeysType.PRIMARY_KEYS) {
-                    sb.append("  ").append(column.toSqlWithoutAggregateTypeName());
-                } else {
-                    sb.append("  ").append(column.toSql());
-                }
-            } else {
-                sb.append("  ").append(column.toSql());
-            }
-        }
-        if (table.getType() == TableType.OLAP || table.getType() == TableType.OLAP_EXTERNAL) {
-            OlapTable olapTable = (OlapTable) table;
-            if (CollectionUtils.isNotEmpty(olapTable.getIndexes())) {
-                for (Index index : olapTable.getIndexes()) {
-                    sb.append(",\n");
-                    sb.append("  ").append(index.toSql());
-                }
-            }
-        }
-        sb.append("\n) ENGINE=");
-        sb.append(table.getType().name()).append(" ");
-
-        if (table.getType() == TableType.OLAP || table.getType() == TableType.OLAP_EXTERNAL) {
-            OlapTable olapTable = (OlapTable) table;
-
-            // keys
-            sb.append("\n").append(olapTable.getKeysType().toSql()).append("(");
-            List<String> keysColumnNames = Lists.newArrayList();
-            for (Column column : olapTable.getBaseSchema()) {
-                if (column.isKey()) {
-                    keysColumnNames.add("`" + column.getName() + "`");
-                }
-            }
-            sb.append(Joiner.on(", ").join(keysColumnNames)).append(")");
-
-            if (!Strings.isNullOrEmpty(table.getComment())) {
-                sb.append("\nCOMMENT \"").append(table.getComment()).append("\"");
-            }
-
-            // partition
-            PartitionInfo partitionInfo = olapTable.getPartitionInfo();
-            List<Long> partitionId = null;
-            if (separatePartition) {
-                partitionId = Lists.newArrayList();
-            }
-            if (partitionInfo.getType() == PartitionType.RANGE
-                    || partitionInfo.getType() == PartitionType.LIST) {
-                sb.append("\n").append(partitionInfo.toSql(olapTable, partitionId));
-            }
-
-            // distribution
-            DistributionInfo distributionInfo = olapTable.getDefaultDistributionInfo();
-            sb.append("\n").append(distributionInfo.toSql());
-
-            // properties
-            sb.append("\nPROPERTIES (\n");
-
-            // replicationNum
-            Short replicationNum = olapTable.getDefaultReplicationNum();
-            sb.append("\"").append(PropertyAnalyzer.PROPERTIES_REPLICATION_NUM).append("\" = \"");
-            sb.append(replicationNum).append("\"");
-
-            // bloom filter
-            Set<String> bfColumnNames = olapTable.getCopiedBfColumns();
-            if (bfColumnNames != null) {
-                sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_BF_COLUMNS).append("\" = \"");
-                sb.append(Joiner.on(", ").join(olapTable.getCopiedBfColumns())).append("\"");
-            }
-
-            if (separatePartition) {
-                // version info
-                sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_VERSION_INFO).append("\" = \"");
-                Partition partition = null;
-                if (olapTable.getPartitionInfo().getType() == PartitionType.UNPARTITIONED) {
-                    partition = olapTable.getPartition(olapTable.getName());
-                } else {
-                    Preconditions.checkState(partitionId.size() == 1);
-                    partition = olapTable.getPartition(partitionId.get(0));
-                }
-                sb.append(partition.getVisibleVersion()).append("\"");
-            }
-
-            // colocateTable
-            String colocateTable = olapTable.getColocateGroup();
-            if (colocateTable != null) {
-                sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_COLOCATE_WITH).append("\" = \"");
-                sb.append(colocateTable).append("\"");
-            }
-
-            // dynamic partition
-            if (olapTable.dynamicPartitionExists()) {
-                sb.append(olapTable.getTableProperty().getDynamicPartitionProperty().toString());
-            }
-
-            // in memory
-            sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_INMEMORY).append("\" = \"");
-            sb.append(olapTable.isInMemory()).append("\"");
-
-            // storage type
-            sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_STORAGE_FORMAT).append("\" = \"");
-            sb.append(olapTable.getStorageFormat()).append("\"");
-
-            // enable_persistent_index
-            sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_ENABLE_PERSISTENT_INDEX).append("\" = \"");
-            sb.append(olapTable.enablePersistentIndex()).append("\"");
-
-            // storage media
-            Map<String, String> properties = olapTable.getTableProperty().getProperties();
-            if (!properties.containsKey(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM)) {
-                sb.append("\n");
-            } else {
-                sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM).append("\" = \"");
-                sb.append(properties.get(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM)).append("\"");
-                sb.append("\n");
-            }
-
-            if (table.getType() == TableType.OLAP_EXTERNAL) {
-                ExternalOlapTable externalOlapTable = (ExternalOlapTable) table;
-                // properties
-                sb.append("\"host\" = \"").append(externalOlapTable.getSourceTableHost()).append("\",\n");
-                sb.append("\"port\" = \"").append(externalOlapTable.getSourceTablePort()).append("\",\n");
-                sb.append("\"user\" = \"").append(externalOlapTable.getSourceTableUser()).append("\",\n");
-                sb.append("\"password\" = \"").append(hidePassword ? "" : externalOlapTable.getSourceTablePassword())
-                        .append("\",\n");
-                sb.append("\"database\" = \"").append(externalOlapTable.getSourceTableDbName()).append("\",\n");
-                sb.append("\"table\" = \"").append(externalOlapTable.getSourceTableName()).append("\"\n");
-            }
-            sb.append(")");
-        } else if (table.getType() == TableType.MYSQL) {
-            MysqlTable mysqlTable = (MysqlTable) table;
-            if (!Strings.isNullOrEmpty(table.getComment())) {
-                sb.append("\nCOMMENT \"").append(table.getComment()).append("\"");
-            }
-            // properties
-            sb.append("\nPROPERTIES (\n");
-            sb.append("\"host\" = \"").append(mysqlTable.getHost()).append("\",\n");
-            sb.append("\"port\" = \"").append(mysqlTable.getPort()).append("\",\n");
-            sb.append("\"user\" = \"").append(mysqlTable.getUserName()).append("\",\n");
-            sb.append("\"password\" = \"").append(hidePassword ? "" : mysqlTable.getPasswd()).append("\",\n");
-            sb.append("\"database\" = \"").append(mysqlTable.getMysqlDatabaseName()).append("\",\n");
-            sb.append("\"table\" = \"").append(mysqlTable.getMysqlTableName()).append("\"\n");
-            sb.append(")");
-        } else if (table.getType() == TableType.BROKER) {
-            BrokerTable brokerTable = (BrokerTable) table;
-            if (!Strings.isNullOrEmpty(table.getComment())) {
-                sb.append("\nCOMMENT \"").append(table.getComment()).append("\"");
-            }
-            // properties
-            sb.append("\nPROPERTIES (\n");
-            sb.append("\"broker_name\" = \"").append(brokerTable.getBrokerName()).append("\",\n");
-            sb.append("\"path\" = \"").append(Joiner.on(",").join(brokerTable.getEncodedPaths())).append("\",\n");
-            sb.append("\"column_separator\" = \"").append(brokerTable.getReadableColumnSeparator()).append("\",\n");
-            sb.append("\"line_delimiter\" = \"").append(brokerTable.getReadableRowDelimiter()).append("\"\n");
-            sb.append(")");
-            if (!brokerTable.getBrokerProperties().isEmpty()) {
-                sb.append("\nBROKER PROPERTIES (\n");
-                sb.append(new PrintableMap<>(brokerTable.getBrokerProperties(), " = ", true, true,
-                        hidePassword).toString());
-                sb.append("\n)");
-            }
-        } else if (table.getType() == TableType.ELASTICSEARCH) {
-            EsTable esTable = (EsTable) table;
-            if (!Strings.isNullOrEmpty(table.getComment())) {
-                sb.append("\nCOMMENT \"").append(table.getComment()).append("\"");
-            }
-
-            // partition
-            PartitionInfo partitionInfo = esTable.getPartitionInfo();
-            if (partitionInfo.getType() == PartitionType.RANGE) {
-                sb.append("\n");
-                sb.append("PARTITION BY RANGE(");
-                idx = 0;
-                RangePartitionInfo rangePartitionInfo = (RangePartitionInfo) partitionInfo;
-                for (Column column : rangePartitionInfo.getPartitionColumns()) {
-                    if (idx != 0) {
-                        sb.append(", ");
-                    }
-                    sb.append("`").append(column.getName()).append("`");
-                }
-                sb.append(")\n()");
-            }
-
-            // properties
-            sb.append("\nPROPERTIES (\n");
-            sb.append("\"hosts\" = \"").append(esTable.getHosts()).append("\",\n");
-            sb.append("\"user\" = \"").append(esTable.getUserName()).append("\",\n");
-            sb.append("\"password\" = \"").append(hidePassword ? "" : esTable.getPasswd()).append("\",\n");
-            sb.append("\"index\" = \"").append(esTable.getIndexName()).append("\",\n");
-            sb.append("\"type\" = \"").append(esTable.getMappingType()).append("\",\n");
-            sb.append("\"transport\" = \"").append(esTable.getTransport()).append("\",\n");
-            sb.append("\"enable_docvalue_scan\" = \"").append(esTable.isDocValueScanEnable()).append("\",\n");
-            sb.append("\"max_docvalue_fields\" = \"").append(esTable.maxDocValueFields()).append("\",\n");
-            sb.append("\"enable_keyword_sniff\" = \"").append(esTable.isKeywordSniffEnable()).append("\",\n");
-            sb.append("\"es.nodes.wan.only\" = \"").append(esTable.wanOnly()).append("\"\n");
-            sb.append(")");
-        } else if (table.getType() == TableType.HIVE) {
-            HiveTable hiveTable = (HiveTable) table;
-            if (!Strings.isNullOrEmpty(table.getComment())) {
-                sb.append("\nCOMMENT \"").append(table.getComment()).append("\"");
-            }
-
-            // properties
-            sb.append("\nPROPERTIES (\n");
-            sb.append("\"database\" = \"").append(hiveTable.getHiveDb()).append("\",\n");
-            sb.append("\"table\" = \"").append(hiveTable.getTableName()).append("\",\n");
-            sb.append("\"resource\" = \"").append(hiveTable.getResourceName()).append("\",\n");
-            sb.append(new PrintableMap<>(hiveTable.getHiveProperties(), " = ", true, true, false).toString());
-            sb.append("\n)");
-        } else if (table.getType() == TableType.HUDI) {
-            HudiTable hudiTable = (HudiTable) table;
-            if (!Strings.isNullOrEmpty(table.getComment())) {
-                sb.append("\nCOMMENT \"").append(table.getComment()).append("\"");
-            }
-
-            // properties
-            sb.append("\nPROPERTIES (\n");
-            sb.append("\"database\" = \"").append(hudiTable.getDb()).append("\",\n");
-            sb.append("\"table\" = \"").append(hudiTable.getTable()).append("\",\n");
-            sb.append("\"resource\" = \"").append(hudiTable.getResourceName()).append("\"");
-            sb.append("\n)");
-        } else if (table.getType() == TableType.ICEBERG) {
-            IcebergTable icebergTable = (IcebergTable) table;
-            if (!Strings.isNullOrEmpty(table.getComment())) {
-                sb.append("\nCOMMENT \"").append(table.getComment()).append("\"");
-            }
-
-            // properties
-            sb.append("\nPROPERTIES (\n");
-            sb.append("\"database\" = \"").append(icebergTable.getDb()).append("\",\n");
-            sb.append("\"table\" = \"").append(icebergTable.getTable()).append("\",\n");
-            String maxTotalBytes = icebergTable.getFileIOMaxTotalBytes();
-            if (!Strings.isNullOrEmpty(maxTotalBytes)) {
-                sb.append("\"fileIO.cache.max-total-bytes\" = \"").append(maxTotalBytes).append("\",\n");
-            }
-            sb.append("\"resource\" = \"").append(icebergTable.getResourceName()).append("\"");
-            sb.append("\n)");
-        } else if (table.getType() == TableType.JDBC) {
-            JDBCTable jdbcTable = (JDBCTable) table;
-            if (!Strings.isNullOrEmpty(table.getComment())) {
-                sb.append("\nCOMMENT \"").append(table.getComment()).append("\"");
-            }
-
-            // properties
-            sb.append("\nPROPERTIES (\n");
-            sb.append("\"resource\" = \"").append(jdbcTable.getResourceName()).append("\",\n");
-            sb.append("\"table\" = \"").append(jdbcTable.getJdbcTable()).append("\"");
-            sb.append("\n)");
-        }
-        sb.append(";");
-
-        createTableStmt.add(sb.toString());
-
-        // 2. add partition
-        if (separatePartition && (table instanceof OlapTable)
-                && ((OlapTable) table).getPartitionInfo().getType() == PartitionType.RANGE
-                && ((OlapTable) table).getPartitions().size() > 1) {
-            OlapTable olapTable = (OlapTable) table;
-            RangePartitionInfo partitionInfo = (RangePartitionInfo) olapTable.getPartitionInfo();
-            boolean first = true;
-            for (Map.Entry<Long, Range<PartitionKey>> entry : partitionInfo.getSortedRangeMap(false)) {
-                if (first) {
-                    first = false;
-                    continue;
-                }
-                sb = new StringBuilder();
-                Partition partition = olapTable.getPartition(entry.getKey());
-                sb.append("ALTER TABLE ").append(table.getName());
-                sb.append(" ADD PARTITION ").append(partition.getName()).append(" VALUES [");
-                sb.append(entry.getValue().lowerEndpoint().toSql());
-                sb.append(", ").append(entry.getValue().upperEndpoint().toSql()).append(")");
-                sb.append("(\"version_info\" = \"");
-                sb.append(partition.getVisibleVersion()).append("\"");
-                sb.append(");");
-                addPartitionStmt.add(sb.toString());
-            }
-        }
-
-        // 3. rollup
-        if (createRollupStmt != null && (table instanceof OlapTable)) {
-            OlapTable olapTable = (OlapTable) table;
-            for (Map.Entry<Long, MaterializedIndexMeta> entry : olapTable.getIndexIdToMeta().entrySet()) {
-                if (entry.getKey() == olapTable.getBaseIndexId()) {
-                    continue;
-                }
-                MaterializedIndexMeta materializedIndexMeta = entry.getValue();
-                sb = new StringBuilder();
-                String indexName = olapTable.getIndexNameById(entry.getKey());
-                sb.append("ALTER TABLE ").append(table.getName()).append(" ADD ROLLUP ").append(indexName);
-                sb.append("(");
-
-                List<Column> indexSchema = materializedIndexMeta.getSchema();
-                for (int i = 0; i < indexSchema.size(); i++) {
-                    Column column = indexSchema.get(i);
-                    sb.append(column.getName());
-                    if (i != indexSchema.size() - 1) {
-                        sb.append(", ");
-                    }
-                }
-                sb.append(");");
-                createRollupStmt.add(sb.toString());
-            }
-        }
-    }
-
-    public void replayCreateTable(String dbName, Table table) {
-        localMetastore.replayCreateTable(dbName, table);
-    }
-
-    public void replayCreateMaterializedView(String dbName, MaterializedView materializedView) {
-        localMetastore.replayCreateMaterializedView(dbName, materializedView);
-    }
-
-    // Drop table
-    public void dropTable(DropTableStmt stmt) throws DdlException {
-        localMetastore.dropTable(stmt);
-    }
-
-    public void sendDropTabletTasks(HashMap<Long, AgentBatchTask> batchTaskMap) {
-        localMetastore.sendDropTabletTasks(batchTaskMap);
-    }
-
-    public void replayDropTable(Database db, long tableId, boolean isForceDrop) {
-        localMetastore.replayDropTable(db, tableId, isForceDrop);
-    }
-
-    public void replayEraseTable(long tableId) throws DdlException {
-        localMetastore.replayEraseTable(tableId);
-    }
-
-    public void replayEraseMultiTables(MultiEraseTableInfo multiEraseTableInfo) throws DdlException {
-        localMetastore.replayEraseMultiTables(multiEraseTableInfo);
-    }
-
-    public void replayRecoverTable(RecoverInfo info) {
-        localMetastore.replayRecoverTable(info);
-    }
-
-    public void replayAddReplica(ReplicaPersistInfo info) {
-        localMetastore.replayAddReplica(info);
-    }
-
-    public void replayUpdateReplica(ReplicaPersistInfo info) {
-        localMetastore.replayUpdateReplica(info);
-    }
-
-    public void replayDeleteReplica(ReplicaPersistInfo info) {
-        localMetastore.replayDeleteReplica(info);
-    }
-
-    public void replayAddFrontend(Frontend fe) {
-        nodeMgr.replayAddFrontend(fe);
-    }
-
-    public void replayUpdateFrontend(Frontend frontend) {
-        nodeMgr.replayUpdateFrontend(frontend);
-    }
-
-    public void replayDropFrontend(Frontend frontend) {
-        nodeMgr.replayDropFrontend(frontend);
-    }
-
-    public int getClusterId() {
-        return nodeMgr.getClusterId();
-    }
-
-    public String getToken() {
-        return nodeMgr.getToken();
-    }
-
-    public Database getDb(String name) {
-        return localMetastore.getDb(name);
-    }
-
-    public Database getDb(long dbId) {
-        return localMetastore.getDb(dbId);
-    }
-
-    public Database getDbIncludeRecycleBin(long dbId) {
-        return localMetastore.getDbIncludeRecycleBin(dbId);
-    }
-
-    public Table getTableIncludeRecycleBin(Database db, long tableId) {
-        return localMetastore.getTableIncludeRecycleBin(db, tableId);
-    }
-
-    public List<Table> getTablesIncludeRecycleBin(Database db) {
-        return localMetastore.getTablesIncludeRecycleBin(db);
-    }
-
-    public Partition getPartitionIncludeRecycleBin(OlapTable table, long partitionId) {
-        return localMetastore.getPartitionIncludeRecycleBin(table, partitionId);
-    }
-
-    public Collection<Partition> getPartitionsIncludeRecycleBin(OlapTable table) {
-        return localMetastore.getPartitionsIncludeRecycleBin(table);
-    }
-
-    public Collection<Partition> getAllPartitionsIncludeRecycleBin(OlapTable table) {
-        return localMetastore.getAllPartitionsIncludeRecycleBin(table);
-    }
-
-    // NOTE: result can be null, cause partition erase is not in db lock
-    public DataProperty getDataPropertyIncludeRecycleBin(PartitionInfo info, long partitionId) {
-        return localMetastore.getDataPropertyIncludeRecycleBin(info, partitionId);
-    }
-
-    // NOTE: result can be -1, cause partition erase is not in db lock
-    public short getReplicationNumIncludeRecycleBin(PartitionInfo info, long partitionId) {
-        return localMetastore.getReplicationNumIncludeRecycleBin(info, partitionId);
-    }
-
     public EditLog getEditLog() {
         return editLog;
     }
 
-    // Get the next available, need't lock because of nextId is atomic.
+    public Journal getJournal() {
+        return journal;
+    }
+
+    // Get the next available, lock-free because nextId is atomic.
     public long getNextId() {
         return idGenerator.getNextId();
     }
 
-    public List<String> getDbNames() {
-        return localMetastore.listDbNames();
-    }
-
-    public List<Long> getDbIds() {
-        return localMetastore.getDbIds();
-    }
-
-    public List<Long> getDbIdsIncludeRecycleBin() {
-        return localMetastore.getDbIdsIncludeRecycleBin();
-    }
-
-    public HashMap<Long, TStorageMedium> getPartitionIdToStorageMediumMap() {
-        return localMetastore.getPartitionIdToStorageMediumMap();
-    }
-
     public ConsistencyChecker getConsistencyChecker() {
-        return this.consistencyChecker;
+        return consistencyChecker;
     }
 
-    public Alter getAlterInstance() {
-        return this.alter;
+    public AlterJobMgr getAlterJobMgr() {
+        return alterJobMgr;
     }
 
     public SchemaChangeHandler getSchemaChangeHandler() {
-        return (SchemaChangeHandler) this.alter.getSchemaChangeHandler();
+        return this.alterJobMgr.getSchemaChangeHandler();
     }
 
     public MaterializedViewHandler getRollupHandler() {
-        return (MaterializedViewHandler) this.alter.getMaterializedViewHandler();
-    }
-
-    public SystemHandler getClusterHandler() {
-        return (SystemHandler) this.alter.getClusterHandler();
+        return this.alterJobMgr.getMaterializedViewHandler();
     }
 
     public BackupHandler getBackupHandler() {
         return this.backupHandler;
     }
 
-    public DeleteHandler getDeleteHandler() {
-        return this.deleteHandler;
+    public DeleteMgr getDeleteMgr() {
+        return deleteMgr;
     }
 
     public Load getLoadInstance() {
-        return this.load;
+        return load;
     }
 
-    public LoadManager getLoadManager() {
-        return loadManager;
+    public LoadMgr getLoadMgr() {
+        return loadMgr;
     }
 
-    public MasterTaskExecutor getPendingLoadTaskScheduler() {
+    public LeaderTaskExecutor getPendingLoadTaskScheduler() {
         return pendingLoadTaskScheduler;
     }
 
-    public MasterTaskExecutor getLoadingLoadTaskScheduler() {
+    public PriorityLeaderTaskExecutor getLoadingLoadTaskScheduler() {
         return loadingLoadTaskScheduler;
     }
 
-    public RoutineLoadManager getRoutineLoadManager() {
-        return routineLoadManager;
+    public RoutineLoadMgr getRoutineLoadMgr() {
+        return routineLoadMgr;
+    }
+
+    public StreamLoadMgr getStreamLoadMgr() {
+        return streamLoadMgr;
+    }
+
+    public BatchWriteMgr getBatchWriteMgr() {
+        return batchWriteMgr;
     }
 
     public RoutineLoadTaskScheduler getRoutineLoadTaskScheduler() {
@@ -2404,6 +2221,14 @@ public class GlobalStateMgr {
 
     public ExportMgr getExportMgr() {
         return this.exportMgr;
+    }
+
+    public SqlBlackList getSqlBlackList() {
+        return this.sqlBlackList;
+    }
+
+    public MaterializedViewMgr getMaterializedViewMgr() {
+        return this.materializedViewMgr;
     }
 
     public SmallFileMgr getSmallFileMgr() {
@@ -2419,71 +2244,35 @@ public class GlobalStateMgr {
     }
 
     public Long getMaxJournalId() {
-        return this.editLog.getMaxJournalId();
+        return this.journal.getMaxJournalId();
     }
 
     public long getEpoch() {
-        return this.epoch;
-    }
-
-    public void setEpoch(long epoch) {
-        this.epoch = epoch;
-    }
-
-    public FrontendNodeType getRole() {
-        return nodeMgr.getRole();
-    }
-
-    public Pair<String, Integer> getHelperNode() {
-        return nodeMgr.getHelperNode();
-    }
-
-    public List<Pair<String, Integer>> getHelperNodes() {
-        return nodeMgr.getHelperNodes();
-    }
-
-    public Pair<String, Integer> getSelfNode() {
-        return nodeMgr.getSelfNode();
-    }
-
-    public String getNodeName() {
-        return nodeMgr.getNodeName();
+        return haProtocol.getLatestEpoch();
     }
 
     public FrontendNodeType getFeType() {
-        return this.feType;
-    }
-
-    public int getMasterRpcPort() {
-        return nodeMgr.getMasterRpcPort();
-    }
-
-    public int getMasterHttpPort() {
-        return nodeMgr.getMasterHttpPort();
-    }
-
-    public String getMasterIp() {
-        return nodeMgr.getMasterIp();
+        return feType;
     }
 
     public EsRepository getEsRepository() {
-        return this.esRepository;
-    }
-
-    public StarRocksRepository getStarRocksRepository() {
-        return this.starRocksRepository;
-    }
-
-    public HiveRepository getHiveRepository() {
-        return this.hiveRepository;
+        return esRepository;
     }
 
     public MetastoreEventsProcessor getMetastoreEventsProcessor() {
         return this.metastoreEventsProcessor;
     }
 
-    public void setMaster(MasterInfo info) {
-        nodeMgr.setMaster(info);
+    public CheckpointWorker getCheckpointWorker() {
+        return checkpointWorker;
+    }
+
+    public CheckpointController getCheckpointController() {
+        return checkpointController;
+    }
+
+    public void setLeader(LeaderInfo info) {
+        nodeMgr.setLeader(info);
     }
 
     public boolean canRead() {
@@ -2494,8 +2283,8 @@ public class GlobalStateMgr {
         return nodeMgr.isElectable();
     }
 
-    public boolean isMaster() {
-        return feType == FrontendNodeType.MASTER;
+    public boolean isLeader() {
+        return feType == FrontendNodeType.LEADER;
     }
 
     public void setSynchronizedTime(long time) {
@@ -2504,7 +2293,10 @@ public class GlobalStateMgr {
 
     public void setEditLog(EditLog editLog) {
         this.editLog = editLog;
-        localMetastore.setEditLog(editLog);
+    }
+
+    public void setJournal(Journal journal) {
+        this.journal = journal;
     }
 
     public void setNextId(long id) {
@@ -2517,15 +2309,21 @@ public class GlobalStateMgr {
 
     public static short calcShortKeyColumnCount(List<Column> columns, Map<String, String> properties)
             throws DdlException {
-        List<Column> indexColumns = new ArrayList<Column>();
-        for (Column column : columns) {
+        List<Integer> sortKeyIdxes = new ArrayList<>();
+        for (int i = 0; i < columns.size(); ++i) {
+            Column column = columns.get(i);
             if (column.isKey()) {
-                indexColumns.add(column);
+                sortKeyIdxes.add(i);
             }
         }
-        LOG.debug("index column size: {}", indexColumns.size());
-        Preconditions.checkArgument(indexColumns.size() > 0);
+        return calcShortKeyColumnCount(columns, properties, sortKeyIdxes);
+    }
 
+    public static short calcShortKeyColumnCount(List<Column> indexColumns, Map<String, String> properties,
+                                                List<Integer> sortKeyIdxes)
+            throws DdlException {
+        LOG.debug("sort key size: {}", sortKeyIdxes.size());
+        Preconditions.checkArgument(sortKeyIdxes.size() > 0);
         // figure out shortKeyColumnCount
         short shortKeyColumnCount = (short) -1;
         try {
@@ -2538,13 +2336,11 @@ public class GlobalStateMgr {
             if (shortKeyColumnCount <= 0) {
                 throw new DdlException("Invalid short key: " + shortKeyColumnCount);
             }
-
-            if (shortKeyColumnCount > indexColumns.size()) {
-                throw new DdlException("Short key is too large. should less than: " + indexColumns.size());
+            if (shortKeyColumnCount > sortKeyIdxes.size()) {
+                throw new DdlException("Short key is too large. should less than: " + sortKeyIdxes.size());
             }
-
             for (int pos = 0; pos < shortKeyColumnCount; pos++) {
-                if (indexColumns.get(pos).getPrimitiveType() == PrimitiveType.VARCHAR &&
+                if (indexColumns.get(sortKeyIdxes.get(pos)).getPrimitiveType() == PrimitiveType.VARCHAR &&
                         pos != shortKeyColumnCount - 1) {
                     throw new DdlException("Varchar should not in the middle of short keys.");
                 }
@@ -2554,17 +2350,17 @@ public class GlobalStateMgr {
              * Calc short key column count. NOTE: short key column count is
              * calculated as follow: 1. All index column are taking into
              * account. 2. Max short key column count is Min(Num of
-             * indexColumns, META_MAX_SHORT_KEY_NUM). 3. Short key list can
+             * sortKeyIdxes, META_MAX_SHORT_KEY_NUM). 3. Short key list can
              * contains at most one VARCHAR column. And if contains, it should
              * be at the last position of the short key list.
              */
             shortKeyColumnCount = 0;
             int shortKeySizeByte = 0;
-            int maxShortKeyColumnCount = Math.min(indexColumns.size(), FeConstants.shortkey_max_column_count);
+            int maxShortKeyColumnCount = Math.min(sortKeyIdxes.size(), FeConstants.SHORTKEY_MAX_COLUMN_COUNT);
             for (int i = 0; i < maxShortKeyColumnCount; i++) {
-                Column column = indexColumns.get(i);
+                Column column = indexColumns.get(sortKeyIdxes.get(i));
                 shortKeySizeByte += column.getOlapColumnIndexSize();
-                if (shortKeySizeByte > FeConstants.shortkey_maxsize_bytes) {
+                if (shortKeySizeByte > FeConstants.SHORTKEY_MAXSIZE_BYTES) {
                     if (column.getPrimitiveType().isCharFamily()) {
                         ++shortKeyColumnCount;
                     }
@@ -2585,209 +2381,20 @@ public class GlobalStateMgr {
             if (shortKeyColumnCount == 0) {
                 throw new DdlException("Data type of first column cannot be " + indexColumns.get(0).getType());
             }
-
         } // end calc shortKeyColumnCount
 
         return shortKeyColumnCount;
-    }
-
-    /*
-     * used for handling AlterTableStmt (for client is the ALTER TABLE command).
-     * including SchemaChangeHandler and RollupHandler
-     */
-    public void alterTable(AlterTableStmt stmt) throws UserException {
-        localMetastore.alterTable(stmt);
-    }
-
-    /**
-     * used for handling AlterViewStmt (the ALTER VIEW command).
-     */
-    public void alterView(AlterViewStmt stmt) throws UserException {
-        localMetastore.alterView(stmt);
-    }
-
-    public void createMaterializedView(CreateMaterializedViewStmt stmt)
-            throws AnalysisException, DdlException {
-        localMetastore.createMaterializedView(stmt);
-    }
-
-    public void createMaterializedView(CreateMaterializedViewStatement statement)
-            throws DdlException {
-        localMetastore.createMaterializedView(statement);
-    }
-
-    public void dropMaterializedView(DropMaterializedViewStmt stmt) throws DdlException, MetaNotFoundException {
-        localMetastore.dropMaterializedView(stmt);
-    }
-
-    public void alterMaterializedView(AlterMaterializedViewStatement stmt) throws DdlException, MetaNotFoundException {
-        localMetastore.alterMaterializedView(stmt);
-    }
-
-    public void replayRenameMaterializedView(RenameMaterializedViewLog log) {
-        this.alter.replayRenameMaterializedView(log);
-    }
-
-    public void replayChangeMaterializedViewRefreshScheme(ChangeMaterializedViewRefreshSchemeLog log) {
-        this.alter.replayChangeMaterializedViewRefreshScheme(log);
-    }
-
-    /*
-     * used for handling CacnelAlterStmt (for client is the CANCEL ALTER
-     * command). including SchemaChangeHandler and RollupHandler
-     */
-    public void cancelAlter(CancelAlterTableStmt stmt) throws DdlException {
-        localMetastore.cancelAlter(stmt);
-    }
-
-    /*
-     * used for handling backup opt
-     */
-    public void backup(BackupStmt stmt) throws DdlException {
-        getBackupHandler().process(stmt);
-    }
-
-    public void restore(RestoreStmt stmt) throws DdlException {
-        getBackupHandler().process(stmt);
-    }
-
-    public void cancelBackup(CancelBackupStmt stmt) throws DdlException {
-        getBackupHandler().cancel(stmt);
-    }
-
-    // entry of rename table operation
-    public void renameTable(Database db, OlapTable table, TableRenameClause tableRenameClause) throws DdlException {
-        localMetastore.renameTable(db, table, tableRenameClause);
-    }
-
-    public void replayRenameTable(TableInfo tableInfo) {
-        localMetastore.replayRenameTable(tableInfo);
-    }
-
-    // the invoker should keep db write lock
-    public void modifyTableColocate(Database db, OlapTable table, String colocateGroup, boolean isReplay,
-                                    GroupId assignedGroupId)
-            throws DdlException {
-        colocateTableIndex.modifyTableColocate(db, table, colocateGroup, isReplay, assignedGroupId);
-    }
-
-    public void replayModifyTableColocate(TablePropertyInfo info) {
-        colocateTableIndex.replayModifyTableColocate(info);
-    }
-
-    public void renameRollup(Database db, OlapTable table, RollupRenameClause renameClause) throws DdlException {
-        localMetastore.renameRollup(db, table, renameClause);
-    }
-
-    public void replayRenameRollup(TableInfo tableInfo) {
-        localMetastore.replayRenameRollup(tableInfo);
-    }
-
-    public void renamePartition(Database db, OlapTable table, PartitionRenameClause renameClause) throws DdlException {
-        localMetastore.renamePartition(db, table, renameClause);
-    }
-
-    public void replayRenamePartition(TableInfo tableInfo) throws DdlException {
-        localMetastore.replayRenamePartition(tableInfo);
-    }
-
-    public void renameColumn(Database db, OlapTable table, ColumnRenameClause renameClause) throws DdlException {
-        throw new DdlException("not implmented");
-    }
-
-    public void modifyTableDynamicPartition(Database db, OlapTable table, Map<String, String> properties)
-            throws DdlException {
-        localMetastore.modifyTableDynamicPartition(db, table, properties);
-    }
-
-    public void modifyTableReplicationNum(Database db, OlapTable table, Map<String, String> properties)
-            throws DdlException {
-        localMetastore.modifyTableReplicationNum(db, table, properties);
-    }
-
-    // The caller need to hold the db write lock
-    public void modifyTableDefaultReplicationNum(Database db, OlapTable table, Map<String, String> properties)
-            throws DdlException {
-        localMetastore.modifyTableDefaultReplicationNum(db, table, properties);
-    }
-
-    public void modifyTableMeta(Database db, OlapTable table, Map<String, String> properties,
-                                TTabletMetaType metaType) {
-        localMetastore.modifyTableMeta(db, table, properties, metaType);
-    }
-
-    public void setHasForbitGlobalDict(String dbName, String tableName, boolean isForbit) throws DdlException {
-        localMetastore.setHasForbitGlobalDict(dbName, tableName, isForbit);
-    }
-
-    public void replayModifyHiveTableColumn(short opCode, ModifyTableColumnOperationLog info) {
-        localMetastore.replayModifyHiveTableColumn(opCode, info);
-    }
-
-    public void replayModifyTableProperty(short opCode, ModifyTablePropertyOperationLog info) {
-        localMetastore.replayModifyTableProperty(opCode, info);
-    }
-
-    /*
-     * used for handling AlterClusterStmt
-     * (for client is the ALTER CLUSTER command).
-     */
-    public ShowResultSet alterCluster(AlterSystemStmt stmt) throws UserException {
-        return this.alter.processAlterCluster(stmt);
-    }
-
-    public void cancelAlterCluster(CancelAlterSystemStmt stmt) throws DdlException {
-        this.alter.getClusterHandler().cancel(stmt);
-    }
-
-    // Change current catalog and database of this session.
-    // We can support 'USE CATALOG.DB'
-    public void changeCatalogDb(ConnectContext ctx, String identifier) throws DdlException {
-        String currentCatalogName = ctx.getCurrentCatalog();
-        String dbName = ctx.getDatabase();
-
-        String[] parts = identifier.split("\\.");
-        if (parts.length != 1 && parts.length != 2) {
-            ErrorReport.reportDdlException(ErrorCode.ERR_BAD_CATALOG_ERROR, identifier);
-        } else if (parts.length == 1) {
-            dbName = CatalogMgr.isInternalCatalog(currentCatalogName) ?
-                    ClusterNamespace.getFullName(ctx.getClusterName(), identifier) : identifier;
-        } else {
-            String newCatalogName = parts[0];
-            if (catalogMgr.catalogExists(newCatalogName)) {
-                dbName = CatalogMgr.isInternalCatalog(newCatalogName) ?
-                        ClusterNamespace.getFullName(ctx.getClusterName(), parts[1]) : parts[1];
-            } else {
-                ErrorReport.reportDdlException(ErrorCode.ERR_BAD_CATALOG_ERROR, identifier);
-            }
-            ctx.setCurrentCatalog(newCatalogName);
-        }
-
-        // Check auth for internal catalog.
-        // Here we check the request permission that sent by the mysql client or jdbc.
-        // So we didn't check UseStmt permission in PrivilegeChecker.
-        if (CatalogMgr.isInternalCatalog(ctx.getCurrentCatalog()) &&
-                !auth.checkDbPriv(ctx, dbName, PrivPredicate.SHOW)) {
-            ErrorReport.reportDdlException(ErrorCode.ERR_DB_ACCESS_DENIED,
-                    ctx.getQualifiedUser(), dbName);
-        }
-
-        if (metadataMgr.getDb(ctx.getCurrentCatalog(), dbName) == null) {
-            LOG.debug("Unknown catalog '%s' and db '%s'", ctx.getCurrentCatalog(), dbName);
-            ErrorReport.reportDdlException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
-        }
-
-        ctx.setDatabase(dbName);
     }
 
     // for test only
     @VisibleForTesting
     public void clear() {
         localMetastore.clear();
+        temporaryTableMgr.clear();
     }
 
-    public void createView(CreateViewStmt stmt) throws DdlException {
-        localMetastore.createView(stmt);
+    public void triggerNewImage() {
+        journalWriter.setForceRollJournal();
     }
 
     /**
@@ -2812,30 +2419,23 @@ public class GlobalStateMgr {
         return functionSet.isNotAlwaysNullResultWithNullParamFunctions(funcName);
     }
 
-    public void replayCreateCluster(Cluster cluster) {
-        localMetastore.replayCreateCluster(cluster);
-    }
-
-    public void setIsDefaultClusterCreated(boolean isDefaultClusterCreated) {
-        this.isDefaultClusterCreated = isDefaultClusterCreated;
-    }
-
-    public Cluster getCluster(String clusterName) {
-        return localMetastore.getCluster(clusterName);
-    }
-
     public void refreshExternalTable(RefreshTableStmt stmt) throws DdlException {
-        refreshExternalTable(stmt.getTableName(), stmt.getPartitions());
+        TableName tableName = stmt.getTableName();
+        List<String> partitionNames = stmt.getPartitions();
+        refreshExternalTable(tableName, partitionNames);
+        refreshOthersFeTable(tableName, partitionNames, true);
+    }
 
-        List<Frontend> allFrontends = GlobalStateMgr.getCurrentState().getFrontends(null);
+    public void refreshOthersFeTable(TableName tableName, List<String> partitions, boolean isSync) throws DdlException {
+        List<Frontend> allFrontends = GlobalStateMgr.getCurrentState().getNodeMgr().getFrontends(null);
         Map<String, Future<TStatus>> resultMap = Maps.newHashMapWithExpectedSize(allFrontends.size() - 1);
         for (Frontend fe : allFrontends) {
-            if (fe.getHost().equals(GlobalStateMgr.getCurrentState().getSelfNode().first)) {
+            if (fe.getHost().equals(GlobalStateMgr.getCurrentState().getNodeMgr().getSelfNode().first)) {
                 continue;
             }
 
-            resultMap.put(fe.getHost(), refreshOtherFesTable(new TNetworkAddress(fe.getHost(), fe.getRpcPort()),
-                    stmt.getTableName(), stmt.getPartitions()));
+            resultMap.put(fe.getHost(), refreshOtherFesTable(
+                    new TNetworkAddress(fe.getHost(), fe.getRpcPort()), tableName, partitions));
         }
 
         String errMsg = "";
@@ -2853,15 +2453,25 @@ public class GlobalStateMgr {
                 errMsg += "refresh fe " + entry.getKey() + " failed: " + e.getMessage();
             }
         }
+
         if (!errMsg.equals("")) {
-            ErrorReport.reportDdlException(ErrorCode.ERROR_REFRESH_EXTERNAL_TABLE_FAILED, errMsg);
+            if (isSync) {
+                ErrorReport.reportDdlException(ErrorCode.ERROR_REFRESH_EXTERNAL_TABLE_FAILED, errMsg);
+            } else {
+                LOG.error("Background refresh others fe failed, {}", errMsg);
+            }
         }
     }
 
     public Future<TStatus> refreshOtherFesTable(TNetworkAddress thriftAddress, TableName tableName,
                                                 List<String> partitions) {
-        int timeout = ConnectContext.get().getSessionVariable().getQueryTimeoutS() * 1000
-                + Config.thrift_rpc_timeout_ms;
+        int timeout;
+        if (ConnectContext.get() == null || ConnectContext.get().getSessionVariable() == null) {
+            timeout = Config.thrift_rpc_timeout_ms * 10;
+        } else {
+            timeout = ConnectContext.get().getExecTimeout() * 1000 + Config.thrift_rpc_timeout_ms;
+        }
+
         FutureTask<TStatus> task = new FutureTask<TStatus>(() -> {
             TRefreshTableRequest request = new TRefreshTableRequest();
             request.setCatalog_name(tableName.getCatalog());
@@ -2869,9 +2479,10 @@ public class GlobalStateMgr {
             request.setTable_name(tableName.getTbl());
             request.setPartitions(partitions);
             try {
-                TRefreshTableResponse response = FrontendServiceProxy.call(thriftAddress,
+                TRefreshTableResponse response = ThriftRPCRequestExecutor.call(
+                        ThriftConnectionPool.frontendPool,
+                        thriftAddress,
                         timeout,
-                        Config.thrift_rpc_retry_times,
                         client -> client.refreshTable(request));
                 return response.getStatus();
             } catch (Exception e) {
@@ -2887,35 +2498,43 @@ public class GlobalStateMgr {
         return task;
     }
 
-    public void refreshExternalTable(TableName tableName, List<String> partitions) throws DdlException {
+    private boolean supportRefreshTableType(Table table) {
+        return table.isHiveTable() || table.isHudiTable() || table.isHiveView() || table.isIcebergTable()
+                || table.isJDBCTable() || table.isDeltalakeTable();
+    }
+
+    public void refreshExternalTable(TableName tableName, List<String> partitions) {
         String catalogName = tableName.getCatalog();
         String dbName = tableName.getDb();
         String tblName = tableName.getTbl();
         Database db = metadataMgr.getDb(catalogName, tableName.getDb());
         if (db == null) {
-            throw new DdlException("db: " + tableName.getDb() + " not exists");
-        }
-        HiveMetaStoreTable table;
-        db.readLock();
-        try {
-            Table tbl = metadataMgr.getTable(catalogName, dbName, tblName);
-            if (tbl == null || !(tbl instanceof HiveMetaStoreTable)) {
-                throw new DdlException("table : " + tableName + " not exists, or is not hive/hudi external table");
-            }
-            table = (HiveMetaStoreTable) tbl;
-        } finally {
-            db.readUnlock();
+            throw new StarRocksConnectorException("db: " + tableName.getDb() + " not exists");
         }
 
-        if (partitions != null && partitions.size() > 0) {
-            table.refreshPartCache(partitions);
-        } else {
-            table.refreshTableCache(dbName, tblName);
+        Table table;
+        table = metadataMgr.getTable(catalogName, dbName, tblName);
+        if (table == null) {
+            throw new StarRocksConnectorException("table %s.%s.%s not exists", catalogName, dbName,
+                    tblName);
         }
+        if (!supportRefreshTableType(table)) {
+            throw new StarRocksConnectorException("can not refresh external table %s.%s.%s, " +
+                    "do not support refresh external table which type is %s", catalogName, dbName,
+                    tblName, table.getType());
+        }
+
+        if (CatalogMgr.isInternalCatalog(catalogName)) {
+            Preconditions.checkState(table.isHMSTable());
+            catalogName = (table).getCatalogName();
+        }
+
+        metadataMgr.refreshTable(catalogName, dbName, table, partitions, true);
     }
 
-    public void initDefaultCluster() {
-        localMetastore.initDefaultCluster();
+    public void initDefaultWarehouse() {
+        warehouseMgr.initDefaultWarehouse();
+        isDefaultWarehouseCreated = true;
     }
 
     public void replayUpdateClusterAndBackends(BackendIdsUpdateInfo info) {
@@ -2927,17 +2546,18 @@ public class GlobalStateMgr {
         String dumpFilePath;
         Map<Long, Database> lockedDbMap = Maps.newTreeMap();
         tryLock(true);
+        Locker locker = new Locker();
         try {
             // sort all dbs
-            for (long dbId : getDbIds()) {
-                Database db = getDb(dbId);
+            for (long dbId : localMetastore.getDbIds()) {
+                Database db = localMetastore.getDb(dbId);
                 Preconditions.checkNotNull(db);
                 lockedDbMap.put(dbId, db);
             }
 
             // lock all dbs
             for (Database db : lockedDbMap.values()) {
-                db.readLock();
+                locker.lockDatabase(db.getId(), LockType.READ);
             }
             LOG.info("acquired all the dbs' read lock.");
 
@@ -2946,152 +2566,20 @@ public class GlobalStateMgr {
             dumpFilePath = dumpFile.getAbsolutePath();
             try {
                 LOG.info("begin to dump {}", dumpFilePath);
-                saveImage(dumpFile, journalId);
+                saveImage(new ImageWriter(Config.meta_dir, ImageFormatVersion.v2, journalId), dumpFile);
             } catch (IOException e) {
                 LOG.error("failed to dump image to {}", dumpFilePath, e);
             }
         } finally {
             // unlock all
             for (Database db : lockedDbMap.values()) {
-                db.readUnlock();
+                locker.unLockDatabase(db.getId(), LockType.READ);
             }
             unlock();
         }
 
-        LOG.info("finished dumpping image to {}", dumpFilePath);
+        LOG.info("finished dumping image to {}", dumpFilePath);
         return dumpFilePath;
-    }
-
-    public List<Partition> createTempPartitionsFromPartitions(Database db, Table table,
-                                                              String namePostfix, List<Long> sourcePartitionIds,
-                                                              List<Long> tmpPartitionIds) {
-        return localMetastore.createTempPartitionsFromPartitions(db, table, namePostfix, sourcePartitionIds, tmpPartitionIds);
-    }
-
-    public void truncateTable(TruncateTableStmt truncateTableStmt) throws DdlException {
-        localMetastore.truncateTable(truncateTableStmt);
-    }
-
-    public void replayTruncateTable(TruncateTableInfo info) {
-        localMetastore.replayTruncateTable(info);
-    }
-
-    public void createFunction(CreateFunctionStmt stmt) throws UserException {
-        FunctionName name = stmt.getFunctionName();
-        Database db = getDb(name.getDb());
-        if (db == null) {
-            ErrorReport.reportDdlException(ErrorCode.ERR_BAD_DB_ERROR, name.getDb());
-        }
-        db.addFunction(stmt.getFunction());
-    }
-
-    public void replayCreateFunction(Function function) {
-        String dbName = function.getFunctionName().getDb();
-        Database db = getDb(dbName);
-        if (db == null) {
-            throw new Error("unknown database when replay log, db=" + dbName);
-        }
-        db.replayAddFunction(function);
-    }
-
-    public void dropFunction(DropFunctionStmt stmt) throws UserException {
-        FunctionName name = stmt.getFunctionName();
-        Database db = getDb(name.getDb());
-        if (db == null) {
-            ErrorReport.reportDdlException(ErrorCode.ERR_BAD_DB_ERROR, name.getDb());
-        }
-        db.dropFunction(stmt.getFunction());
-    }
-
-    public void replayDropFunction(FunctionSearchDesc functionSearchDesc) {
-        String dbName = functionSearchDesc.getName().getDb();
-        Database db = getDb(dbName);
-        if (db == null) {
-            throw new Error("unknown database when replay log, db=" + dbName);
-        }
-        db.replayDropFunction(functionSearchDesc);
-    }
-
-    public void setConfig(AdminSetConfigStmt stmt) throws DdlException {
-        nodeMgr.setConfig(stmt);
-    }
-
-    public void setFrontendConfig(Map<String, String> configs) throws DdlException {
-        nodeMgr.setFrontendConfig(configs);
-    }
-
-    public void replayBackendTabletsInfo(BackendTabletsInfo backendTabletsInfo) {
-        localMetastore.replayBackendTabletsInfo(backendTabletsInfo);
-    }
-
-    public void convertDistributionType(Database db, OlapTable tbl) throws DdlException {
-        localMetastore.convertDistributionType(db, tbl);
-    }
-
-    public void replayConvertDistributionType(TableInfo tableInfo) {
-        localMetastore.replayConvertDistributionType(tableInfo);
-    }
-
-    public void replaceTempPartition(Database db, String tableName, ReplacePartitionClause clause) throws DdlException {
-        localMetastore.replaceTempPartition(db, tableName, clause);
-    }
-
-    public void replayReplaceTempPartition(ReplacePartitionOperationLog replaceTempPartitionLog) {
-        localMetastore.replayReplaceTempPartition(replaceTempPartitionLog);
-    }
-
-    public void installPlugin(InstallPluginStmt stmt) throws UserException, IOException {
-        pluginMgr.installPlugin(stmt);
-    }
-
-    public void replayInstallPlugin(PluginInfo pluginInfo) {
-        try {
-            pluginMgr.replayLoadDynamicPlugin(pluginInfo);
-        } catch (Exception e) {
-            LOG.warn("replay install plugin failed.", e);
-        }
-    }
-
-    public void uninstallPlugin(UninstallPluginStmt stmt) throws IOException, UserException {
-        PluginInfo info = pluginMgr.uninstallPlugin(stmt.getPluginName());
-        if (null != info) {
-            editLog.logUninstallPlugin(info);
-        }
-        LOG.info("uninstall plugin = " + stmt.getPluginName());
-    }
-
-    public void replayUninstallPlugin(PluginInfo pluginInfo) {
-        try {
-            pluginMgr.uninstallPlugin(pluginInfo.getName());
-        } catch (Exception e) {
-            LOG.warn("replay uninstall plugin failed.", e);
-        }
-    }
-
-    // entry of checking tablets operation
-    public void checkTablets(AdminCheckTabletsStmt stmt) {
-        localMetastore.checkTablets(stmt);
-    }
-
-    // Set specified replica's status. If replica does not exist, just ignore it.
-    public void setReplicaStatus(AdminSetReplicaStatusStmt stmt) {
-        localMetastore.setReplicaStatus(stmt);
-    }
-
-    public void replaySetReplicaStatus(SetReplicaStatusOperationLog log) {
-        localMetastore.replaySetReplicaStatus(log);
-    }
-
-    public void onEraseDatabase(long dbId) {
-        localMetastore.onEraseDatabase(dbId);
-    }
-
-    public HashMap<Long, AgentBatchTask> onEraseOlapTable(OlapTable olapTable, boolean isReplay) {
-        return localMetastore.onEraseOlapTable(olapTable, isReplay);
-    }
-
-    public void onErasePartition(Partition partition) {
-        localMetastore.onErasePartition(partition);
     }
 
     public long getImageJournalId() {
@@ -3104,17 +2592,18 @@ public class GlobalStateMgr {
 
     public void clearExpiredJobs() {
         try {
-            loadManager.removeOldLoadJob();
+            loadMgr.removeOldLoadJob();
         } catch (Throwable t) {
             LOG.warn("load manager remove old load jobs failed", t);
         }
+
         try {
             exportMgr.removeOldExportJobs();
         } catch (Throwable t) {
             LOG.warn("export manager remove old export jobs failed", t);
         }
         try {
-            deleteHandler.removeOldDeleteInfo();
+            deleteMgr.removeOldDeleteInfo();
         } catch (Throwable t) {
             LOG.warn("delete handler remove old delete info failed", t);
         }
@@ -3124,9 +2613,29 @@ public class GlobalStateMgr {
             LOG.warn("transaction manager remove expired txns failed", t);
         }
         try {
-            routineLoadManager.cleanOldRoutineLoadJobs();
+            routineLoadMgr.cleanOldRoutineLoadJobs();
         } catch (Throwable t) {
             LOG.warn("routine load manager clean old routine load jobs failed", t);
+        }
+        try {
+            backupHandler.removeOldJobs();
+        } catch (Throwable t) {
+            LOG.warn("backup handler clean old jobs failed", t);
+        }
+        try {
+            streamLoadMgr.cleanOldStreamLoadTasks(false);
+        } catch (Throwable t) {
+            LOG.warn("delete handler remove old delete info failed", t);
+        }
+        try {
+            taskManager.removeExpiredTasks();
+        } catch (Throwable t) {
+            LOG.warn("task manager clean expire tasks failed", t);
+        }
+        try {
+            taskManager.removeExpiredTaskRuns();
+        } catch (Throwable t) {
+            LOG.warn("task manager clean expire task runs history failed", t);
         }
     }
 
@@ -3141,5 +2650,78 @@ public class GlobalStateMgr {
         } catch (Throwable t) {
             LOG.warn("task manager clean expire task runs history failed", t);
         }
+    }
+
+    public StateChangeExecution getStateChangeExecution() {
+        return execution;
+    }
+
+    public void createBuiltinStorageVolume() {
+        try {
+            String builtinStorageVolumeId = storageVolumeMgr.createBuiltinStorageVolume();
+            if (!builtinStorageVolumeId.isEmpty()) {
+                authorizationMgr.grantStorageVolumeUsageToPublicRole(builtinStorageVolumeId);
+            }
+        } catch (InvalidConfException e) {
+            LOG.fatal(e.getMessage());
+            System.exit(-1);
+        } catch (DdlException | AlreadyExistsException e) {
+            LOG.warn("Failed to create or update builtin storage volume", e);
+        } catch (PrivilegeException e) {
+            LOG.warn("Failed to grant builtin storage volume usage to public role", e);
+        }
+    }
+
+    public SlotManager getSlotManager() {
+        return slotManager;
+    }
+
+    public GlobalSlotProvider getGlobalSlotProvider() {
+        return globalSlotProvider;
+    }
+
+    public SlotProvider getLocalSlotProvider() {
+        return localSlotProvider;
+    }
+
+    public GlobalLoadJobListenerBus getOperationListenerBus() {
+        return operationListenerBus;
+    }
+
+    public ResourceUsageMonitor getResourceUsageMonitor() {
+        return resourceUsageMonitor;
+    }
+
+    public DictionaryMgr getDictionaryMgr() {
+        return dictionaryMgr;
+    }
+
+    public boolean isInTransferringToLeader() {
+        return isInTransferringToLeader;
+    }
+
+    public long getDominationStartTimeMs() {
+        return dominationStartTimeMs;
+    }
+
+    public MetaRecoveryDaemon getMetaRecoveryDaemon() {
+        return metaRecoveryDaemon;
+    }
+
+    public VariableMgr getVariableMgr() {
+        return variableMgr;
+    }
+
+    public WarehouseIdleChecker getWarehouseIdleChecker() {
+        return warehouseIdleChecker;
+    }
+
+    public void shutdown() {
+        // in a single thread.
+        connectorMgr.shutdown();
+    }
+
+    public ReportHandler getReportHandler() {
+        return reportHandler;
     }
 }

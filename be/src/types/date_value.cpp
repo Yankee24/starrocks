@@ -1,11 +1,24 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "types/date_value.hpp"
 
+#include "date_value.h"
 #include "gutil/strings/substitute.h"
 #include "types/timestamp_value.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 static const std::string s_day_name[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
 static const char* s_month_name[] = {"",     "January", "February",  "March",   "April",    "May",      "June",
@@ -13,6 +26,8 @@ static const char* s_month_name[] = {"",     "January", "February",  "March",   
 
 static int month_to_quarter[13] = {0, 1, 1, 1, 4, 4, 4, 7, 7, 7, 10, 10, 10};
 static int day_to_first[8] = {0 /*never use*/, 6, 0, 1, 2, 3, 4, 5};
+static constexpr int s_days_in_month[13] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+static int month_to_quarter_end[13] = {0, 3, 3, 3, 6, 6, 6, 9, 9, 9, 12, 12, 12};
 
 const DateValue DateValue::MAX_DATE_VALUE{date::MAX_DATE};
 const DateValue DateValue::MIN_DATE_VALUE{date::MIN_DATE};
@@ -25,6 +40,14 @@ int32_t DateValue::to_date_literal() const {
     int year, month, day;
     to_date(&year, &month, &day);
     return year * 10000 + month * 100 + day;
+}
+
+// return milliseconds since UNIX epoch.
+int64_t DateValue::to_unixtime() const {
+    int64_t result = (int64_t)_julian * SECS_PER_DAY;
+    result -= timestamp::UNIX_EPOCH_SECONDS;
+    result *= 1000L;
+    return result;
 }
 
 void DateValue::from_date_literal(int64_t date_literal) {
@@ -74,7 +97,7 @@ void DateValue::from_mysql_date(uint64_t date) {
 uint24_t DateValue::to_mysql_date() const {
     int y, m, d;
     to_date(&y, &m, &d);
-    return uint24_t((uint32_t)(y << 9) | (m << 5) | (d));
+    return {(uint32_t)(y << 9) | (m << 5) | (d)};
 }
 
 bool DateValue::from_string(const char* date_str, size_t len) {
@@ -128,6 +151,28 @@ void DateValue::trunc_to_quarter() {
     _julian = date::from_date(year, month_to_quarter[month], 1);
 }
 
+void DateValue::set_end_of_month() {
+    int year, month, day;
+    date::to_date_with_cache(_julian, &year, &month, &day);
+    if ((month == 2) && date::is_leap(year)) {
+        _julian = date::from_date(year, 2, 29);
+    } else {
+        _julian = date::from_date(year, month, s_days_in_month[month]);
+    }
+}
+
+void DateValue::set_end_of_quarter() {
+    int year, month, day;
+    date::to_date_with_cache(_julian, &year, &month, &day);
+    _julian = date::from_date(year, month_to_quarter_end[month], s_days_in_month[month_to_quarter_end[month]]);
+}
+
+void DateValue::set_end_of_year() {
+    int year, month, day;
+    date::to_date_with_cache(_julian, &year, &month, &day);
+    _julian = date::from_date(year, 12, 31);
+}
+
 bool DateValue::is_valid() const {
     return (_julian >= date::MIN_DATE) & (_julian <= date::MAX_DATE);
 }
@@ -146,7 +191,7 @@ std::string DateValue::month_name() const {
 std::string DateValue::day_name() const {
     int day = weekday();
     if (day < 0 || day >= 7) {
-        return std::string();
+        return {};
     }
     return s_day_name[day];
 }
@@ -155,4 +200,4 @@ std::string DateValue::to_string() const {
     return date::to_string(_julian);
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

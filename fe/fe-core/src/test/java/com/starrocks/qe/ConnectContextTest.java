@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/qe/ConnectContextTest.java
 
@@ -21,12 +34,21 @@
 
 package com.starrocks.qe;
 
+import com.starrocks.analysis.TableName;
+import com.starrocks.common.Status;
 import com.starrocks.common.util.TimeUtils;
 import com.starrocks.mysql.MysqlCapability;
 import com.starrocks.mysql.MysqlChannel;
 import com.starrocks.mysql.MysqlCommand;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.WarehouseManager;
+import com.starrocks.sql.ast.InsertStmt;
+import com.starrocks.sql.ast.QueryStatement;
+import com.starrocks.sql.ast.ValuesRelation;
+import com.starrocks.thrift.TStatus;
+import com.starrocks.thrift.TStatusCode;
 import com.starrocks.thrift.TUniqueId;
+import com.starrocks.warehouse.DefaultWarehouse;
 import mockit.Expectations;
 import mockit.Mocked;
 import org.junit.Assert;
@@ -40,13 +62,13 @@ public class ConnectContextTest {
     @Mocked
     private MysqlChannel channel;
     @Mocked
-    private StmtExecutor executor;
-    @Mocked
     private SocketChannel socketChannel;
     @Mocked
     private GlobalStateMgr globalStateMgr;
     @Mocked
     private ConnectScheduler connectScheduler;
+
+    private VariableMgr variableMgr = new VariableMgr();
 
     @Before
     public void setUp() throws Exception {
@@ -63,8 +85,9 @@ public class ConnectContextTest {
                 minTimes = 0;
                 result = "192.168.1.1";
 
-                executor.cancel();
+                globalStateMgr.getVariableMgr();
                 minTimes = 0;
+                result = variableMgr;
             }
         };
     }
@@ -85,11 +108,6 @@ public class ConnectContextTest {
         Assert.assertFalse(ctx.isKilled());
         ctx.setKilled();
         Assert.assertTrue(ctx.isKilled());
-
-        // Current cluster
-        Assert.assertEquals("", ctx.getClusterName());
-        ctx.setCluster("testCluster");
-        Assert.assertEquals("testCluster", ctx.getClusterName());
 
         // Current db
         Assert.assertEquals("", ctx.getDatabase());
@@ -130,13 +148,13 @@ public class ConnectContextTest {
         Assert.assertEquals("101", row.get(0));
         Assert.assertEquals("testUser", row.get(1));
         Assert.assertEquals("127.0.0.1:12345", row.get(2));
-        Assert.assertEquals("testCluster", row.get(3));
-        Assert.assertEquals("testDb", row.get(4));
-        Assert.assertEquals("Ping", row.get(5));
-        Assert.assertEquals(TimeUtils.longToTimeString(ctx.getConnectionStartTime()), row.get(6));
-        Assert.assertEquals(Long.toString((currentTimeMillis - ctx.getConnectionStartTime()) / 1000), row.get(7));
+        Assert.assertEquals("testDb", row.get(3));
+        Assert.assertEquals("Ping", row.get(4));
+        Assert.assertEquals(TimeUtils.longToTimeString(ctx.getConnectionStartTime()), row.get(5));
+        Assert.assertEquals(Long.toString((currentTimeMillis - ctx.getConnectionStartTime()) / 1000), row.get(6));
+        Assert.assertEquals("OK", row.get(7));
         Assert.assertEquals("", row.get(8));
-        Assert.assertEquals("", row.get(9));
+        Assert.assertEquals("false", row.get(9));
 
         // Start time
         ctx.setStartTime();
@@ -170,14 +188,13 @@ public class ConnectContextTest {
         // Timeout
         ctx.setStartTime();
         now = ctx.getStartTime() + ctx.getSessionVariable().getWaitTimeoutS() * 1000 + 1;
-        ctx.setExecutor(executor);
         ctx.checkTimeout(now);
         Assert.assertTrue(ctx.isKilled());
 
         // Kill
-        ctx.kill(true);
+        ctx.kill(true, "sleep time out");
         Assert.assertTrue(ctx.isKilled());
-        ctx.kill(false);
+        ctx.kill(false, "sleep time out");
         Assert.assertTrue(ctx.isKilled());
 
         // clean up
@@ -185,23 +202,56 @@ public class ConnectContextTest {
     }
 
     @Test
-    public void testOtherTimeout() {
+    public void testQueryTimeout() {
         ConnectContext ctx = new ConnectContext(socketChannel);
         ctx.setCommand(MysqlCommand.COM_QUERY);
+        ctx.setThreadLocalInfo();
 
-        // sleep no time out
+        StmtExecutor executor = new StmtExecutor(ctx, new QueryStatement(ValuesRelation.newDualRelation()));
+        ctx.setExecutor(executor);
+
+        // query no time out
         Assert.assertFalse(ctx.isKilled());
-        long now = ctx.getSessionVariable().getQueryTimeoutS() * 1000 - 1;
+        long now = ctx.getStartTime() + ctx.getSessionVariable().getQueryTimeoutS() * 1000 - 1;
         ctx.checkTimeout(now);
         Assert.assertFalse(ctx.isKilled());
 
         // Timeout
-        now = ctx.getSessionVariable().getQueryTimeoutS() * 1000 + 1;
+        now = ctx.getStartTime() + ctx.getSessionVariable().getQueryTimeoutS() * 1000 + 1;
         ctx.checkTimeout(now);
         Assert.assertFalse(ctx.isKilled());
 
         // Kill
-        ctx.kill(true);
+        ctx.kill(true, "query timeout");
+        Assert.assertTrue(ctx.isKilled());
+
+        // clean up
+        ctx.cleanup();
+    }
+
+    @Test
+    public void testInsertTimeout() {
+        ConnectContext ctx = new ConnectContext(socketChannel);
+        ctx.setCommand(MysqlCommand.COM_QUERY);
+        ctx.setThreadLocalInfo();
+
+        StmtExecutor executor = new StmtExecutor(
+                ctx, new InsertStmt(new TableName("db", "tbl"), new QueryStatement(ValuesRelation.newDualRelation())));
+        ctx.setExecutor(executor);
+
+        // insert no time out
+        Assert.assertFalse(ctx.isKilled());
+        long now = ctx.getStartTime() + ctx.getSessionVariable().getInsertTimeoutS() * 1000 - 1;
+        ctx.checkTimeout(now);
+        Assert.assertFalse(ctx.isKilled());
+
+        // Timeout
+        now = ctx.getStartTime() + ctx.getSessionVariable().getInsertTimeoutS() * 1000 + 1;
+        ctx.checkTimeout(now);
+        Assert.assertFalse(ctx.isKilled());
+
+        // Kill
+        ctx.kill(true, "insert timeout");
         Assert.assertTrue(ctx.isKilled());
 
         // clean up
@@ -215,5 +265,47 @@ public class ConnectContextTest {
         ctx.setThreadLocalInfo();
         Assert.assertNotNull(ConnectContext.get());
         Assert.assertEquals(ctx, ConnectContext.get());
+    }
+
+    @Test
+    public void testWarehouse(@Mocked WarehouseManager warehouseManager) {
+        new Expectations() {
+            {
+                globalStateMgr.getWarehouseMgr();
+                minTimes = 0;
+                result = warehouseManager;
+
+                warehouseManager.getWarehouse(anyLong);
+                minTimes = 0;
+                result = new DefaultWarehouse(WarehouseManager.DEFAULT_WAREHOUSE_ID,
+                        WarehouseManager.DEFAULT_WAREHOUSE_NAME);
+            }
+        };
+
+        ConnectContext ctx = new ConnectContext(socketChannel);
+        ctx.setGlobalStateMgr(globalStateMgr);
+        ctx.setCurrentWarehouse("wh1");
+        Assert.assertEquals("wh1", ctx.getCurrentWarehouseName());
+
+        ctx.setCurrentWarehouseId(WarehouseManager.DEFAULT_WAREHOUSE_ID);
+        Assert.assertEquals(WarehouseManager.DEFAULT_WAREHOUSE_ID, ctx.getCurrentWarehouseId());
+    }
+
+    @Test
+    public void testGetNormalizedErrorCode() {
+        ConnectContext ctx = new ConnectContext(socketChannel);
+        ctx.setState(new QueryState());
+        Status status = new Status(new TStatus(TStatusCode.MEM_LIMIT_EXCEEDED));
+
+        {
+            ctx.setErrorCodeOnce(status.getErrorCodeString());
+            ctx.getState().setErrType(QueryState.ErrType.ANALYSIS_ERR);
+            Assert.assertEquals("MEM_LIMIT_EXCEEDED", ctx.getNormalizedErrorCode());
+        }
+
+        {
+            ctx.resetErrorCode();
+            Assert.assertEquals("ANALYSIS_ERR", ctx.getNormalizedErrorCode());
+        }
     }
 }

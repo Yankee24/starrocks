@@ -3,6 +3,7 @@
 #include <functional>
 #include <ostream>
 #include <string>
+#include <type_traits>
 
 #include "common/compiler_util.h"
 #include "common/config.h"
@@ -29,16 +30,19 @@ enum JsonType {
     JSON_OBJECT = 5,
 };
 
+// Maximum length of JSON string is 16MB
+constexpr size_t kJSONLengthLimit = 16 << 20;
+
 class JsonValue {
 public:
     using VSlice = vpack::Slice;
     using VBuilder = vpack::Builder;
 
-    JsonValue() {}
+    JsonValue() = default;
 
     JsonValue(const JsonValue& rhs) : binary_(rhs.binary_.data(), rhs.binary_.size()) {}
 
-    JsonValue(JsonValue&& rhs) : binary_(std::move(rhs.binary_)) {}
+    JsonValue(JsonValue&& rhs) noexcept : binary_(std::move(rhs.binary_)) {}
 
     JsonValue& operator=(const JsonValue& rhs) {
         if (this != &rhs) {
@@ -47,7 +51,7 @@ public:
         return *this;
     }
 
-    JsonValue& operator=(JsonValue&& rhs) {
+    JsonValue& operator=(JsonValue&& rhs) noexcept {
         if (this != &rhs) {
             binary_ = std::move(rhs.binary_);
         }
@@ -66,6 +70,7 @@ public:
     ////////////////// builder  //////////////////////
 
     // construct a JsonValue from single sql type
+    static JsonValue from_none();
     static JsonValue from_null();
     static JsonValue from_int(int64_t value);
     static JsonValue from_uint(uint64_t value);
@@ -73,18 +78,38 @@ public:
     static JsonValue from_double(double value);
     static JsonValue from_string(const Slice& value);
 
+    template <class T>
+    static StatusOr<JsonValue> from(T value) {
+        if constexpr (std::is_same_v<T, bool>) {
+            return JsonValue::from_bool(value);
+        } else if constexpr (std::is_integral_v<T>) {
+            return JsonValue::from_int(value);
+        } else if constexpr (std::is_unsigned_v<T>) {
+            return JsonValue::from_uint(value);
+        } else if constexpr (std::is_floating_point_v<T>) {
+            return JsonValue::from_double(value);
+        } else if constexpr (std::is_same_v<T, const char*> || std::is_same_v<T, Slice> ||
+                             std::is_same_v<T, std::string>) {
+            return JsonValue::parse(value);
+        } else {
+            static_assert("not supported");
+        }
+    }
+
     // construct a JsonValue from simdjson::value
     static StatusOr<JsonValue> from_simdjson(simdjson::ondemand::value* value);
     static StatusOr<JsonValue> from_simdjson(simdjson::ondemand::object* obj);
 
     ////////////////// parsing  //////////////////////
     static Status parse(const Slice& src, JsonValue* out);
-
     static StatusOr<JsonValue> parse(const Slice& src);
+    // Try to parse it as JSON object, otherwise consider it as a string
+    static StatusOr<JsonValue> parse_json_or_string(const Slice& src);
 
     ////////////////// serialization  //////////////////////
     size_t serialize(uint8_t* dst) const;
     uint64_t serialize_size() const;
+    uint64_t mem_usage() const { return serialize_size(); }
 
     ////////////////// RAW accessor ////////////////////////////
     Slice get_slice() const;
@@ -98,7 +123,11 @@ public:
     StatusOr<uint64_t> get_uint() const;
     StatusOr<double> get_double() const;
     StatusOr<Slice> get_string() const;
+    StatusOr<JsonValue> get_obj(const std::string& key) const;
     bool is_null() const;
+    bool is_none() const;
+    bool is_null_or_none() const;
+    bool is_invalid() const;
 
     ////////////////// util  //////////////////////
     StatusOr<std::string> to_string() const;
@@ -153,6 +182,10 @@ inline vpack::Slice noneJsonSlice() {
 
 inline vpack::Slice nullJsonSlice() {
     return vpack::Slice::nullSlice();
+}
+
+inline vpack::Slice emptyStringJsonSlice() {
+    return vpack::Slice::emptyStringSlice();
 }
 
 template <class Ret, class Fn>

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/http/ev_http_server.cpp
 
@@ -37,6 +50,7 @@
 #include "http/http_handler.h"
 #include "http/http_headers.h"
 #include "http/http_request.h"
+#include "service/backend_options.h"
 #include "service/brpc.h"
 #include "util/debug_util.h"
 #include "util/errno.h"
@@ -45,12 +59,12 @@
 namespace starrocks {
 
 static void on_chunked(struct evhttp_request* ev_req, void* param) {
-    HttpRequest* request = (HttpRequest*)ev_req->on_free_cb_arg;
+    auto* request = (HttpRequest*)ev_req->on_free_cb_arg;
     request->handler()->on_chunk_data(request);
 }
 
 static void on_free(struct evhttp_request* ev_req, void* arg) {
-    HttpRequest* request = (HttpRequest*)arg;
+    auto* request = (HttpRequest*)arg;
     delete request;
 }
 
@@ -64,7 +78,7 @@ static void on_request(struct evhttp_request* ev_req, void* arg) {
 }
 
 static int on_header(struct evhttp_request* ev_req, void* param) {
-    EvHttpServer* server = (EvHttpServer*)ev_req->on_complete_cb_arg;
+    auto* server = (EvHttpServer*)ev_req->on_complete_cb_arg;
     return server->on_header(ev_req);
 }
 
@@ -76,8 +90,8 @@ static int on_connection(struct evhttp_request* req, void* param) {
     return 0;
 }
 
-EvHttpServer::EvHttpServer(int port, int num_workers)
-        : _host("0.0.0.0"), _port(port), _num_workers(num_workers), _real_port(0) {
+EvHttpServer::EvHttpServer(int port, int num_workers) : _port(port), _num_workers(num_workers), _real_port(0) {
+    _host = BackendOptions::get_service_bind_address();
     DCHECK_GT(_num_workers, 0);
     auto res = pthread_rwlock_init(&_rw_lock, nullptr);
     DCHECK_EQ(res, 0);
@@ -98,14 +112,15 @@ Status EvHttpServer::start() {
     // bind to
     RETURN_IF_ERROR(_bind());
     for (int i = 0; i < _num_workers; ++i) {
-        auto worker = [this, i]() {
-            LOG(INFO) << "EvHttpServer worker start, id=" << i;
+        auto worker = [this]() {
             struct event_base* base = event_base_new();
             if (base == nullptr) {
                 LOG(WARNING) << "Couldn't create an event_base.";
                 return;
             }
+            pthread_rwlock_wrlock(&_rw_lock);
             _event_bases.push_back(base);
+            pthread_rwlock_unlock(&_rw_lock);
 
             /* Create a new evhttp object to handle requests. */
             struct evhttp* http = evhttp_new(base);
@@ -113,7 +128,10 @@ Status EvHttpServer::start() {
                 LOG(WARNING) << "Couldn't create an evhttp.";
                 return;
             }
+
+            pthread_rwlock_wrlock(&_rw_lock);
             _https.push_back(http);
+            pthread_rwlock_unlock(&_rw_lock);
 
             auto res = evhttp_accept_socket(http, _server_fd);
             if (res < 0) {
@@ -141,9 +159,14 @@ void EvHttpServer::stop() {
 
     // shutdown the socket to wake up the epoll_wait
     shutdown(_server_fd, SHUT_RDWR);
+}
 
-    // join the thread before close the socket
-    join();
+void EvHttpServer::join() {
+    for (auto& thread : _workers) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
 
     // close the socket at last
     close(_server_fd);
@@ -158,17 +181,9 @@ void EvHttpServer::stop() {
     }
 }
 
-void EvHttpServer::join() {
-    for (auto& thread : _workers) {
-        if (thread.joinable()) {
-            thread.join();
-        }
-    }
-}
-
 Status EvHttpServer::_bind() {
     butil::EndPoint point;
-    auto res = butil::hostname2endpoint(_host.c_str(), _port, &point);
+    auto res = butil::str2endpoint(_host.c_str(), _port, &point);
     if (res < 0) {
         std::stringstream ss;
         ss << "convert address failed, host=" << _host << ", port=" << _port;

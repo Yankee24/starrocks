@@ -53,7 +53,7 @@ public class MysqlHandshakePacketTest {
 
     @Test
     public void testWrite() {
-        MysqlHandshakePacket packet = new MysqlHandshakePacket(1090);
+        MysqlHandshakePacket packet = new MysqlHandshakePacket(1090, false);
         MysqlSerializer serializer = MysqlSerializer.newInstance(capability);
 
         packet.writeTo(serializer);
@@ -62,7 +62,7 @@ public class MysqlHandshakePacketTest {
         // assert protocol version
         Assert.assertEquals(10, MysqlProto.readInt1(buffer));
         // server version
-        Assert.assertEquals("5.1.0", new String(MysqlProto.readNulTerminateString(buffer)));
+        Assert.assertEquals("8.0.33", new String(MysqlProto.readNulTerminateString(buffer)));
         // connection id
         Assert.assertEquals(1090, MysqlProto.readInt4(buffer));
         // plugin data 1

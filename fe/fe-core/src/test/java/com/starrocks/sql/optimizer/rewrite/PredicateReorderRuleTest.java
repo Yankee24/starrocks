@@ -1,16 +1,31 @@
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.optimizer.rewrite;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.analysis.CreateDbStmt;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Type;
+import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.FeConstants;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.CreateDbStmt;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.operator.logical.LogicalJoinOperator;
@@ -24,11 +39,11 @@ import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.rule.implementation.HashJoinImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.OlapScanImplementationRule;
+import com.starrocks.sql.optimizer.rule.tree.PredicateReorderRule;
 import com.starrocks.sql.optimizer.statistics.CachedStatisticStorage;
 import com.starrocks.sql.optimizer.statistics.ColumnStatistic;
 import com.starrocks.sql.optimizer.statistics.Statistics;
-import com.starrocks.statistic.Constants;
-import com.starrocks.system.SystemInfoService;
+import com.starrocks.statistic.StatsConstants;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
 import org.junit.BeforeClass;
@@ -57,14 +72,14 @@ public class PredicateReorderRuleTest {
     @BeforeClass
     public static void beforeClass() throws Exception {
 
-        FeConstants.default_scheduler_interval_millisecond = 1;
+        Config.alter_scheduler_interval_millisecond = 1;
         UtFrameUtils.createMinStarRocksCluster();
 
         // create connect context
         connectContext = UtFrameUtils.createDefaultCtx();
         starRocksAssert = new StarRocksAssert(connectContext);
-        String DB_NAME = "test";
-        starRocksAssert.withDatabase(DB_NAME).useDatabase(DB_NAME);
+        String dbName = "test";
+        starRocksAssert.withDatabase(dbName).useDatabase(dbName);
 
         connectContext.getSessionVariable().setMaxTransformReorderJoins(8);
         connectContext.getSessionVariable().setOptimizerExecuteTimeout(30000);
@@ -78,8 +93,7 @@ public class PredicateReorderRuleTest {
                         "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                         "PROPERTIES (\n" +
                         "\"replication_num\" = \"1\",\n" +
-                        "\"in_memory\" = \"false\",\n" +
-                        "\"storage_format\" = \"DEFAULT\"\n" +
+                        "\"in_memory\" = \"false\"\n" +
                         ");")
                 .withTable("CREATE TABLE `t1` (\n" +
                         "  `v1` int NULL COMMENT \"\",\n" +
@@ -89,17 +103,15 @@ public class PredicateReorderRuleTest {
                         "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                         "PROPERTIES (\n" +
                         "\"replication_num\" = \"1\",\n" +
-                        "\"in_memory\" = \"false\",\n" +
-                        "\"storage_format\" = \"DEFAULT\"\n" +
+                        "\"in_memory\" = \"false\"\n" +
                         ");");
-        CreateDbStmt dbStmt = new CreateDbStmt(false, Constants.StatisticsDBName);
-        dbStmt.setClusterName(SystemInfoService.DEFAULT_CLUSTER);
+        CreateDbStmt dbStmt = new CreateDbStmt(false, StatsConstants.STATISTICS_DB_NAME);
         try {
-            GlobalStateMgr.getCurrentState().createDb(dbStmt);
+            GlobalStateMgr.getCurrentState().getLocalMetastore().createDb(dbStmt.getFullDbName());
         } catch (DdlException e) {
             return;
         }
-        starRocksAssert.useDatabase(Constants.StatisticsDBName);
+        starRocksAssert.useDatabase(StatsConstants.STATISTICS_DB_NAME);
         starRocksAssert.withTable(DEFAULT_CREATE_TABLE_TEMPLATE);
         FeConstants.runningUnitTest = true;
 
@@ -127,8 +139,8 @@ public class PredicateReorderRuleTest {
 
         GlobalStateMgr catalog = GlobalStateMgr.getCurrentState();
         CachedStatisticStorage cachedStatisticStorage = new CachedStatisticStorage();
-        OlapTable t0 = (OlapTable) catalog.getDb("default_cluster:test").getTable("t0");
-        OlapTable t1 = (OlapTable) catalog.getDb("default_cluster:test").getTable("t1");
+        OlapTable t0 = (OlapTable) catalog.getLocalMetastore().getDb("test").getTable("t0");
+        OlapTable t1 = (OlapTable) catalog.getLocalMetastore().getDb("test").getTable("t1");
         cachedStatisticStorage.addColumnStatistic(t0, v1.getName(), statistics.getColumnStatistic(v1));
         cachedStatisticStorage.addColumnStatistic(t0, v2.getName(), statistics.getColumnStatistic(v2));
         cachedStatisticStorage.addColumnStatistic(t1, v1.getName(), statistics.getColumnStatistic(v1));
@@ -144,7 +156,7 @@ public class PredicateReorderRuleTest {
 
         sessionVariable.enablePredicateReorder();
 
-        OlapTable t0 = (OlapTable) GlobalStateMgr.getCurrentState().getDb("default_cluster:test").getTable("t0");
+        OlapTable t0 = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test").getTable("t0");
 
         PredicateReorderRule predicateReorderRule = new PredicateReorderRule(sessionVariable);
 
@@ -218,8 +230,8 @@ public class PredicateReorderRuleTest {
     public void testHashJoinPredicateReorder() {
         sessionVariable.enablePredicateReorder();
 
-        OlapTable t0 = (OlapTable) GlobalStateMgr.getCurrentState().getDb("default_cluster:test").getTable("t0");
-        OlapTable t1 = (OlapTable) GlobalStateMgr.getCurrentState().getDb("default_cluster:test").getTable("t1");
+        OlapTable t0 = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test").getTable("t0");
+        OlapTable t1 = (OlapTable) GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("test").getTable("t1");
 
         PredicateReorderRule predicateReorderRule = new PredicateReorderRule(sessionVariable);
 
@@ -261,6 +273,7 @@ public class PredicateReorderRuleTest {
                 hashJoinImplementationRule.transform(new OptExpression(logicalJoinOperator1), null).get(0);
         optExpression1.getInputs().add(optExpressionT0);
         optExpression1.getInputs().add(optExpressionT1);
+        optExpression1.setStatistics(statistics);
 
         LogicalJoinOperator.Builder builder2 = new LogicalJoinOperator.Builder();
         builder2.setPredicate(or);
@@ -269,6 +282,7 @@ public class PredicateReorderRuleTest {
                 hashJoinImplementationRule.transform(new OptExpression(logicalJoinOperator2), null).get(0);
         optExpression2.getInputs().add(optExpressionT0);
         optExpression2.getInputs().add(optExpressionT1);
+        optExpression2.setStatistics(statistics);
         //
         optExpression1 = predicateReorderRule.rewrite(optExpression1, null);
         assertEquals(optExpression1.getOp().getPredicate().getChild(0), intEq1);

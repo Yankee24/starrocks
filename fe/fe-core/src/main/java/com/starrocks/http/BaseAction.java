@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/http/BaseAction.java
 
@@ -23,17 +36,20 @@ package com.starrocks.http;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
-import com.google.common.collect.Lists;
-import com.starrocks.analysis.UserIdentity;
-import com.starrocks.cluster.ClusterNamespace;
+import com.starrocks.authorization.AccessDeniedException;
+import com.starrocks.authorization.AuthorizationMgr;
+import com.starrocks.authorization.PrivilegeBuiltinConstants;
+import com.starrocks.authorization.PrivilegeException;
 import com.starrocks.common.DdlException;
-import com.starrocks.mysql.privilege.PrivPredicate;
+import com.starrocks.common.util.DebugUtil;
+import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
-import com.starrocks.system.SystemInfoService;
+import com.starrocks.sql.ast.UserIdentity;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
+import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelProgressiveFuture;
 import io.netty.channel.ChannelProgressiveFutureListener;
 import io.netty.channel.DefaultFileRegion;
@@ -65,10 +81,11 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.RandomAccessFile;
-import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public abstract class BaseAction implements IAction {
     private static final Logger LOG = LogManager.getLogger(BaseAction.class);
@@ -83,23 +100,24 @@ public abstract class BaseAction implements IAction {
     }
 
     @Override
-    public void handleRequest(BaseRequest request) throws Exception {
+    public void handleRequest(BaseRequest request) {
         BaseResponse response = new BaseResponse();
-        LOG.info("receive http request. url={}", request.getRequest().uri());
         try {
             execute(request, response);
         } catch (Exception e) {
-            LOG.warn("fail to process url: {}", request.getRequest().uri(), e);
-            if (e instanceof UnauthorizedException) {
+            LOG.warn("fail to process url: {}, exception: {}", request.getRequest().uri(), DebugUtil.getStackTrace(e));
+            if (e instanceof AccessDeniedException) {
                 response.updateHeader(HttpHeaderNames.WWW_AUTHENTICATE.toString(), "Basic realm=\"\"");
                 writeResponse(request, response, HttpResponseStatus.UNAUTHORIZED);
             } else {
                 writeResponse(request, response, HttpResponseStatus.NOT_FOUND);
             }
+        } finally {
+            ConnectContext.remove();
         }
     }
 
-    public abstract void execute(BaseRequest request, BaseResponse response) throws DdlException;
+    public abstract void execute(BaseRequest request, BaseResponse response) throws DdlException, AccessDeniedException;
 
     protected void writeResponse(BaseRequest request, BaseResponse response, HttpResponseStatus status) {
         // if (HttpHeaders.is100ContinueExpected(request.getRequest())) {
@@ -107,15 +125,8 @@ public abstract class BaseAction implements IAction {
         // HttpResponseStatus.CONTINUE));
         // }
 
-        FullHttpResponse responseObj = null;
-        try {
-            responseObj = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, status,
-                    Unpooled.wrappedBuffer(response.getContent().toString().getBytes("UTF-8")));
-        } catch (UnsupportedEncodingException e) {
-            LOG.warn("get exception.", e);
-            responseObj = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, status,
-                    Unpooled.wrappedBuffer(response.getContent().toString().getBytes()));
-        }
+        FullHttpResponse responseObj = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, status,
+                Unpooled.wrappedBuffer(response.getContent().toString().getBytes(StandardCharsets.UTF_8)));
         Preconditions.checkNotNull(responseObj);
         HttpMethod method = request.getRequest().method();
 
@@ -127,8 +138,12 @@ public abstract class BaseAction implements IAction {
         writeCustomHeaders(response, responseObj);
         writeCookies(response, responseObj);
 
-        boolean keepAlive = HttpUtil.isKeepAlive(request.getRequest());
+        // Connection can be keep-alive only when
+        // - The client requests to keep-alive and,
+        // - The action doesn't close the connection forcibly.
+        boolean keepAlive = HttpUtil.isKeepAlive(request.getRequest()) && !response.isForceCloseConnection();
         if (!keepAlive) {
+            responseObj.headers().set(HttpHeaderNames.CONNECTION.toString(), HttpHeaderValues.CLOSE.toString());
             request.getContext().write(responseObj).addListener(ChannelFutureListener.CLOSE);
         } else {
             responseObj.headers().set(HttpHeaderNames.CONNECTION.toString(), HttpHeaderValues.KEEP_ALIVE.toString());
@@ -236,7 +251,7 @@ public abstract class BaseAction implements IAction {
         }
     }
 
-    // Set 'CONTENT_TYPE' header if it havn't been set.
+    // Set 'CONTENT_TYPE' header if it hasn't been set.
     protected void checkDefaultContentTypeHeader(BaseResponse response, Object responseOj) {
         if (!Strings.isNullOrEmpty(response.getContentType())) {
             response.updateHeader(HttpHeaderNames.CONTENT_TYPE.toString(), response.getContentType());
@@ -257,67 +272,75 @@ public abstract class BaseAction implements IAction {
         }
     }
 
+    protected void handleChannelInactive(ChannelHandlerContext ctx) {
+    }
+
     public static class ActionAuthorizationInfo {
         public String fullUserName;
         public String remoteIp;
         public String password;
-        public String cluster;
 
         @Override
         public String toString() {
             StringBuilder sb = new StringBuilder();
             sb.append("user: ").append(fullUserName).append(", remote ip: ").append(remoteIp);
-            sb.append(", password: ").append(password).append(", cluster: ").append(cluster);
+            sb.append(", password: ").append(password);
             return sb.toString();
         }
-    }
 
-    protected void checkGlobalAuth(UserIdentity currentUser, PrivPredicate predicate) throws UnauthorizedException {
-        if (!GlobalStateMgr.getCurrentState().getAuth().checkGlobalPriv(currentUser, predicate)) {
-            throw new UnauthorizedException("Access denied; you need (at least one of) the "
-                    + predicate.getPrivs().toString() + " privilege(s) for this operation");
+        public static ActionAuthorizationInfo of(String fullUserName, String password, String remoteIp) {
+            ActionAuthorizationInfo authInfo = new ActionAuthorizationInfo();
+            authInfo.fullUserName = fullUserName;
+            authInfo.remoteIp = remoteIp;
+            authInfo.password = password;
+            return authInfo;
         }
     }
 
-    protected void checkDbAuth(UserIdentity currentUser, String db, PrivPredicate predicate)
-            throws UnauthorizedException {
-        if (!GlobalStateMgr.getCurrentState().getAuth().checkDbPriv(currentUser, db, predicate)) {
-            throw new UnauthorizedException("Access denied; you need (at least one of) the "
-                    + predicate.getPrivs().toString() + " privilege(s) for this operation");
-        }
-    }
-
-    protected void checkTblAuth(UserIdentity currentUser, String db, String tbl, PrivPredicate predicate)
-            throws UnauthorizedException {
-        if (!GlobalStateMgr.getCurrentState().getAuth().checkTblPriv(currentUser, db, tbl, predicate)) {
-            throw new UnauthorizedException("Access denied; you need (at least one of) the "
-                    + predicate.getPrivs().toString() + " privilege(s) for this operation");
+    // We check whether user owns db_admin and user_admin role in new RBAC privilege framework for
+    // operation which checks `PrivPredicate.ADMIN` in global table in old Auth framework.
+    protected void checkUserOwnsAdminRole(UserIdentity currentUser) throws AccessDeniedException {
+        try {
+            Set<Long> userOwnedRoles = AuthorizationMgr.getOwnedRolesByUser(currentUser);
+            if (!(currentUser.equals(UserIdentity.ROOT) ||
+                    userOwnedRoles.contains(PrivilegeBuiltinConstants.ROOT_ROLE_ID) ||
+                    (userOwnedRoles.contains(PrivilegeBuiltinConstants.DB_ADMIN_ROLE_ID) &&
+                            userOwnedRoles.contains(PrivilegeBuiltinConstants.USER_ADMIN_ROLE_ID)))) {
+                throw new AccessDeniedException();
+            }
+        } catch (PrivilegeException e) {
+            throw new AccessDeniedException();
         }
     }
 
     // return currentUserIdentity from StarRocks auth
-    protected UserIdentity checkPassword(ActionAuthorizationInfo authInfo)
-            throws UnauthorizedException {
-        List<UserIdentity> currentUser = Lists.newArrayList();
-        if (!GlobalStateMgr.getCurrentState().getAuth().checkPlainPassword(authInfo.fullUserName,
-                authInfo.remoteIp, authInfo.password, currentUser)) {
-            throw new UnauthorizedException("Access denied for "
+    public static UserIdentity checkPassword(ActionAuthorizationInfo authInfo)
+            throws AccessDeniedException {
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        UserIdentity currentUser =
+                globalStateMgr.getAuthenticationMgr().checkPlainPassword(
+                        authInfo.fullUserName, authInfo.remoteIp, authInfo.password);
+        if (currentUser == null) {
+            throw new AccessDeniedException("Access denied for "
                     + authInfo.fullUserName + "@" + authInfo.remoteIp);
         }
-        Preconditions.checkState(currentUser.size() == 1);
-        return currentUser.get(0);
+        return currentUser;
     }
 
     public ActionAuthorizationInfo getAuthorizationInfo(BaseRequest request)
-            throws UnauthorizedException {
+            throws AccessDeniedException {
         ActionAuthorizationInfo authInfo = new ActionAuthorizationInfo();
-        if (!parseAuthInfo(request, authInfo)) {
-            LOG.info("parse auth info failed, Authorization header {}, url {}",
-                    request.getAuthorizationHeader(), request.getRequest().uri());
-            throw new UnauthorizedException("Need auth information.");
+        try {
+            if (!parseAuthInfo(request, authInfo)) {
+                LOG.info("parse auth info failed, Authorization header {}, url {}",
+                        request.getAuthorizationHeader(), request.getRequest().uri());
+                throw new AccessDeniedException("Need auth information.");
+            }
+            LOG.debug("get auth info: {}", authInfo);
+            return authInfo;
+        } catch (Exception e) {
+            throw new AccessDeniedException(e.getMessage());
         }
-        LOG.debug("get auth info: {}", authInfo);
-        return authInfo;
     }
 
     private boolean parseAuthInfo(BaseRequest request, ActionAuthorizationInfo authInfo) {
@@ -339,18 +362,19 @@ public abstract class BaseAction implements IAction {
             // a colon(':')
             decodeBuf = Base64.decode(buf);
             String authString = decodeBuf.toString(CharsetUtil.UTF_8);
+            if (authString.isEmpty()) {
+                return false;
+            }
             // Note that password may contain colon, so can not simply use a
             // colon to split.
             int index = authString.indexOf(":");
+            if (index == -1) {
+                return false;
+            }
             authInfo.fullUserName = authString.substring(0, index);
             final String[] elements = authInfo.fullUserName.split("@");
-            if (elements != null && elements.length < 2) {
-                authInfo.fullUserName = ClusterNamespace.getFullName(SystemInfoService.DEFAULT_CLUSTER,
-                        authInfo.fullUserName);
-                authInfo.cluster = SystemInfoService.DEFAULT_CLUSTER;
-            } else if (elements != null && elements.length == 2) {
-                authInfo.fullUserName = ClusterNamespace.getFullName(elements[1], elements[0]);
-                authInfo.cluster = elements[1];
+            if (elements.length == 2) {
+                authInfo.fullUserName = elements[0];
             }
             authInfo.password = authString.substring(index + 1);
             authInfo.remoteIp = request.getHostString();
@@ -366,6 +390,23 @@ public abstract class BaseAction implements IAction {
             }
         }
         return true;
+    }
+
+    // Refer to {@link #parseAuthInfo(BaseRequest, ActionAuthorizationInfo)}
+    public static ActionAuthorizationInfo parseAuthInfo(String fullUserName, String password, String host) {
+        ActionAuthorizationInfo authInfo = new ActionAuthorizationInfo();
+        final String[] elements = fullUserName.split("@");
+        if (elements.length == 2) {
+            authInfo.fullUserName = elements[0];
+        } else {
+            authInfo.fullUserName = fullUserName;
+        }
+        authInfo.password = password;
+        authInfo.remoteIp = host;
+
+        LOG.debug("Parse result for the input [{} {} {}]: {}", fullUserName, password, host, authInfo);
+
+        return authInfo;
     }
 
     protected int checkIntParam(String strParam) {

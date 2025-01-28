@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/exec/es/es_scan_reader.cpp
 
@@ -31,6 +44,8 @@
 #include "exec/es/es_scroll_parser.h"
 #include "exec/es/es_scroll_query.h"
 #include "fmt/compile.h"
+#include "runtime/exec_env.h"
+#include "util/priority_thread_pool.hpp"
 
 namespace starrocks {
 
@@ -41,10 +56,8 @@ const std::string SOURCE_SCROLL_SEARCH_FILTER_PATH =
 const std::string DOCVALUE_SCROLL_SEARCH_FILTER_PATH =
         "filter_path=_scroll_id,hits.total,hits.hits._score,hits.hits.fields";
 
-const std::string REQUEST_SCROLL_PATH = "_scroll";
 const std::string REQUEST_PREFERENCE_PREFIX = "&preference=_shards:";
 const std::string REQUEST_SEARCH_SCROLL_PATH = "/_search/scroll";
-const std::string REQUEST_SEPARATOR = "/";
 
 ESScanReader::ESScanReader(const std::string& target, const std::map<std::string, std::string>& props,
                            bool doc_value_mode)
@@ -53,7 +66,9 @@ ESScanReader::ESScanReader(const std::string& target, const std::map<std::string
           _doc_value_mode(doc_value_mode) {
     _target = target;
     _index = props.at(KEY_INDEX);
-    _type = props.at(KEY_TYPE);
+    if (props.find(KEY_TYPE) != props.end()) {
+        _type = props.at(KEY_TYPE);
+    }
     if (props.find(KEY_USER_NAME) != props.end()) {
         _user_name = props.at(KEY_USER_NAME);
     }
@@ -77,21 +92,25 @@ ESScanReader::ESScanReader(const std::string& target, const std::map<std::string
 
     if (props.find(KEY_TERMINATE_AFTER) != props.end()) {
         _exactly_once = true;
-        std::stringstream scratch;
-        // just send a normal search  against the elasticsearch with additional terminate_after param to achieve terminate early effect when limit take effect
-        scratch << _target << REQUEST_SEPARATOR << _index << REQUEST_SEPARATOR << _type << "/_search?"
-                << "terminate_after=" << props.at(KEY_TERMINATE_AFTER) << REQUEST_PREFERENCE_PREFIX << _shards << "&"
-                << filter_path;
-        _search_url = scratch.str();
+        // just send a normal search against the elasticsearch with additional terminate_after param to achieve terminate early effect when limit take effect
+        if (_type.empty()) {
+            _search_url = fmt::format("{}/{}/_search?terminate_after={}&preference=_shards:{}&{}", _target, _index,
+                                      props.at(KEY_TERMINATE_AFTER), _shards, filter_path);
+        } else {
+            _search_url = fmt::format("{}/{}/{}/_search?terminate_after={}&preference=_shards:{}&{}", _target, _index,
+                                      _type, props.at(KEY_TERMINATE_AFTER), _shards, filter_path);
+        }
     } else {
         _exactly_once = false;
-        std::stringstream scratch;
         // scroll request for scanning
         // add terminate_after for the first scroll to avoid decompress all postings list
-        scratch << _target << REQUEST_SEPARATOR << _index << REQUEST_SEPARATOR << _type << "/_search?"
-                << "scroll=" << _scroll_keep_alive << REQUEST_PREFERENCE_PREFIX << _shards << "&" << filter_path
-                << "&terminate_after=" << batch_size_str;
-        _init_scroll_url = scratch.str();
+        if (_type.empty()) {
+            _init_scroll_url = fmt::format("{}/{}/_search?scroll={}&preference=_shards:{}&{}", _target, _index,
+                                           _scroll_keep_alive, _shards, filter_path);
+        } else {
+            _init_scroll_url = fmt::format("{}/{}/{}/_search?scroll={}&preference=_shards:{}&{}", _target, _index,
+                                           _type, _scroll_keep_alive, _shards, filter_path);
+        }
         _next_scroll_url = _target + REQUEST_SEARCH_SCROLL_PATH + "?" + filter_path;
     }
     _eos = false;
@@ -115,12 +134,12 @@ Status ESScanReader::open() {
     }
     // phase open, we cached the first response for `get_next` phase
     Status status = _network_client.execute_post_request(_query, &_cached_response);
-    VLOG(1) << "ES Query:" << _query;
+    VLOG(2) << "ES Query:" << _query;
     if (!status.ok() || _network_client.get_http_status() != 200) {
-        std::string err_msg = fmt::format("Failed to connect to ES server, errmsg is: {}", status.get_error_msg());
+        std::string err_msg = fmt::format("Failed to connect to ES server, errmsg is: {}", status.message());
         return Status::InternalError(err_msg);
     }
-    VLOG(1) << "open _cached response: " << _cached_response;
+    VLOG(2) << "open _cached response: " << _cached_response;
     return Status::OK();
 }
 
@@ -165,11 +184,11 @@ Status ESScanReader::get_next(bool* scan_eos, std::unique_ptr<T>& scroll_parser)
     }
 
     scroll_parser.reset(new T(_doc_value_mode));
-    VLOG(1) << "get_next request ES, returned response: " << response;
+    VLOG(2) << "get_next request ES, returned response: " << response;
     Status status = scroll_parser->parse(response, _exactly_once);
     if (!status.ok()) {
         _eos = true;
-        LOG(WARNING) << status.get_error_msg();
+        LOG(WARNING) << status.message();
         return status;
     }
 
@@ -189,8 +208,7 @@ Status ESScanReader::get_next(bool* scan_eos, std::unique_ptr<T>& scroll_parser)
     return Status::OK();
 }
 
-template Status ESScanReader::get_next<vectorized::ScrollParser>(
-        bool* scan_eos, std::unique_ptr<vectorized::ScrollParser>& scroll_parser);
+template Status ESScanReader::get_next<ScrollParser>(bool* scan_eos, std::unique_ptr<ScrollParser>& scroll_parser);
 
 Status ESScanReader::close() {
     if (_scroll_id.empty()) {
@@ -198,21 +216,32 @@ Status ESScanReader::close() {
     }
 
     std::string scratch_target = _target + REQUEST_SEARCH_SCROLL_PATH;
-    RETURN_IF_ERROR(_network_client.init(scratch_target));
-    _network_client.set_basic_auth(_user_name, _passwd);
-    _network_client.set_method(DELETE);
-    _network_client.set_content_type("application/json");
-    _network_client.set_timeout_ms(5 * 1000);
-    if (_ssl_enabled) {
-        _network_client.trust_all_ssl();
+    std::function<void()> send_del_request = [user_name = _user_name, passwd = _passwd, enable_ssl = _ssl_enabled,
+                                              scroll_id = _scroll_id, scratch_target]() {
+        HttpClient client;
+        RETURN_IF(!client.init(scratch_target).ok(), (void)0);
+        client.set_basic_auth(user_name, passwd);
+        client.set_method(DELETE);
+        client.set_content_type("application/json");
+        client.set_timeout_ms(5 * 1000);
+        if (enable_ssl) {
+            client.trust_all_ssl();
+        }
+        std::string response;
+        auto payload = ESScrollQueryBuilder::build_clear_scroll_body(scroll_id);
+        auto st = client.execute_delete_request(payload, &response);
+        if (!st.ok()) {
+            LOG(WARNING) << "es delete scroll id failed:" << st.to_string();
+            return;
+        }
+        if (client.get_http_status() != 200) {
+            LOG(WARNING) << "es_scan_reader delete scroll context failure status code:" << client.get_http_status();
+        }
+    };
+    auto* thread_pool = ExecEnv::GetInstance()->pipeline_sink_io_pool();
+    if (!thread_pool->try_offer(send_del_request)) {
+        LOG(WARNING) << "try to delete scroll id failed";
     }
-    std::string response;
-    RETURN_IF_ERROR(_network_client.execute_delete_request(ESScrollQueryBuilder::build_clear_scroll_body(_scroll_id),
-                                                           &response));
-    if (_network_client.get_http_status() == 200) {
-        return Status::OK();
-    } else {
-        return Status::InternalError("es_scan_reader delete scroll context failure");
-    }
+    return Status::OK();
 }
 } // namespace starrocks

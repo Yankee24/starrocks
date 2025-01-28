@@ -1,23 +1,37 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.analysis;
 
 import com.google.common.collect.Maps;
-import com.starrocks.common.Config;
-import com.starrocks.common.FeConstants;
 import com.starrocks.common.jmockit.Deencapsulation;
-import com.starrocks.common.util.SqlParserUtils;
-import com.starrocks.load.DeleteHandler;
+import com.starrocks.load.DeleteMgr;
 import com.starrocks.load.routineload.KafkaRoutineLoadJob;
 import com.starrocks.load.routineload.LoadDataSourceType;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.sql.ast.CreateRoutineLoadStmt;
+import com.starrocks.sql.ast.DeleteStmt;
+import com.starrocks.sql.ast.InsertStmt;
+import com.starrocks.sql.ast.LoadStmt;
+import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import java.io.StringReader;
 import java.util.ArrayList;
 
 import static org.junit.Assert.assertFalse;
@@ -30,12 +44,8 @@ public class RestrictOpMaterializedViewTest {
 
     @BeforeClass
     public static void setUp() throws Exception {
-        FeConstants.runningUnitTest = true;
-        FeConstants.default_scheduler_interval_millisecond = 100;
-        Config.dynamic_partition_enable = true;
-        Config.dynamic_partition_check_interval_seconds = 1;
-        Config.enable_experimental_mv = true;
         UtFrameUtils.createMinStarRocksCluster();
+        // set default config for async mvs
         String createTblStmtStr =
                 "CREATE TABLE tbl1\n" +
                         "(\n" +
@@ -59,10 +69,14 @@ public class RestrictOpMaterializedViewTest {
                 ") " +
                 "as select tbl1.k1 ss, k2 from tbl1;";
         ctx = UtFrameUtils.createDefaultCtx();
+
+        // set default config for async mvs
+        UtFrameUtils.setDefaultConfigForAsyncMVTest(ctx);
+
         starRocksAssert = new StarRocksAssert(ctx);
         starRocksAssert.withDatabase("db1").useDatabase("db1");
         starRocksAssert.withTable(createTblStmtStr);
-        starRocksAssert.withNewMaterializedView(createMvStmtStr);
+        starRocksAssert.withMaterializedView(createMvStmtStr);
 
     }
 
@@ -103,7 +117,7 @@ public class RestrictOpMaterializedViewTest {
         String sql1 = "delete from db1.mv1 where k2 = 3;";
         try {
             StatementBase statementBase = UtFrameUtils.parseStmtWithNewParser(sql1, ctx);
-            DeleteHandler deleteHandler = new DeleteHandler();
+            DeleteMgr deleteHandler = new DeleteMgr();
             deleteHandler.process((DeleteStmt) statementBase);
             Assert.fail();
         } catch (Exception e) {
@@ -128,10 +142,9 @@ public class RestrictOpMaterializedViewTest {
     public void testBrokerLoad() {
         String sql1 = "LOAD LABEL db1.label0 (DATA INFILE('/path/file1') INTO TABLE mv1) with broker 'broker0';";
         try {
-            SqlParser parser = new SqlParser(new SqlScanner(new StringReader(sql1)));
-            LoadStmt loadStmt = (LoadStmt) SqlParserUtils.getFirstStmt(parser);
-            Deencapsulation.setField(loadStmt, "label", new LabelName("default_cluster:db1", "mv1"));
-            loadStmt.analyze(AccessTestUtil.fetchAdminAnalyzer(true));
+            LoadStmt loadStmt = (LoadStmt) com.starrocks.sql.parser.SqlParser.parse(sql1, ctx.getSessionVariable().getSqlMode()).get(0);
+            Deencapsulation.setField(loadStmt, "label", new LabelName("db1", "mv1"));
+            com.starrocks.sql.analyzer.Analyzer.analyze(loadStmt, ctx);
             Assert.fail();
         } catch (Exception e) {
             assertTrue(e.getMessage().contains("the data of materialized view must be consistent with the base table"));
@@ -140,12 +153,12 @@ public class RestrictOpMaterializedViewTest {
 
     @Test
     public void testRoutineLoad() {
-        LabelName labelName = new LabelName("default_cluster:db1", "job1");
+        LabelName labelName = new LabelName("db1", "job1");
         CreateRoutineLoadStmt createRoutineLoadStmt = new CreateRoutineLoadStmt(labelName, "mv1",
                 new ArrayList<>(), Maps.newHashMap(),
                 LoadDataSourceType.KAFKA.name(), Maps.newHashMap());
 
-        Deencapsulation.setField(createRoutineLoadStmt, "dbName", "default_cluster:db1");
+        Deencapsulation.setField(createRoutineLoadStmt, "dbName", "db1");
 
         try {
             KafkaRoutineLoadJob.fromCreateStmt(createRoutineLoadStmt);
@@ -163,6 +176,17 @@ public class RestrictOpMaterializedViewTest {
             Assert.fail();
         } catch (Exception e) {
             assertTrue(e.getMessage().contains("is a materialized view,you can use 'ALTER MATERIALIZED VIEW' to alter it."));
+        }
+    }
+
+    @Test
+    public void testDropTable() {
+        String sql1 = "drop table db1.mv1;";
+        try {
+            UtFrameUtils.parseStmtWithNewParser(sql1, ctx);
+            Assert.fail();
+        } catch (Exception e) {
+            assertTrue(e.getMessage().contains("is a materialized view,use 'drop materialized view mv1' to drop it."));
         }
     }
 

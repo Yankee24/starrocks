@@ -27,7 +27,7 @@ RESULT SINK
 [sql]
 select * from t0 where v1 in (1.1, 2, null)
 [result]
-SCAN (columns[1: v1, 2: v2, 3: v3] predicate[cast(1: v1 as decimal128(20, 1)) IN (1.1, 2, null)])
+SCAN (columns[1: v1, 2: v2, 3: v3] predicate[cast(1: v1 as DECIMAL128(20,1)) IN (1.1, 2.0, null)])
 [end]
 
 [sql]
@@ -69,7 +69,6 @@ tabletRatio=3/3
 tabletList=10006,10008,10010
 cardinality=1
 avgRowSize=9.0
-numNodes=0
 [end]
 
 [sql]
@@ -87,7 +86,7 @@ SCAN (columns[1: v1] predicate[null])
 [sql]
 select v1 from t0 where (null * null) is null
 [result]
-SCAN (columns[1: v1] predicate[true])
+SCAN (columns[1: v1] predicate[null])
 [end]
 
 [sql]
@@ -142,7 +141,7 @@ SCAN (columns[4: t1d, 9: id_date] predicate[9: id_date = 2020-01-01])
 [sql]
 select v1 from t0 where ((NULL) - (NULL)) <=> ((NULL) % (NULL))
 [result]
-SCAN (columns[1: v1] predicate[true])
+SCAN (columns[1: v1] predicate[null])
 [end]
 
 [sql]
@@ -161,6 +160,5 @@ VALUES
 select v1 from (select * from (select v1,sum(v2) from t0 group by v1  union all select null as v1,null ) t) temp where v1 = 1
 [result]
 AGGREGATE ([GLOBAL] aggregate [{}] group by [[1: v1]] having [null]
-    AGGREGATE ([LOCAL] aggregate [{}] group by [[1: v1]] having [null]
-        SCAN (columns[1: v1] predicate[1: v1 = 1])
+    SCAN (columns[1: v1] predicate[1: v1 = 1])
 [end]

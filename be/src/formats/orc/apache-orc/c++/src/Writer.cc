@@ -20,6 +20,7 @@
 
 #include "ColumnWriter.hh"
 #include "Timezone.hh"
+#include "common/config.h"
 #include "orc/Common.hh"
 #include "orc/OrcFile.hh"
 
@@ -134,6 +135,13 @@ double WriterOptions::getDictionaryKeySizeThreshold() const {
 WriterOptions& WriterOptions::setFileVersion(const FileVersion& version) {
     // Only Hive_0_11 and Hive_0_12 version are supported currently
     if (version.getMajor() == 0 && (version.getMinor() == 11 || version.getMinor() == 12)) {
+        privateBits->fileVersion = version;
+        return *this;
+    }
+    if (version == FileVersion::UNSTABLE_PRE_2_0()) {
+        *privateBits->errorStream << "Warning: ORC files written in " << FileVersion::UNSTABLE_PRE_2_0().toString()
+                                  << " will not be readable by other versions of the software."
+                                  << " It is only for developer testing.\n";
         privateBits->fileVersion = version;
         return *this;
     }
@@ -379,7 +387,11 @@ void WriterImpl::init() {
     postScript.add_version(options.getFileVersion().getMajor());
     postScript.add_version(options.getFileVersion().getMinor());
 
-    postScript.set_writerversion(WriterVersion_ORC_135);
+    if (starrocks::config::orc_writer_version != -1) {
+        postScript.set_writerversion(starrocks::config::orc_writer_version);
+    } else {
+        postScript.set_writerversion(WriterVersion_ORC_135);
+    }
     postScript.set_magic("ORC");
 
     // Initialize first stripe
@@ -434,8 +446,8 @@ void WriterImpl::writeStripe() {
     proto::StripeStatistics* stripeStats = metadata.add_stripestats();
     std::vector<proto::ColumnStatistics> colStats;
     columnWriter->getStripeStatistics(colStats);
-    for (uint32_t i = 0; i != colStats.size(); ++i) {
-        *stripeStats->add_colstats() = colStats[i];
+    for (auto& colStat : colStats) {
+        *stripeStats->add_colstats() = colStat;
     }
     // merge stripe stats into file stats and clear stripe stats
     columnWriter->mergeStripeStatsIntoFileStats();
@@ -486,8 +498,8 @@ void WriterImpl::writeFileFooter() {
     // update file statistics
     std::vector<proto::ColumnStatistics> colStats;
     columnWriter->getFileStatistics(colStats);
-    for (uint32_t i = 0; i != colStats.size(); ++i) {
-        *fileFooter.add_statistics() = colStats[i];
+    for (auto& colStat : colStats) {
+        *fileFooter.add_statistics() = colStat;
     }
 
     if (!fileFooter.SerializeToZeroCopyStream(compressionStream.get())) {
@@ -500,7 +512,7 @@ void WriterImpl::writePostscript() {
     if (!postScript.SerializeToZeroCopyStream(bufferedStream.get())) {
         throw std::logic_error("Failed to write post script.");
     }
-    unsigned char psLength = static_cast<unsigned char>(bufferedStream->flush());
+    auto psLength = static_cast<unsigned char>(bufferedStream->flush());
     outStream->write(&psLength, sizeof(unsigned char));
 }
 

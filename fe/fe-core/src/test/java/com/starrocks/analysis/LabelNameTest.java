@@ -18,6 +18,8 @@
 package com.starrocks.analysis;
 
 import com.starrocks.common.AnalysisException;
+import com.starrocks.qe.ConnectContext;
+import com.starrocks.sql.analyzer.SemanticException;
 import mockit.Expectations;
 import mockit.Mocked;
 import org.junit.Assert;
@@ -30,13 +32,6 @@ public class LabelNameTest {
 
     @Before
     public void setUp() {
-        new Expectations() {
-            {
-                analyzer.getClusterName();
-                minTimes = 0;
-                result = "testCluster";
-            }
-        };
     }
 
     @Test
@@ -50,18 +45,20 @@ public class LabelNameTest {
         };
 
         LabelName label = new LabelName("testDb", "testLabel");
-        label.analyze(analyzer);
-        Assert.assertEquals("`testCluster:testDb`.`testLabel`", label.toString());
+        label.analyze(new ConnectContext());
+        Assert.assertEquals("testDb", label.getDbName());
+        Assert.assertEquals("testLabel", label.getLabelName());
 
         label = new LabelName("", "testLabel");
-        label.analyze(analyzer);
-        Assert.assertEquals("`testCluster:testDb`.`testLabel`", label.toString());
-        Assert.assertEquals("testCluster:testDb", label.getDbName());
+        ConnectContext context = new ConnectContext();
+        context.setDatabase("testDb");
+        label.analyze(context);
+        Assert.assertEquals("testDb", label.getDbName());
         Assert.assertEquals("testLabel", label.getLabelName());
     }
 
-    @Test(expected = AnalysisException.class)
-    public void testNoDb() throws AnalysisException {
+    @Test(expected = SemanticException.class)
+    public void testNoDb() throws SemanticException {
         new Expectations() {
             {
                 analyzer.getDefaultDb();
@@ -71,12 +68,12 @@ public class LabelNameTest {
         };
 
         LabelName label = new LabelName("", "testLabel");
-        label.analyze(analyzer);
+        label.analyze(new ConnectContext());
         Assert.fail("No exception throws");
     }
 
-    @Test(expected = AnalysisException.class)
-    public void testNoLabel() throws AnalysisException {
+    @Test(expected = SemanticException.class)
+    public void testNoLabel() throws SemanticException {
         new Expectations() {
             {
                 analyzer.getDefaultDb();
@@ -86,7 +83,7 @@ public class LabelNameTest {
         };
 
         LabelName label = new LabelName("", "");
-        label.analyze(analyzer);
+        label.analyze(new ConnectContext());
         Assert.fail("No exception throws");
     }
 

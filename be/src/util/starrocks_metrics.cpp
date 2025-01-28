@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/util/starrocks_metrics.cpp
 
@@ -24,8 +37,6 @@
 #include <unistd.h>
 
 #include "fs/fs.h"
-#include "fs/fs_util.h"
-#include "util/debug_util.h"
 #include "util/system_metrics.h"
 
 namespace starrocks {
@@ -43,8 +54,41 @@ StarRocksMetrics::StarRocksMetrics() : _metrics(_s_registry_name) {
     REGISTER_STARROCKS_METRIC(query_scan_bytes);
     REGISTER_STARROCKS_METRIC(query_scan_rows);
 
+    REGISTER_STARROCKS_METRIC(pipe_scan_executor_queuing);
+    REGISTER_STARROCKS_METRIC(pipe_driver_schedule_count);
+    REGISTER_STARROCKS_METRIC(pipe_driver_execution_time);
+    REGISTER_STARROCKS_METRIC(pipe_driver_queue_len);
+    REGISTER_STARROCKS_METRIC(pipe_poller_block_queue_len);
+
+    REGISTER_STARROCKS_METRIC(load_channel_add_chunks_total);
+    REGISTER_STARROCKS_METRIC(load_channel_add_chunks_eos_total);
+    REGISTER_STARROCKS_METRIC(load_channel_add_chunks_duration_us);
+    REGISTER_STARROCKS_METRIC(load_channel_add_chunks_wait_memtable_duration_us);
+    REGISTER_STARROCKS_METRIC(load_channel_add_chunks_wait_writer_duration_us);
+    REGISTER_STARROCKS_METRIC(load_channel_add_chunks_wait_replica_duration_us);
+
+    REGISTER_STARROCKS_METRIC(async_delta_writer_execute_total);
+    REGISTER_STARROCKS_METRIC(async_delta_writer_task_total);
+    REGISTER_STARROCKS_METRIC(async_delta_writer_task_execute_duration_us);
+    REGISTER_STARROCKS_METRIC(async_delta_writer_task_pending_duration_us);
+
+    REGISTER_STARROCKS_METRIC(delta_writer_commit_task_total);
+    REGISTER_STARROCKS_METRIC(delta_writer_wait_flush_task_total);
+    REGISTER_STARROCKS_METRIC(delta_writer_wait_flush_duration_us);
+    REGISTER_STARROCKS_METRIC(delta_writer_pk_preload_duration_us);
+    REGISTER_STARROCKS_METRIC(delta_writer_wait_replica_duration_us);
+    REGISTER_STARROCKS_METRIC(delta_writer_txn_commit_duration_us);
+
     REGISTER_STARROCKS_METRIC(memtable_flush_total);
+    REGISTER_STARROCKS_METRIC(memtable_finalize_duration_us);
     REGISTER_STARROCKS_METRIC(memtable_flush_duration_us);
+    REGISTER_STARROCKS_METRIC(memtable_flush_io_time_us);
+    REGISTER_STARROCKS_METRIC(memtable_flush_memory_bytes_total);
+    REGISTER_STARROCKS_METRIC(memtable_flush_disk_bytes_total);
+    REGISTER_STARROCKS_METRIC(segment_flush_total);
+    REGISTER_STARROCKS_METRIC(segment_flush_duration_us);
+    REGISTER_STARROCKS_METRIC(segment_flush_io_time_us);
+    REGISTER_STARROCKS_METRIC(segment_flush_bytes_total);
 
     REGISTER_STARROCKS_METRIC(update_rowset_commit_request_total);
     REGISTER_STARROCKS_METRIC(update_rowset_commit_request_failed);
@@ -57,6 +101,13 @@ StarRocksMetrics::StarRocksMetrics() : _metrics(_s_registry_name) {
     REGISTER_STARROCKS_METRIC(update_del_vector_bytes_total);
     REGISTER_STARROCKS_METRIC(update_del_vector_deletes_total);
     REGISTER_STARROCKS_METRIC(update_del_vector_deletes_new);
+    REGISTER_STARROCKS_METRIC(column_partial_update_apply_total);
+    REGISTER_STARROCKS_METRIC(column_partial_update_apply_duration_us);
+    REGISTER_STARROCKS_METRIC(delta_column_group_get_total);
+    REGISTER_STARROCKS_METRIC(delta_column_group_get_hit_cache);
+    REGISTER_STARROCKS_METRIC(delta_column_group_get_non_pk_total);
+    REGISTER_STARROCKS_METRIC(delta_column_group_get_non_pk_hit_cache);
+    REGISTER_STARROCKS_METRIC(primary_key_table_error_state_total);
 
     // push request
     _metrics.register_metric("push_requests_total", MetricLabels().add("status", "SUCCESS"),
@@ -99,6 +150,8 @@ StarRocksMetrics::StarRocksMetrics() : _metrics(_s_registry_name) {
     REGISTER_ENGINE_REQUEST_METRIC(base_compaction, failed, base_compaction_request_failed);
     REGISTER_ENGINE_REQUEST_METRIC(cumulative_compaction, total, cumulative_compaction_request_total);
     REGISTER_ENGINE_REQUEST_METRIC(cumulative_compaction, failed, cumulative_compaction_request_failed);
+    REGISTER_ENGINE_REQUEST_METRIC(update_compaction, total, update_compaction_request_total);
+    REGISTER_ENGINE_REQUEST_METRIC(update_compaction, failed, update_compaction_request_failed);
 
     REGISTER_ENGINE_REQUEST_METRIC(publish, total, publish_task_request_total);
     REGISTER_ENGINE_REQUEST_METRIC(publish, failed, publish_task_failed_total);
@@ -157,16 +210,24 @@ StarRocksMetrics::StarRocksMetrics() : _metrics(_s_registry_name) {
     REGISTER_STARROCKS_METRIC(tablet_cumulative_max_compaction_score);
     REGISTER_STARROCKS_METRIC(tablet_base_max_compaction_score);
     REGISTER_STARROCKS_METRIC(tablet_update_max_compaction_score);
+    REGISTER_STARROCKS_METRIC(max_tablet_rowset_num);
+    REGISTER_STARROCKS_METRIC(wait_cumulative_compaction_task_num);
+    REGISTER_STARROCKS_METRIC(wait_base_compaction_task_num);
+    REGISTER_STARROCKS_METRIC(running_cumulative_compaction_task_num);
+    REGISTER_STARROCKS_METRIC(running_base_compaction_task_num);
+    REGISTER_STARROCKS_METRIC(running_update_compaction_task_num);
+    REGISTER_STARROCKS_METRIC(cumulative_compaction_task_cost_time_ms);
+    REGISTER_STARROCKS_METRIC(base_compaction_task_cost_time_ms);
+    REGISTER_STARROCKS_METRIC(update_compaction_task_cost_time_ns);
+    REGISTER_STARROCKS_METRIC(base_compaction_task_byte_per_second);
+    REGISTER_STARROCKS_METRIC(cumulative_compaction_task_byte_per_second);
+    REGISTER_STARROCKS_METRIC(update_compaction_task_byte_per_second);
 
     REGISTER_STARROCKS_METRIC(push_request_write_bytes_per_second);
     REGISTER_STARROCKS_METRIC(query_scan_bytes_per_second);
     REGISTER_STARROCKS_METRIC(max_disk_io_util_percent);
     REGISTER_STARROCKS_METRIC(max_network_send_bytes_rate);
     REGISTER_STARROCKS_METRIC(max_network_receive_bytes_rate);
-
-    REGISTER_STARROCKS_METRIC(tcmalloc_total_bytes_reserved);
-    REGISTER_STARROCKS_METRIC(tcmalloc_pageheap_unmapped_bytes);
-    REGISTER_STARROCKS_METRIC(tcmalloc_bytes_in_use);
 
     _metrics.register_hook(_s_hook_name, [this] { _update(); });
 
@@ -179,6 +240,9 @@ StarRocksMetrics::StarRocksMetrics() : _metrics(_s_registry_name) {
     REGISTER_STARROCKS_METRIC(disk_sync_total);
     REGISTER_STARROCKS_METRIC(blocks_open_reading);
     REGISTER_STARROCKS_METRIC(blocks_open_writing);
+
+    REGISTER_STARROCKS_METRIC(short_circuit_request_total);
+    REGISTER_STARROCKS_METRIC(short_circuit_request_duration_us);
 }
 
 void StarRocksMetrics::initialize(const std::vector<std::string>& paths, bool init_system_metrics,

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/LimitElement.java
 
@@ -21,7 +34,9 @@
 
 package com.starrocks.analysis;
 
+import com.google.common.base.Preconditions;
 import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.parser.NodePosition;
 
 /**
  * Combination of limit and offset expressions.
@@ -32,28 +47,38 @@ public class LimitElement implements ParseNode {
     /////////////////////////////////////////
     // BEGIN: Members that need to be reset()
 
-    private long limit;
-    private long offset;
+    private final Expr limit;
+    private final Expr offset;
 
     // END: Members that need to be reset()
     /////////////////////////////////////////
 
-    public LimitElement() {
-        limit = -1;
-        offset = 0;
-    }
+    private final NodePosition pos;
 
-    public LimitElement(long limit) {
-        this.limit = limit;
-        offset = 0;
+    public LimitElement() {
+        pos = NodePosition.ZERO;
+        limit = new IntLiteral(-1);
+        offset = new IntLiteral(0);
     }
 
     public LimitElement(long offset, long limit) {
+        this(offset, limit, NodePosition.ZERO);
+    }
+
+    public LimitElement(long offset, long limit, NodePosition pos) {
+        this.pos = pos;
+        this.offset = new IntLiteral(offset);
+        this.limit = new IntLiteral(limit);
+    }
+
+    public LimitElement(Expr offset, Expr limit, NodePosition pos) {
+        this.pos = pos;
         this.offset = offset;
         this.limit = limit;
     }
 
     protected LimitElement(LimitElement other) {
+        pos = other.pos;
         limit = other.limit;
         offset = other.offset;
     }
@@ -68,11 +93,12 @@ public class LimitElement implements ParseNode {
      * first. If no limit was set, then -1 is returned.
      */
     public long getLimit() {
-        return limit;
+        Preconditions.checkState(limit instanceof LiteralExpr);
+        return ((LiteralExpr) limit).getLongValue();
     }
 
     public boolean hasLimit() {
-        return limit != -1;
+        return getLimit() != -1;
     }
 
     /**
@@ -80,41 +106,49 @@ public class LimitElement implements ParseNode {
      * analyze() first. If no offsetExpr exists, then 0 (the default offset) is returned.
      */
     public long getOffset() {
-        return offset;
+        Preconditions.checkState(offset instanceof LiteralExpr);
+        return ((LiteralExpr) offset).getLongValue();
     }
 
     public boolean hasOffset() {
-        return offset != 0;
+        return getOffset() != 0;
     }
 
     public String toSql() {
-        if (limit == -1) {
+        if (getLimit() == -1) {
             return "";
         }
         StringBuilder sb = new StringBuilder(" LIMIT ");
-        if (offset != 0) {
-            sb.append(offset).append(", ");
+        if (getOffset() != 0) {
+            sb.append(getOffset()).append(", ");
         }
-        sb.append("").append(limit);
+        sb.append("").append(getLimit());
         return sb.toString();
     }
 
+    public Expr getLimitExpr() {
+        return limit;
+    }
+
+    public Expr getOffsetExpr() {
+        return offset;
+    }
+
+    @Override
+    public NodePosition getPos() {
+        return pos;
+    }
+
     public String toDigest() {
-        if (limit == -1) {
+        if (getLimit() == -1) {
             return "";
         }
         StringBuilder sb = new StringBuilder(" limit ");
-        if (offset != 0) {
+        if (getOffset() != 0) {
             sb.append(" ?, ");
         }
         sb.append("").append(" ? ");
         return sb.toString();
-    }
-
-    public void analyze(Analyzer analyzer) {
-        if (limit == 0) {
-            analyzer.setHasEmptyResultSet();
-        }
     }
 
     public void reset() {

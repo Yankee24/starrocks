@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.sql.plan;
 
@@ -6,23 +18,45 @@ import com.starrocks.catalog.Database;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.FeConstants;
-import com.starrocks.planner.PlanFragment;
-import com.starrocks.qe.SessionVariable;
 import com.starrocks.server.GlobalStateMgr;
-import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.optimizer.OptimizerContext;
 import com.starrocks.sql.optimizer.rule.RuleSet;
 import com.starrocks.sql.optimizer.rule.transformation.JoinAssociativityRule;
-import com.starrocks.system.BackendCoreStat;
-import com.starrocks.thrift.TExplainLevel;
-import mockit.Expectations;
 import mockit.Mock;
 import mockit.MockUp;
 import org.apache.commons.lang3.StringUtils;
 import org.junit.Assert;
+import org.junit.Ignore;
 import org.junit.Test;
 
 public class JoinTest extends PlanTestBase {
+
+    @Test
+    public void testIsNullPredicatePushdownClear() throws Exception {
+        {
+            String sql = "with cte_tbl as (\n" +
+                    "  select v1, count(distinct v2) as clickcnt from " +
+                    "(select * from t0) t0 join t1 on t0.v1= t1.v4 where 1 = 1 and t0.v2 in (select v7 from t2) group by v1\n" +
+                    ") select t3.* from (select * from t3 left join cte_tbl on v10 = v1 where v11 = 11) t3 where 1 = 1 ";
+            String plan = getFragmentPlan(sql);
+            // should be LEFT OUTER JOIN, not INNER JOIN
+            assertContains(plan, "13:HASH JOIN\n" +
+                    "  |  join op: LEFT OUTER JOIN");
+        }
+
+        {
+            // remove where 1 = 1
+            String sql = "with cte_tbl as (\n" +
+                    "  select v1, count(distinct v2) as clickcnt from " +
+                    "(select * from t0) t0 join t1 on t0.v1= t1.v4 where 1 = 1 and t0.v2 in (select v7 from t2) group by v1\n" +
+                    ") select t3.* from (select * from t3 left join cte_tbl on v10 = v1 where v11 = 11) t3";
+            String plan = getFragmentPlan(sql);
+            // should be LEFT OUTER JOIN, not INNER JOIN
+            assertContains(plan, "13:HASH JOIN\n" +
+                    "  |  join op: LEFT OUTER JOIN");
+        }
+    }
+
     @Test
     public void testColocateDistributeSatisfyShuffleColumns() throws Exception {
         FeConstants.runningUnitTest = true;
@@ -41,16 +75,16 @@ public class JoinTest extends PlanTestBase {
     @Test
     public void testInnerJoinWithPredicate() throws Exception {
         String sql = "SELECT * from t0 join test_all_type on t0.v1 = test_all_type.t1d where t0.v1 = 1;";
-        String planFragment = getFragmentPlan(sql);
-        Assert.assertTrue(planFragment.contains("PREDICATES: 1: v1 = 1"));
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "PREDICATES: 1: v1 = 1");
     }
 
     @Test
     public void testInnerJoinWithConstPredicate() throws Exception {
         String sql = "SELECT * from t0 join test_all_type on NOT NULL >= NULL";
 
-        String planFragment = getFragmentPlan(sql);
-        Assert.assertTrue(planFragment.contains("  0:EMPTYSET\n"));
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "  0:EMPTYSET\n");
     }
 
     @Test
@@ -60,25 +94,25 @@ public class JoinTest extends PlanTestBase {
     }
 
     @Test
-    public void testCorssJoinWithPredicate() throws Exception {
+    public void testCrossJoinWithPredicate() throws Exception {
         String sql = "SELECT * from t0 join test_all_type where t0.v1 = 2;";
-        String planFragment = getFragmentPlan(sql);
-        Assert.assertTrue(planFragment.contains("PREDICATES: 1: v1 = 2"));
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "PREDICATES: 1: v1 = 2");
     }
 
     @Test
     public void testLeftOuterJoinWithPredicate() throws Exception {
         String sql = "SELECT * from t0 left join test_all_type on t0.v1 = test_all_type.t1d where t0.v1 > 1;";
-        String planFragment = getFragmentPlan(sql);
-        Assert.assertTrue(planFragment.contains("PREDICATES: 1: v1 > 1"));
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "PREDICATES: 1: v1 > 1");
     }
 
     @Test
     public void testCrossJoinToInnerJoin() throws Exception {
         String sql = "SELECT t0.v1 from t0, test_all_type where t0.v1 = test_all_type.t1d";
-        String planFragment = getFragmentPlan(sql);
-        Assert.assertTrue(planFragment.contains("join op: INNER JOIN"));
-        Assert.assertTrue(planFragment.contains("equal join conjunct: 1: v1 = 7: t1d"));
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "join op: INNER JOIN");
+        assertContains(plan, "equal join conjunct: 1: v1 = 7: t1d");
     }
 
     @Test
@@ -87,59 +121,53 @@ public class JoinTest extends PlanTestBase {
         getFragmentPlan(sql);
 
         sql = " select a.v2 from t0 a join t0 b on a.v3 = b.v3;";
-        String planFragment = getFragmentPlan(sql);
-        Assert.assertTrue(planFragment.contains("4:Project\n"
-                + "  |  <slot 2> : 2: v2"));
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "4:Project\n"
+                + "  |  <slot 2> : 2: v2");
     }
 
     @Test
     public void testCrossJoin() throws Exception {
         String sql = "SELECT * from t0 join test_all_type;";
-        String planFragment = getFragmentPlan(sql);
-        Assert.assertTrue(planFragment.contains("  3:CROSS JOIN\n" +
-                "  |  cross join:\n" +
-                "  |  predicates is NULL.\n" +
+        String plan = getFragmentPlan(sql);
+        Assert.assertTrue(plan, plan.contains("  3:NESTLOOP JOIN\n" +
+                "  |  join op: CROSS JOIN\n" +
+                "  |  colocate: false, reason: \n" +
                 "  |  \n" +
-                "  |----2:EXCHANGE\n" +
-                "  |    \n" +
-                "  0:OlapScanNode"));
+                "  |----2:EXCHANGE\n"));
 
         sql = "select * from t0 join test_all_type on NOT 69 IS NOT NULL where true";
-        planFragment = getFragmentPlan(sql);
-        Assert.assertTrue(planFragment.contains("  3:CROSS JOIN\n" +
-                "  |  cross join:\n" +
-                "  |  predicates is NULL.\n" +
-                "  |  \n" +
-                "  |----2:EXCHANGE\n" +
-                "  |    \n" +
-                "  0:EMPTYSET"));
+        plan = getFragmentPlan(sql);
+        assertNotContains(plan, "JOIN");
+        Assert.assertTrue(plan,
+                plan.contains("0:EMPTYSET"));
     }
 
     @Test
     public void testFullOuterJoin() throws Exception {
         String sql = "select * from t0 full outer join t1 on t0.v1 = t1.v4 where abs(1) > 2;";
-        String planFragment = getFragmentPlan(sql);
-        Assert.assertTrue(planFragment.contains("     TABLE: t1\n"
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "     TABLE: t1\n"
                 + "     PREAGGREGATION: ON\n"
-                + "     PREDICATES: abs(1) > 2"));
-        Assert.assertTrue(planFragment.contains("     TABLE: t0\n"
+                + "     PREDICATES: abs(1) > 2");
+        assertContains(plan, "     TABLE: t0\n"
                 + "     PREAGGREGATION: ON\n"
-                + "     PREDICATES: abs(1) > 2"));
+                + "     PREDICATES: abs(1) > 2");
     }
 
     @Test
     public void testFullOuterJoinPredicatePushDown() throws Exception {
         String sql = "select * from t0 full outer join t1 on t0.v1 = t1.v4 " +
                 " where (NOT (t0.v2 IS NOT NULL))";
-        String planFragment = getFragmentPlan(sql);
-        Assert.assertTrue(planFragment.contains("other predicates: 2: v2 IS NULL"));
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "other predicates: 2: v2 IS NULL");
     }
 
     @Test
     public void testRightSemiJoinWithFilter() throws Exception {
         String sql = "select t1.v4 from t0 right semi join t1 on t0.v1 = t1.v4 and t0.v1 > 1 ";
-        String planFragment = getFragmentPlan(sql);
-        Assert.assertTrue(planFragment.contains("PREDICATES: 1: v1 > 1"));
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "PREDICATES: 1: v1 > 1");
     }
 
     @Test
@@ -316,7 +344,7 @@ public class JoinTest extends PlanTestBase {
         String query = "select t1.* from t0, t2, t3, t1 where t1.v4 = t2.v7 " +
                 "and t1.v4 = t3.v10 and t3.v10 = t0.v1";
         String explainString = getFragmentPlan(query);
-        Assert.assertFalse(explainString.contains("CROSS JOIN"));
+        Assert.assertFalse(explainString.contains("NESTLOOP JOIN"));
     }
 
     @Test
@@ -336,10 +364,10 @@ public class JoinTest extends PlanTestBase {
                 + "        AND (subt0.v3 <= subt0.v3 < subt1.v6) = (subt1.v5)\n";
 
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "  |  colocate: false, reason: \n"
-                + "  |  equal join conjunct: 4: v4 = 1: v1\n"
-                + "  |  equal join conjunct: 5: v5 = 2: v2\n"
-                + "  |  other join predicates: CAST(CAST(3: v3 <= 3: v3 AS BIGINT) < 6: v6 AS BIGINT) = 5: v5\n");
+        assertContains(plan, "|  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 4: v4\n" +
+                "  |  equal join conjunct: 2: v2 = 5: v5\n" +
+                "  |  other join predicates: CAST(CAST(3: v3 <= 3: v3 AS BIGINT) < 6: v6 AS BIGINT) = 5: v5");
     }
 
     @Test
@@ -359,10 +387,10 @@ public class JoinTest extends PlanTestBase {
                 + "        AND (subt0.v3 <= subt0.v3 < subt1.v6) = (subt1.v5)\n";
 
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "  |  colocate: false, reason: \n"
-                + "  |  equal join conjunct: 4: v4 = 1: v1\n"
-                + "  |  equal join conjunct: 5: v5 = 2: v2\n"
-                + "  |  other join predicates: CAST(CAST(3: v3 <= 3: v3 AS BIGINT) < 6: v6 AS BIGINT) = 5: v5\n");
+        assertContains(plan, "|  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 4: v4\n" +
+                "  |  equal join conjunct: 2: v2 = 5: v5\n" +
+                "  |  other join predicates: CAST(CAST(3: v3 <= 3: v3 AS BIGINT) < 6: v6 AS BIGINT) = 5: v5");
     }
 
     @Test
@@ -380,7 +408,6 @@ public class JoinTest extends PlanTestBase {
         String plan = getFragmentPlan(sql);
         assertContains(plan, "  2:HASH JOIN\n"
                 + "  |  join op: INNER JOIN (COLOCATE)\n"
-                + "  |  hash predicates:\n"
                 + "  |  colocate: true\n"
                 + "  |  equal join conjunct: 1: v1 = 4: v1");
         FeConstants.runningUnitTest = false;
@@ -399,10 +426,9 @@ public class JoinTest extends PlanTestBase {
                 "\n" +
                 "WHERE l1.tc < s0.t1c";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "  1:Project\n" +
+        assertContains(plan, " 1:Project\n" +
                 "  |  <slot 1> : 1: v1\n" +
                 "  |  <slot 4> : 49\n" +
-                "  |  <slot 26> : CAST(49 AS VARCHAR(1048576))\n" +
                 "  |  \n" +
                 "  0:OlapScanNode");
     }
@@ -435,6 +461,87 @@ public class JoinTest extends PlanTestBase {
     }
 
     @Test
+    public void testShuffleBucketShuffle() throws Exception {
+        FeConstants.runningUnitTest = true;
+        String sql =
+                "select a.v1, a.v4 from (select v1, v2, v4 from t0 join[shuffle] t1 on t0.v1 = t1.v4) a join[shuffle] " +
+                        "(select v7,v8, v10 from t2 join[shuffle] t3 on t2.v7 = t3.v10) b on a.v1 = b.v7 and a.v2 = b.v8";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, " 11:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 7: v7\n" +
+                "  |  equal join conjunct: 2: v2 = 8: v8\n" +
+                "  |  \n" +
+                "  |----10:Project\n" +
+                "  |    |  <slot 7> : 7: v7\n" +
+                "  |    |  <slot 8> : 8: v8\n" +
+                "  |    |  \n" +
+                "  |    9:HASH JOIN\n" +
+                "  |    |  join op: INNER JOIN (PARTITIONED)\n" +
+                "  |    |  colocate: false, reason: \n" +
+                "  |    |  equal join conjunct: 7: v7 = 10: v10\n" +
+                "  |    |  \n" +
+                "  |    |----8:EXCHANGE\n" +
+                "  |    |    \n" +
+                "  |    6:EXCHANGE\n" +
+                "  |    \n" +
+                "  4:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (PARTITIONED)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 4: v4");
+
+        sql = "select a.v1, a.v4 from (select v1, v2, v4 from t0 join[shuffle] t1 on t0.v1 = t1.v4) a join[shuffle] " +
+                "(select v7,v8, v10 from t2 join[shuffle] t3 on t2.v8 = t3.v10) b on a.v1 = b.v7 and a.v2 = b.v8";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "  12:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 7: v7\n" +
+                "  |  equal join conjunct: 2: v2 = 8: v8\n" +
+                "  |  \n" +
+                "  |----11:EXCHANGE\n" +
+                "  |    \n" +
+                "  4:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (PARTITIONED)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 4: v4\n");
+        sql = "select a.v1, a.v4 from (select v1, v2, v4 from t0 join[shuffle] t1 on t0.v1 = t1.v4) a join[shuffle] " +
+                "(select v7,v8 from t2) b on a.v1 = b.v7 and a.v2 = b.v8";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, " 7:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 7: v7\n" +
+                "  |  equal join conjunct: 2: v2 = 8: v8\n" +
+                "  |  \n" +
+                "  |----6:EXCHANGE\n" +
+                "  |    \n" +
+                "  4:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (PARTITIONED)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 4: v4");
+        assertContains(plan, "STREAM DATA SINK\n" +
+                "    EXCHANGE ID: 06\n" +
+                "    HASH_PARTITIONED: 7: v7");
+
+        sql = "select a.v1, a.v4 from (select v7,v8 from t2) b " +
+                "join[shuffle] (select v1, v2, v4 from t0 join[shuffle] t1 on t0.v2 = t1.v4) a " +
+                "on a.v1 = b.v7 and a.v2 = b.v8";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, " 8:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (PARTITIONED)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v7 = 4: v1\n" +
+                "  |  equal join conjunct: 2: v8 = 5: v2\n" +
+                "  |  \n" +
+                "  |----7:EXCHANGE\n" +
+                "  |    \n" +
+                "  1:EXCHANGE");
+        FeConstants.runningUnitTest = false;
+    }
+
+    @Test
     public void testSemiReorder() throws Exception {
         String sql = "select 0 from t0,t1 left semi join t2 on v4 = v7";
         String plan = getFragmentPlan(sql);
@@ -444,7 +551,7 @@ public class JoinTest extends PlanTestBase {
                 "\n" +
                 "  RESULT SINK\n" +
                 "\n" +
-                "  8:Project\n" +
+                "  9:Project\n" +
                 "  |  <slot 10> : 0\n" +
                 "  |  \n");
     }
@@ -484,7 +591,7 @@ public class JoinTest extends PlanTestBase {
             @Override
             public void addJoinTransformationRules() {
                 this.getTransformRules().clear();
-                this.getTransformRules().add(JoinAssociativityRule.getInstance());
+                this.getTransformRules().add(JoinAssociativityRule.INNER_JOIN_ASSOCIATIVITY_RULE);
             }
         };
 
@@ -496,29 +603,7 @@ public class JoinTest extends PlanTestBase {
         };
 
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "PLAN FRAGMENT 1\n" +
-                " OUTPUT EXPRS:\n" +
-                "  PARTITION: UNPARTITIONED\n" +
-                "\n" +
-                "  STREAM DATA SINK\n" +
-                "    EXCHANGE ID: 06\n" +
-                "    UNPARTITIONED\n" +
-                "\n" +
-                "  5:Project\n" +
-                "  |  <slot 4> : 4: v4\n" +
-                "  |  \n" +
-                "  4:HASH JOIN\n" +
-                "  |  join op: INNER JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
-                "  |  colocate: false, reason: \n" +
-                "  |  equal join conjunct: 4: v4 = 7: v10\n" +
-                "  |  equal join conjunct: 5: v5 = 7: v10\n" +
-                "  |  equal join conjunct: 10: cast = 8: v11\n" +
-                "  |  other join predicates: 4: v4 >= 7: v10, 5: v5 > 7: v10\n" +
-                "  |  \n" +
-                "  |----3:EXCHANGE\n" +
-                "  |    \n" +
-                "  1:EMPTYSET");
+        assertContains(plan, "0:EMPTYSET");
     }
 
     @Test
@@ -576,10 +661,9 @@ public class JoinTest extends PlanTestBase {
                 "limit \n" +
                 "  45;";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "6:Project\n" +
+        assertContains(plan, " 6:Project\n" +
                 "  |  <slot 3> : 3: t1c\n" +
-                "  |  <slot 21> : 37\n" +
-                "  |  <slot 40> : CAST(37 AS INT");
+                "  |  <slot 21> : 37");
     }
 
     @Test
@@ -599,19 +683,16 @@ public class JoinTest extends PlanTestBase {
         String sql = "select * from t0 as x0 inner join t0 as x1 on x0.v1 = x1.v1;";
         String plan = getFragmentPlan(sql);
         assertContains(plan, "  |  join op: INNER JOIN (COLOCATE)\n"
-                + "  |  hash predicates:\n"
                 + "  |  colocate: true");
 
         sql = "select * from t0 as x0 inner join[shuffle] t0 as x1 on x0.v1 = x1.v1;";
         plan = getFragmentPlan(sql);
         assertContains(plan, "  |  join op: INNER JOIN (PARTITIONED)\n"
-                + "  |  hash predicates:\n"
                 + "  |  colocate: false, reason: ");
 
         sql = "select * from t0 as x0 inner join[colocate] t0 as x1 on x0.v1 = x1.v1;";
         plan = getFragmentPlan(sql);
         assertContains(plan, "  |  join op: INNER JOIN (COLOCATE)\n"
-                + "  |  hash predicates:\n"
                 + "  |  colocate: true");
         FeConstants.runningUnitTest = false;
     }
@@ -622,19 +703,16 @@ public class JoinTest extends PlanTestBase {
         String sql = "select * from t0 as x0 inner join t1 as x1 on x0.v1 = x1.v4;";
         String plan = getFragmentPlan(sql);
         assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n"
-                + "  |  hash predicates:\n"
                 + "  |  colocate: false, reason: ");
 
         sql = "select * from t0 as x0 inner join[shuffle] t1 as x1 on x0.v1 = x1.v4;";
         plan = getFragmentPlan(sql);
         assertContains(plan, "  |  join op: INNER JOIN (PARTITIONED)\n"
-                + "  |  hash predicates:\n"
                 + "  |  colocate: false, reason: ");
 
         sql = "select * from t0 as x0 inner join[bucket] t1 as x1 on x0.v1 = x1.v4;";
         plan = getFragmentPlan(sql);
         assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n"
-                + "  |  hash predicates:\n"
                 + "  |  colocate: false, reason: ");
         FeConstants.runningUnitTest = false;
     }
@@ -644,7 +722,7 @@ public class JoinTest extends PlanTestBase {
         String sql =
                 "select a.id_datetime from test_all_type as a join test_all_type as b where a.id_date in (b.id_date)";
         String plan = getFragmentPlan(sql);
-        Assert.assertFalse(plan.contains("CAST(9: id_date AS DATETIME)"));
+        assertNotContains(plan, "CAST(9: id_date AS DATETIME)");
         assertContains(plan, "equal join conjunct: 9: id_date = 19: id_date");
     }
 
@@ -652,16 +730,9 @@ public class JoinTest extends PlanTestBase {
     public void testOnlyCrossJoin() throws Exception {
         String sql = "select * from t0 as x0 join t1 as x1 on (1 = 2) is not null;";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "3:CROSS JOIN\n" +
-                "  |  cross join:\n" +
-                "  |  predicates is NULL");
-    }
-
-    @Test
-    public void testFailedLeftJoin() {
-        String sql = "select * from t0 as x0 left outer join t1 as x1 on (1 = 2) is not null";
-        Assert.assertThrows("No equal on predicate in LEFT OUTER JOIN is not supported", SemanticException.class,
-                () -> getFragmentPlan(sql));
+        assertContains(plan, "3:NESTLOOP JOIN\n" +
+                "  |  join op: CROSS JOIN\n" +
+                "  |  colocate: false, reason: \n");
     }
 
     @Test
@@ -675,9 +746,8 @@ public class JoinTest extends PlanTestBase {
                 "             AND (v3 IN (SELECT v1 FROM t0)));";
         // check no exception
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "12:HASH JOIN\n" +
+        assertContains(plan, "11:HASH JOIN\n" +
                 "  |  join op: LEFT OUTER JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 5: v2 = 24: v1");
     }
@@ -712,7 +782,7 @@ public class JoinTest extends PlanTestBase {
 
         sql = "select * from t0,t1 where v1 = v4";
         plan = getVerboseExplain(sql);
-        Assert.assertFalse(plan.contains("output columns"));
+        assertNotContains(plan, "output columns");
     }
 
     @Test
@@ -733,9 +803,10 @@ public class JoinTest extends PlanTestBase {
     public void testCrossJoinOnPredicate() throws Exception {
         String sql = "select * from t0 cross join t1 on t0.v1 != t1.v4 and t0.v2 != t1.v5";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "  3:CROSS JOIN\n" +
-                "  |  cross join:\n" +
-                "  |  predicates: 1: v1 != 4: v4, 2: v2 != 5: v5");
+        assertContains(plan, "  3:NESTLOOP JOIN\n" +
+                "  |  join op: INNER JOIN\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  other join predicates: 1: v1 != 4: v4, 2: v2 != 5: v5\n");
     }
 
     @Test
@@ -744,7 +815,6 @@ public class JoinTest extends PlanTestBase {
         String plan = getFragmentPlan(sql);
         assertContains(plan, "  3:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 1: v1 = 4: v4\n" +
                 "  |  other join predicates: 2: v2 != 5: v5");
@@ -768,7 +838,6 @@ public class JoinTest extends PlanTestBase {
         String plan = getFragmentPlan(sql);
         assertContains(plan, " 8:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 2: v2 = 8: v8\n" +
                 "  |  equal join conjunct: 1: v1 = 7: v7");
@@ -784,13 +853,11 @@ public class JoinTest extends PlanTestBase {
         plan = getFragmentPlan(sql);
         assertContains(plan, "12:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 7: v7 = 10: v10\n" +
                 "  |  equal join conjunct: 8: v8 = 11: v11");
         assertContains(plan, "8:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 2: v2 = 8: v8\n" +
                 "  |  equal join conjunct: 1: v1 = 7: v7");
@@ -806,7 +873,6 @@ public class JoinTest extends PlanTestBase {
         plan = getFragmentPlan(sql);
         assertContains(plan, " 8:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 2: v2 = 8: v8\n" +
                 "  |  equal join conjunct: 1: v1 = 7: v7");
@@ -822,7 +888,6 @@ public class JoinTest extends PlanTestBase {
         plan = getFragmentPlan(sql);
         assertContains(plan, "12:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 1: v1 = 10: v10\n" +
                 "  |  equal join conjunct: 2: v2 = 11: v11");
@@ -844,7 +909,6 @@ public class JoinTest extends PlanTestBase {
         plan = getFragmentPlan(sql);
         assertContains(plan, "8:HASH JOIN\n" +
                 "  |  join op: LEFT OUTER JOIN (BUCKET_SHUFFLE(S))\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 3: v3 = 6: v6\n" +
                 "  |  equal join conjunct: 1: v1 = 4: v4\n" +
@@ -856,14 +920,13 @@ public class JoinTest extends PlanTestBase {
                 "    EXCHANGE ID: 05\n" +
                 "    HASH_PARTITIONED: 9: v9, 7: v7, 8: v8");
 
-        sql =
-                "select a.v1, a.v4, b.v7, b.v10 from (select v1, v2, v4 from t0 join[shuffle] t1 on t0.v1 = t1.v4 and t0.v2 = t1.v5) a join[shuffle] " +
-                        "(select v7, v8, v10 from t2 join[shuffle] t3 on t2.v7 = t3.v10 and t2.v8 = t3.v11) b " +
-                        "on a.v2 = b.v8 and a.v1 = b.v7";
+        sql = "select a.v1, a.v4, b.v7, b.v10 " +
+                "from (select v1, v2, v4 from t0 join[shuffle] t1 on t0.v1 = t1.v4 and t0.v2 = t1.v5) a join[shuffle] " +
+                "(select v7, v8, v10 from t2 join[shuffle] t3 on t2.v7 = t3.v10 and t2.v8 = t3.v11) b " +
+                "on a.v2 = b.v8 and a.v1 = b.v7";
         plan = getFragmentPlan(sql);
         assertContains(plan, "12:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 2: v2 = 8: v8\n" +
                 "  |  equal join conjunct: 1: v1 = 7: v7");
@@ -881,20 +944,18 @@ public class JoinTest extends PlanTestBase {
                 "    HASH_PARTITIONED: 2: v2, 1: v1");
 
         // check can not adjust column orders
-        sql =
-                "select a.v1, a.v4, b.v7, b.v10 from (select v1, v2, v4, v5 from t0 join[shuffle] t1 on t0.v1 = t1.v4 and t0.v2 = t1.v5) a join[shuffle] " +
-                        "(select v7, v8, v10, v11 from t2 join[shuffle] t3 on t2.v7 = t3.v10 and t2.v8 = t3.v11) b " +
-                        "on a.v2 = b.v8 and a.v4 = b.v8";
+        sql = "select a.v1, a.v4, b.v7, b.v10 from " +
+                "(select v1, v2, v4, v5 from t0 join[shuffle] t1 on t0.v1 = t1.v4 and t0.v2 = t1.v5) a join[shuffle] " +
+                "(select v7, v8, v10, v11 from t2 join[shuffle] t3 on t2.v7 = t3.v10 and t2.v8 = t3.v11) b " +
+                "on a.v2 = b.v8 and a.v4 = b.v8";
         plan = getFragmentPlan(sql);
         assertContains(plan, "14:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 2: v2 = 8: v8\n" +
                 "  |  equal join conjunct: 4: v4 = 8: v8");
         assertContains(plan, " 11:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 7: v7 = 10: v10\n" +
                 "  |  equal join conjunct: 8: v8 = 11: v11");
@@ -906,20 +967,18 @@ public class JoinTest extends PlanTestBase {
                 "    HASH_PARTITIONED: 10: v10, 11: v11");
 
         // check can not adjust column orders
-        sql =
-                "select a.v1, a.v4, b.v7, b.v10 from (select v1, v2, v4, v5 from t0 join[shuffle] t1 on t0.v1 = t1.v4 and t0.v2 = t1.v5) a join[shuffle] " +
-                        "(select v7, v8, v10, v11 from t2 join[shuffle] t3 on t2.v7 = t3.v10 and t2.v8 = t3.v11) b " +
-                        "on a.v2 = b.v8 and a.v4 = b.v10";
+        sql = "select a.v1, a.v4, b.v7, b.v10 " +
+                "from (select v1, v2, v4, v5 from t0 join[shuffle] t1 on t0.v1 = t1.v4 and t0.v2 = t1.v5) a join[shuffle] " +
+                "(select v7, v8, v10, v11 from t2 join[shuffle] t3 on t2.v7 = t3.v10 and t2.v8 = t3.v11) b " +
+                "on a.v2 = b.v8 and a.v4 = b.v10";
         plan = getFragmentPlan(sql);
         assertContains(plan, "14:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 2: v2 = 8: v8\n" +
                 "  |  equal join conjunct: 4: v4 = 10: v10");
         assertContains(plan, "11:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 7: v7 = 10: v10\n" +
                 "  |  equal join conjunct: 8: v8 = 11: v11");
@@ -930,19 +989,25 @@ public class JoinTest extends PlanTestBase {
     public void testJoinOnPredicateRewrite() throws Exception {
         String sql = "select * from t0 left outer join t1 on v1=v4 and cast(v2 as bigint) = v5 and false";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "equal join conjunct: 1: v1 = 4: v4");
-        assertContains(plan, "1:EMPTYSET");
+        assertContains(plan, "  1:Project\n" +
+                "  |  <slot 1> : 1: v1\n" +
+                "  |  <slot 2> : 2: v2\n" +
+                "  |  <slot 3> : 3: v3\n" +
+                "  |  <slot 4> : NULL\n" +
+                "  |  <slot 5> : NULL\n" +
+                "  |  <slot 6> : NULL\n" +
+                "  |  \n" +
+                "  0:OlapScanNode\n" +
+                "     TABLE: t0");
     }
 
     @Test
     public void testSemiJoinFalsePredicate() throws Exception {
         String sql = "select * from t0 left semi join t3 on t0.v1 = t3.v10 " +
-                "AND CASE WHEN NULL THEN t0.v1 ELSE '' END = CASE WHEN true THEN 'fGrak3iTt' WHEN false THEN t3.v10 ELSE 'asf' END";
+                "AND CASE WHEN NULL THEN t0.v1 ELSE '' END = " +
+                "CASE WHEN true THEN 'fGrak3iTt' WHEN false THEN t3.v10 ELSE 'asf' END";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "  |  join op: RIGHT SEMI JOIN (PARTITIONED)\n" +
-                "  |  hash predicates:\n" +
-                "  |  colocate: false, reason: \n" +
-                "  |  equal join conjunct: 4: v10 = 1: v1");
+        assertContains(plan, "0:EMPTYSET");
     }
 
     @Test
@@ -951,9 +1016,10 @@ public class JoinTest extends PlanTestBase {
         String sql = "select t0.v1 from t0, t1, t2, t3 where t0.v1 + t3.v10 = 2";
         String plan = getFragmentPlan(sql);
         connectContext.getSessionVariable().setMaxTransformReorderJoins(4);
-        assertContains(plan, "11:CROSS JOIN\n" +
-                "  |  cross join:\n" +
-                "  |  predicates: 1: v1 + 10: v10 = 2");
+        assertContains(plan, "13:NESTLOOP JOIN\n" +
+                "  |  join op: INNER JOIN\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  other join predicates: 1: v1 + 10: v10 = 2");
     }
 
     @Test
@@ -975,7 +1041,6 @@ public class JoinTest extends PlanTestBase {
         plan = getFragmentPlan(sql);
         assertContains(plan, "3:HASH JOIN\n" +
                 "  |  join op: FULL OUTER JOIN (BUCKET_SHUFFLE)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 1: v1 = 4: v4\n" +
                 "  |  \n" +
@@ -1048,71 +1113,67 @@ public class JoinTest extends PlanTestBase {
     @Test
     public void testJoinReorderTakeEffect() throws Exception {
         GlobalStateMgr globalStateMgr = connectContext.getGlobalStateMgr();
-        Database db = globalStateMgr.getDb("default_cluster:test");
-        Table table = db.getTable("join2");
+        Database db = globalStateMgr.getLocalMetastore().getDb("test");
+        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), "join2");
         OlapTable olapTable1 = (OlapTable) table;
-        new Expectations(olapTable1) {
-            {
-                olapTable1.getRowCount();
-                result = 2L;
-                minTimes = 0;
-            }
-        };
-        String sql = "select * from join1 join join2 on join1.id = join2.id;";
-        String explainString = getFragmentPlan(sql);
-        Assert.assertTrue(explainString.contains("  3:HASH JOIN\n" +
-                "  |  join op: INNER JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
-                "  |  colocate: false, reason: \n" +
-                "  |  equal join conjunct: 2: id = 5: id"));
-        Assert.assertTrue(explainString.contains("  0:OlapScanNode\n" +
-                "     TABLE: join1"));
-        Assert.assertTrue(explainString.contains("  1:OlapScanNode\n" +
-                "     TABLE: join2"));
+        try {
+            setTableStatistics(olapTable1, 2);
+            String sql = "select * from join1 join join2 on join1.id = join2.id;";
+            String explainString = getFragmentPlan(sql);
+            Assert.assertTrue(explainString.contains("  3:HASH JOIN\n" +
+                    "  |  join op: INNER JOIN (BROADCAST)\n" +
+                    "  |  colocate: false, reason: \n" +
+                    "  |  equal join conjunct: 2: id = 5: id"));
+            Assert.assertTrue(explainString.contains("  0:OlapScanNode\n" +
+                    "     TABLE: join1"));
+            Assert.assertTrue(explainString.contains("  1:OlapScanNode\n" +
+                    "     TABLE: join2"));
+        } finally {
+            setTableStatistics(olapTable1, 0);
+        }
     }
 
     @Test
     public void testJoinReorderWithWithClause() throws Exception {
-        connectContext.setDatabase("default_cluster:test");
+        connectContext.setDatabase("test");
         GlobalStateMgr globalStateMgr = connectContext.getGlobalStateMgr();
-        Table table = globalStateMgr.getDb("default_cluster:test").getTable("join2");
+        Table table = globalStateMgr.getLocalMetastore().getDb("test").getTable("join2");
         OlapTable olapTable1 = (OlapTable) table;
-        new Expectations(olapTable1) {
-            {
-                olapTable1.getRowCount();
-                result = 2L;
-                minTimes = 0;
-            }
-        };
-        String sql =
-                "WITH t_temp AS (select join1.id as id1,  join2.id as id2 from join1 join join2 on join1.id = join2.id) select * from t_temp";
-        String explainString = getFragmentPlan(sql);
-        Assert.assertTrue(explainString.contains("equal join conjunct: 8: id = 11: id"));
-        Assert.assertTrue(explainString.contains("  |----2:EXCHANGE\n" +
-                "  |    \n" +
-                "  0:OlapScanNode\n" +
-                "     TABLE: join1"));
-        Assert.assertTrue(explainString.contains("  1:OlapScanNode\n" +
-                "     TABLE: join2\n" +
-                "     PREAGGREGATION: ON"));
+        try {
+            setTableStatistics(olapTable1, 2);
+            String sql = "WITH t_temp AS (select join1.id as id1, " +
+                    "join2.id as id2 from join1 join join2 on join1.id = join2.id) select * from t_temp";
+            String explainString = getFragmentPlan(sql);
+            Assert.assertTrue(explainString, explainString.contains("equal join conjunct: 2: id = 5: id"));
+            Assert.assertTrue(explainString, explainString.contains("  |----2:EXCHANGE\n" +
+                    "  |    \n" +
+                    "  0:OlapScanNode\n" +
+                    "     TABLE: join1"));
+            Assert.assertTrue(explainString, explainString.contains("  1:OlapScanNode\n" +
+                    "     TABLE: join2\n" +
+                    "     PREAGGREGATION: ON"));
+        } finally {
+            setTableStatistics(olapTable1, 0);
+        }
     }
 
-    // todo(ywb) disable replicate join temporarily
+    @Test
+    @Ignore("disable replicate join temporarily")
     public void testReplicatedJoin() throws Exception {
         connectContext.getSessionVariable().setEnableReplicationJoin(true);
         String sql = "select * from join1 join join2 on join1.id = join2.id;";
         String plan = getFragmentPlan(sql);
         assertContains(plan, "join op: INNER JOIN (REPLICATED)");
-        Assert.assertFalse(plan.contains("EXCHANGE"));
+        assertNotContains(plan, "EXCHANGE");
 
         sql = "select * from join2 right join join1 on join1.id = join2.id;";
         plan = getFragmentPlan(sql);
-        Assert.assertFalse(plan.contains("join op: INNER JOIN (REPLICATED)"));
+        assertNotContains(plan, "join op: INNER JOIN (REPLICATED)");
 
         sql = "select * from join1 as a join (select sum(id),id from join2 group by id) as b on a.id = b.id;";
         plan = getFragmentPlan(sql);
         assertContains(plan, "join op: INNER JOIN (REPLICATED)");
-        Assert.assertFalse(plan.contains("EXCHANGE"));
+        assertNotContains(plan, "EXCHANGE");
 
         connectContext.getSessionVariable().setNewPlanerAggStage(2);
         sql = "select * from join1 as a join (select sum(id),dt from join2 group by dt) as b on a.id = b.dt;";
@@ -1123,11 +1184,11 @@ public class JoinTest extends PlanTestBase {
 
         sql = "select a.* from join1 as a join join1 as b ;";
         plan = getFragmentPlan(sql);
-        Assert.assertFalse(plan.contains("EXCHANGE"));
+        assertNotContains(plan, "EXCHANGE");
 
         sql = "select a.* from join1 as a join (select sum(id) from join1 group by dt) as b ;";
         plan = getFragmentPlan(sql);
-        Assert.assertFalse(plan.contains("EXCHANGE"));
+        assertNotContains(plan, "EXCHANGE");
 
         connectContext.getSessionVariable().setNewPlanerAggStage(2);
         sql = "select a.* from join1 as a join (select sum(id) from join1 group by dt) as b ;";
@@ -1194,8 +1255,8 @@ public class JoinTest extends PlanTestBase {
     public void testColocateCoverReplicate() throws Exception {
         FeConstants.runningUnitTest = true;
         String sql = "select * from join1 join join1 as xx on join1.id = xx.id;";
-        String planFragment = getFragmentPlan(sql);
-        Assert.assertTrue(planFragment.contains("  |  join op: INNER JOIN (COLOCATE)\n"));
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "  |  join op: INNER JOIN (COLOCATE)\n");
         FeConstants.runningUnitTest = false;
     }
 
@@ -1206,56 +1267,56 @@ public class JoinTest extends PlanTestBase {
         Assert.assertTrue(explainString.contains("  2:OlapScanNode\n" +
                 "     TABLE: join2\n" +
                 "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: round(2, 0) > 3"));
+                "     PREDICATES: CAST(round(2.0, 0) AS DOUBLE) > 3.0"));
 
         sql = "select * from test.join1 right semi join test.join2 on join1.id = join2.id where round(2.0, 0) > 3.0";
         explainString = getFragmentPlan(sql);
         Assert.assertTrue(explainString.contains("  0:OlapScanNode\n" +
                 "     TABLE: join2\n" +
                 "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: round(2, 0) > 3"));
+                "     PREDICATES: CAST(round(2.0, 0) AS DOUBLE) > 3.0"));
 
         sql = "select * from test.join1 right anti join test.join2 on join1.id = join2.id where round(2.0, 0) > 3.0";
         explainString = getFragmentPlan(sql);
         Assert.assertTrue(explainString.contains("  0:OlapScanNode\n" +
                 "     TABLE: join2\n" +
                 "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: round(2, 0) > 3"));
+                "     PREDICATES: CAST(round(2.0, 0) AS DOUBLE) > 3.0"));
 
         sql = "select * from test.join1 left join test.join2 on join1.id = join2.id where round(2.0, 0) > 3.0";
         explainString = getFragmentPlan(sql);
-        Assert.assertTrue(explainString.contains("  2:OlapScanNode\n" +
+        Assert.assertTrue(explainString.contains("0:OlapScanNode\n" +
                 "     TABLE: join1\n" +
                 "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: round(2, 0) > 3"));
+                "     PREDICATES: CAST(round(2.0, 0) AS DOUBLE) > 3.0"));
 
         sql = "select * from test.join1 left semi join test.join2 on join1.id = join2.id where round(2.0, 0) > 3.0";
         explainString = getFragmentPlan(sql);
         Assert.assertTrue(explainString.contains("  0:OlapScanNode\n" +
                 "     TABLE: join1\n" +
                 "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: round(2, 0) > 3"));
+                "     PREDICATES: CAST(round(2.0, 0) AS DOUBLE) > 3.0"));
 
         sql = "select * from test.join1 left anti join test.join2 on join1.id = join2.id where round(2.0, 0) > 3.0";
         explainString = getFragmentPlan(sql);
         Assert.assertTrue(explainString.contains("  0:OlapScanNode\n" +
                 "     TABLE: join1\n" +
                 "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: round(2, 0) > 3"));
+                "     PREDICATES: CAST(round(2.0, 0) AS DOUBLE) > 3.0"));
 
         sql = "select * from test.join1 inner join test.join2 on join1.id = join2.id where round(2.0, 0) > 3.0";
         explainString = getFragmentPlan(sql);
-        Assert.assertTrue(explainString.contains("  0:OlapScanNode\n" +
+        assertContains(explainString, "  0:OlapScanNode\n" +
                 "     TABLE: join1\n" +
                 "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: round(2, 0) > 3"));
+                "     PREDICATES: CAST(round(2.0, 0) AS DOUBLE) > 3.0");
 
         sql = "select * from test.join1 where round(2.0, 0) > 3.0";
         explainString = getFragmentPlan(sql);
         Assert.assertTrue(explainString.contains("  0:OlapScanNode\n" +
                 "     TABLE: join1\n" +
                 "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: round(2, 0) > 3"));
+                "     PREDICATES: CAST(round(2.0, 0) AS DOUBLE) > 3.0"));
     }
 
     @Test
@@ -1274,7 +1335,7 @@ public class JoinTest extends PlanTestBase {
     }
 
     @Test
-    public void TestSemiJoinNameResolve() {
+    public void testSemiJoinNameResolve() {
         String sql = "select join1.dt from  test.join1 right semi join test.join2 on join1.id = join2.id";
         starRocksAssert.query(sql).analysisError("Column '`join1`.`dt`' cannot be resolved");
 
@@ -1285,15 +1346,15 @@ public class JoinTest extends PlanTestBase {
 
     @Test
     public void testLeftOuterJoinOnOrPredicate() throws Exception {
-        connectContext.setDatabase("default_cluster:test");
+        connectContext.setDatabase("test");
 
         String sql = "select * from join1 left join join2 on join1.id = join2.id\n" +
                 "and (join2.id > 1 or join2.id < 10);";
         String explainString = getFragmentPlan(sql);
 
-        Assert.assertTrue(explainString.contains("join op: LEFT OUTER JOIN (BROADCAST)"));
-        Assert.assertTrue(explainString.contains("PREDICATES: (5: id > 1) OR (5: id < 10)"));
-        Assert.assertTrue(explainString.contains("equal join conjunct: 2: id = 5: id"));
+        assertContains(explainString, "join op: LEFT OUTER JOIN (BROADCAST)");
+        assertContains(explainString, "PREDICATES: (5: id > 1) OR (5: id < 10)");
+        assertContains(explainString, "equal join conjunct: 2: id = 5: id");
     }
 
     @Test
@@ -1304,18 +1365,18 @@ public class JoinTest extends PlanTestBase {
         String explainString = getFragmentPlan(queryStr);
         Assert.assertTrue(explainString.contains("colocate: true"));
 
-        queryStr =
-                "select * from test.colocate1 t1 join (select k1, k2 from test.colocate2 group by k1, k2) t2 on t1.k1 = t2.k1 and t1.k2 = t2.k2";
+        queryStr = "select * from test.colocate1 t1 join " +
+                "(select k1, k2 from test.colocate2 group by k1, k2) t2 on t1.k1 = t2.k1 and t1.k2 = t2.k2";
         explainString = getFragmentPlan(queryStr);
         Assert.assertTrue(explainString.contains("colocate: true"));
 
-        queryStr =
-                "select * from test.colocate1 t1 join (select k1, k2 from test.colocate2 group by k1, k2, k3) t2 on t1.k1 = t2.k1 and t1.k2 = t2.k2";
+        queryStr = "select * from test.colocate1 t1 " +
+                "join (select k1, k2 from test.colocate2 group by k1, k2, k3) t2 on t1.k1 = t2.k1 and t1.k2 = t2.k2";
         explainString = getFragmentPlan(queryStr);
         Assert.assertTrue(explainString.contains("colocate: true"));
 
-        queryStr =
-                "select * from (select k1, k2 from test.colocate1 group by k1, k2) t1 join (select k1, k2 from test.colocate2 group by k1, k2) t2 on t1.k1 = t2.k1 and t1.k2 = t2.k2";
+        queryStr = "select * from (select k1, k2 from test.colocate1 group by k1, k2) t1 " +
+                "join (select k1, k2 from test.colocate2 group by k1, k2) t2 on t1.k1 = t2.k1 and t1.k2 = t2.k2";
         explainString = getFragmentPlan(queryStr);
         Assert.assertTrue(explainString.contains("colocate: true"));
 
@@ -1352,7 +1413,6 @@ public class JoinTest extends PlanTestBase {
                 "where join2.id > 1;";
         starRocksAssert.query(sql).explainContains("  3:HASH JOIN\n" +
                         "  |  join op: INNER JOIN (BROADCAST)\n" +
-                        "  |  hash predicates:\n" +
                         "  |  colocate: false, reason: \n" +
                         "  |  equal join conjunct: 2: id = 5: id",
                 "  0:OlapScanNode\n" +
@@ -1369,7 +1429,6 @@ public class JoinTest extends PlanTestBase {
                 "where join2.id > 1 or join2.id < 10 ;";
         starRocksAssert.query(sql).explainContains("  3:HASH JOIN\n" +
                         "  |  join op: INNER JOIN (BROADCAST)\n" +
-                        "  |  hash predicates:\n" +
                         "  |  colocate: false, reason: \n" +
                         "  |  equal join conjunct: 2: id = 5: id",
                 "  1:OlapScanNode\n" +
@@ -1383,7 +1442,6 @@ public class JoinTest extends PlanTestBase {
         //        getFragmentPlan(sql);
         starRocksAssert.query(sql).explainContains("  3:HASH JOIN\n" +
                 "  |  join op: LEFT OUTER JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 2: id = 5: id\n" +
                 "  |  other predicates: (5: id > 1) OR (5: id IS NULL)");
@@ -1393,7 +1451,6 @@ public class JoinTest extends PlanTestBase {
                 "where b.id > 1;";
         starRocksAssert.query(sql).explainContains("  3:HASH JOIN\n" +
                         "  |  join op: INNER JOIN (BROADCAST)\n" +
-                        "  |  hash predicates:\n" +
                         "  |  colocate: false, reason: \n" +
                         "  |  equal join conjunct: 2: id = 5: id",
                 "  0:OlapScanNode\n" +
@@ -1410,7 +1467,6 @@ public class JoinTest extends PlanTestBase {
                 "where b.id > 1;";
         starRocksAssert.query(sql).explainContains("  3:HASH JOIN\n" +
                         "  |  join op: INNER JOIN (BROADCAST)\n" +
-                        "  |  hash predicates:\n" +
                         "  |  colocate: false, reason: \n" +
                         "  |  equal join conjunct: 2: id = 5: id",
                 "  0:OlapScanNode\n" +
@@ -1427,7 +1483,6 @@ public class JoinTest extends PlanTestBase {
                 "where join2.id is null;";
         starRocksAssert.query(sql).explainContains("  3:HASH JOIN\n" +
                 "  |  join op: LEFT OUTER JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 2: id = 5: id\n" +
                 "  |  other predicates: 5: id IS NULL");
@@ -1437,7 +1492,6 @@ public class JoinTest extends PlanTestBase {
                 "group by join2.id having join2.id > 1;";
         starRocksAssert.query(sql).explainContains("  4:HASH JOIN\n" +
                         "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                        "  |  hash predicates:\n" +
                         "  |  colocate: false, reason: \n" +
                         "  |  equal join conjunct: 2: id = 5: id",
                 "  0:OlapScanNode\n" +
@@ -1458,7 +1512,6 @@ public class JoinTest extends PlanTestBase {
                         "  |  having: 7: count > 1",
                 "  3:HASH JOIN\n" +
                         "  |  join op: LEFT OUTER JOIN (BROADCAST)\n" +
-                        "  |  hash predicates:\n" +
                         "  |  colocate: false, reason: \n" +
                         "  |  equal join conjunct: 2: id = 5: id");
 
@@ -1467,7 +1520,6 @@ public class JoinTest extends PlanTestBase {
                 "where join1.id > 1;";
         starRocksAssert.query(sql).explainContains("  3:HASH JOIN\n" +
                         "  |  join op: INNER JOIN (BROADCAST)\n" +
-                        "  |  hash predicates:\n" +
                         "  |  colocate: false, reason: \n" +
                         "  |  equal join conjunct: 2: id = 5: id",
                 "  0:OlapScanNode\n" +
@@ -1483,7 +1535,6 @@ public class JoinTest extends PlanTestBase {
         sql = "select * from join1 full outer join join2 on join1.id = join2.id\n" +
                 "where join1.id > 1;";
         starRocksAssert.query(sql).explainContains("  |  join op: LEFT OUTER JOIN (BROADCAST)\n" +
-                        "  |  hash predicates:\n" +
                         "  |  colocate: false, reason: \n" +
                         "  |  equal join conjunct: 2: id = 5: id",
                 "  0:OlapScanNode\n" +
@@ -1499,7 +1550,6 @@ public class JoinTest extends PlanTestBase {
                 "where join1.id > 1;";
         starRocksAssert.query(sql).explainContains("  3:HASH JOIN\n" +
                         "  |  join op: LEFT OUTER JOIN (BROADCAST)\n" +
-                        "  |  hash predicates:\n" +
                         "  |  colocate: false, reason: \n" +
                         "  |  equal join conjunct: 2: id = 5: id\n" +
                         "  |  other join predicates: 1: dt != 2",
@@ -1517,7 +1567,6 @@ public class JoinTest extends PlanTestBase {
                 "where join2.id > 1;";
         starRocksAssert.query(sql).explainContains("  4:HASH JOIN\n" +
                         "  |  join op: RIGHT OUTER JOIN (PARTITIONED)\n" +
-                        "  |  hash predicates:\n" +
                         "  |  colocate: false, reason: \n" +
                         "  |  equal join conjunct: 2: id = 5: id",
                 "  2:OlapScanNode\n" +
@@ -1534,7 +1583,6 @@ public class JoinTest extends PlanTestBase {
                 "where join2.id > 1 and join1.id > 10;";
         starRocksAssert.query(sql).explainContains("  3:HASH JOIN\n" +
                         "  |  join op: INNER JOIN (BROADCAST)\n" +
-                        "  |  hash predicates:\n" +
                         "  |  colocate: false, reason: \n" +
                         "  |  equal join conjunct: 2: id = 5: id",
                 "  0:OlapScanNode\n" +
@@ -1553,19 +1601,17 @@ public class JoinTest extends PlanTestBase {
 
         starRocksAssert.query(sql).explainContains("7:HASH JOIN\n" +
                         "  |  join op: LEFT OUTER JOIN (BUCKET_SHUFFLE(S))\n" +
-                        "  |  hash predicates:\n" +
                         "  |  colocate: false, reason: \n" +
                         "  |  equal join conjunct: 2: id = 8: id",
                 "4:HASH JOIN\n" +
                         "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                        "  |  hash predicates:\n" +
                         "  |  colocate: false, reason: \n" +
-                        "  |  equal join conjunct: 5: id = 2: id",
-                "0:OlapScanNode\n" +
+                        "  |  equal join conjunct: 2: id = 5: id\n",
+                "2:OlapScanNode\n" +
                         "     TABLE: join2\n" +
                         "     PREAGGREGATION: ON\n" +
                         "     PREDICATES: 5: id > 1",
-                "2:OlapScanNode\n" +
+                "0:OlapScanNode\n" +
                         "     TABLE: join1\n" +
                         "     PREAGGREGATION: ON\n" +
                         "     PREDICATES: 2: id > 1");
@@ -1573,21 +1619,19 @@ public class JoinTest extends PlanTestBase {
         sql = "select * from join1 left join join2 as b on join1.id = b.id\n" +
                 "left join join2 as c on join1.id = c.id \n" +
                 "where b.dt > 1 and c.dt > 1;";
-        starRocksAssert.query(sql).explainContains("6:HASH JOIN\n" +
-                        "  |  join op: INNER JOIN (BROADCAST)\n" +
-                        "  |  hash predicates:\n" +
+        assertContains(starRocksAssert.query(sql).explainQuery(), "  7:HASH JOIN\n" +
+                        "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
                         "  |  colocate: false, reason: \n" +
                         "  |  equal join conjunct: 2: id = 8: id",
-                "  3:HASH JOIN\n" +
-                        "  |  join op: INNER JOIN (BROADCAST)\n" +
-                        "  |  hash predicates:\n" +
+                "  4:HASH JOIN\n" +
+                        "  |  join op: INNER JOIN (PARTITIONED)\n" +
                         "  |  colocate: false, reason: \n" +
                         "  |  equal join conjunct: 2: id = 5: id",
-                "  4:OlapScanNode\n" +
+                "  5:OlapScanNode\n" +
                         "     TABLE: join2\n" +
                         "     PREAGGREGATION: ON\n" +
                         "     PREDICATES: 7: dt > 1",
-                "  1:OlapScanNode\n" +
+                "  2:OlapScanNode\n" +
                         "     TABLE: join2\n" +
                         "     PREAGGREGATION: ON\n" +
                         "     PREDICATES: 4: dt > 1");
@@ -1596,25 +1640,23 @@ public class JoinTest extends PlanTestBase {
     @Test
     public void testJoinReorderWithReanalyze() throws Exception {
         GlobalStateMgr globalStateMgr = connectContext.getGlobalStateMgr();
-        Table table = globalStateMgr.getDb("default_cluster:test").getTable("join2");
+        Table table = globalStateMgr.getLocalMetastore().getDb("test").getTable("join2");
         OlapTable olapTable1 = (OlapTable) table;
-        new Expectations(olapTable1) {
-            {
-                olapTable1.getRowCount();
-                result = 2L;
-                minTimes = 0;
-            }
-        };
-        String sql = "select * from join1 join join2 on join1.id = join2.id and 1 < join1.id ";
-        String plan = getFragmentPlan(sql);
-        assertContains(plan, "  0:OlapScanNode\n" +
-                "     TABLE: join1\n" +
-                "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: 2: id > 1");
-        assertContains(plan, "  1:OlapScanNode\n" +
-                "     TABLE: join2\n" +
-                "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: 5: id > 1");
+        try {
+            setTableStatistics(olapTable1, 2);
+            String sql = "select * from join1 join join2 on join1.id = join2.id and 1 < join1.id ";
+            String plan = getFragmentPlan(sql);
+            assertContains(plan, "  0:OlapScanNode\n" +
+                    "     TABLE: join1\n" +
+                    "     PREAGGREGATION: ON\n" +
+                    "     PREDICATES: 2: id > 1");
+            assertContains(plan, "  1:OlapScanNode\n" +
+                    "     TABLE: join2\n" +
+                    "     PREAGGREGATION: ON\n" +
+                    "     PREDICATES: 5: id > 1");
+        } finally {
+            setTableStatistics(olapTable1, 0);
+        }
     }
 
     @Test
@@ -1625,13 +1667,8 @@ public class JoinTest extends PlanTestBase {
                 " union select join2.id from join1 RIGHT ANTI JOIN join2 on join1.id = join2.id " +
                 " and 1 > 2 WHERE (NOT (true)) group by join2.id ";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "4:HASH JOIN\n" +
-                "  |  join op: LEFT ANTI JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
-                "  |  colocate: false, reason: \n" +
-                "  |  equal join conjunct: 5: id = 2: id");
-        assertContains(plan, "  2:EMPTYSET\n");
-        assertContains(plan, "  8:EMPTYSET\n");
+        assertNotContains(plan, "HASH JOIN");
+        assertNotContains(plan, "EMPTYSET\n");
         FeConstants.runningUnitTest = false;
     }
 
@@ -1641,14 +1678,12 @@ public class JoinTest extends PlanTestBase {
                 "SELECT 1 FROM join1 RIGHT ANTI JOIN join2 on join1.id = join2.id and join2.dt = 1 FULL OUTER JOIN "
                         + "pushdown_test on join2.dt = pushdown_test.k3 WHERE join2.value != join2.value";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "  9:HASH JOIN\n" +
-                "  |  join op: RIGHT OUTER JOIN (PARTITIONED)\n" +
-                "  |  hash predicates:\n" +
+        assertContains(plan, "8:HASH JOIN\n" +
+                "  |  join op: LEFT OUTER JOIN (BROADCAST)\n" +
                 "  |  colocate: false, reason: \n" +
-                "  |  equal join conjunct: 9: k3 = 4: dt");
-        assertContains(plan, "  6:HASH JOIN\n" +
+                "  |  equal join conjunct: 4: dt = 9: k3");
+        assertContains(plan, "4:HASH JOIN\n" +
                 "  |  join op: LEFT ANTI JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 5: id = 2: id\n" +
                 "  |  other join predicates: 4: dt = 1");
@@ -1660,39 +1695,29 @@ public class JoinTest extends PlanTestBase {
                 "SELECT 1 FROM join1 RIGHT ANTI JOIN join2 on join1.id = join2.id FULL OUTER JOIN "
                         + "pushdown_test on join2.dt = pushdown_test.k3 WHERE join2.value != join2.value";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "  9:HASH JOIN\n" +
-                "  |  join op: RIGHT OUTER JOIN (PARTITIONED)\n" +
-                "  |  hash predicates:\n" +
+        assertContains(plan, "8:HASH JOIN\n" +
+                "  |  join op: LEFT OUTER JOIN (BROADCAST)\n" +
                 "  |  colocate: false, reason: \n" +
-                "  |  equal join conjunct: 9: k3 = 4: dt");
-        assertContains(plan, "  6:HASH JOIN\n" +
+                "  |  equal join conjunct: 4: dt = 9: k3");
+        assertContains(plan, "4:HASH JOIN\n" +
                 "  |  join op: LEFT ANTI JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 5: id = 2: id");
     }
 
     @Test
     public void testJoinConst() throws Exception {
-        String sql =
-                "with user_info as (select 2 as user_id, 'mike' as user_name), address as (select 1 as user_id, 'newzland' as address_name) \n" +
-                        "select * from address a right join user_info b on b.user_id=a.user_id;";
+        String sql = "with user_info as (select 2 as user_id, 'mike' as user_name), " +
+                "address as (select 1 as user_id, 'newzland' as address_name) \n" +
+                "select * from address a right join user_info b on b.user_id=a.user_id;";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "  6:HASH JOIN\n" +
-                "  |  join op: RIGHT OUTER JOIN (PARTITIONED)\n" +
-                "  |  hash predicates:\n" +
-                "  |  colocate: false, reason: \n" +
-                "  |  equal join conjunct: 8: expr = 11: expr");
-        assertContains(plan, "  4:Project\n" +
-                "  |  <slot 11> : 2\n" +
-                "  |  <slot 12> : 'mike'\n" +
-                "  |  \n" +
-                "  3:UNION\n" +
-                "     constant exprs: \n" +
-                "         NULL");
-        assertContains(plan, "  1:Project\n" +
-                "  |  <slot 8> : 1\n" +
-                "  |  <slot 9> : 'newzland'\n" +
+        assertContains(plan, "RESULT SINK\n" +
+                "\n" +
+                "  1:Project\n" +
+                "  |  <slot 2> : NULL\n" +
+                "  |  <slot 3> : NULL\n" +
+                "  |  <slot 5> : 2\n" +
+                "  |  <slot 6> : 'mike'\n" +
                 "  |  \n" +
                 "  0:UNION\n" +
                 "     constant exprs: \n" +
@@ -1735,7 +1760,6 @@ public class JoinTest extends PlanTestBase {
         explainString = getFragmentPlan(sql);
         Assert.assertTrue(explainString.contains("  3:HASH JOIN\n" +
                 "  |  join op: LEFT OUTER JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 2: id = 5: id\n" +
                 "  |  other join predicates: 2: id > 1"));
@@ -1755,10 +1779,10 @@ public class JoinTest extends PlanTestBase {
                 "left join join2 on join1.id = join2.id\n" +
                 "where join2.id > 1;";
         explainString = getFragmentPlan(sql);
-        Assert.assertTrue(explainString.contains("  1:OlapScanNode\n" +
+        assertContains(explainString, "  1:OlapScanNode\n" +
                 "     TABLE: join2\n" +
                 "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: 5: id > 1"));
+                "     PREDICATES: 5: id > 1");
 
         // test left join: right table join predicate, only push down right table
         sql = "select *\n from join1\n" +
@@ -1853,7 +1877,6 @@ public class JoinTest extends PlanTestBase {
                 "     PREDICATES: 5: id > 1"));
         Assert.assertTrue(explainString.contains("  3:HASH JOIN\n" +
                 "  |  join op: LEFT ANTI JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 2: id = 5: id"));
 
@@ -1864,7 +1887,6 @@ public class JoinTest extends PlanTestBase {
         explainString = getFragmentPlan(sql);
         Assert.assertTrue(explainString.contains("  3:HASH JOIN\n" +
                 "  |  join op: LEFT SEMI JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 2: id = 5: id"));
         Assert.assertTrue(explainString.contains("  1:OlapScanNode\n" +
@@ -1879,7 +1901,6 @@ public class JoinTest extends PlanTestBase {
         explainString = getFragmentPlan(sql);
         Assert.assertTrue(explainString.contains("  3:HASH JOIN\n" +
                 "  |  join op: LEFT ANTI JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 2: id = 5: id\n" +
                 "  |  other join predicates: 2: id > 1"));
@@ -1891,7 +1912,6 @@ public class JoinTest extends PlanTestBase {
         explainString = getFragmentPlan(sql);
         Assert.assertTrue(explainString.contains("  3:HASH JOIN\n" +
                 "  |  join op: LEFT SEMI JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 2: id = 5: id"));
         Assert.assertTrue(explainString.contains("  0:OlapScanNode\n" +
@@ -1905,15 +1925,14 @@ public class JoinTest extends PlanTestBase {
                 "left anti join join2 on join1.id = join2.id\n" +
                 "where join1.id > 1;";
         explainString = getFragmentPlan(sql);
-        Assert.assertTrue(explainString.contains("  4:HASH JOIN\n" +
-                "  |  join op: RIGHT ANTI JOIN (PARTITIONED)\n" +
-                "  |  hash predicates:\n" +
+        assertContains(explainString, "3:HASH JOIN\n" +
+                "  |  join op: LEFT ANTI JOIN (BROADCAST)\n" +
                 "  |  colocate: false, reason: \n" +
-                "  |  equal join conjunct: 5: id = 2: id"));
-        Assert.assertTrue(explainString.contains("  2:OlapScanNode\n" +
+                "  |  equal join conjunct: 2: id = 5: id");
+        assertContains(explainString, "0:OlapScanNode\n" +
                 "     TABLE: join1\n" +
                 "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: 2: id > 1"));
+                "     PREDICATES: 2: id > 1");
 
         // test semi join, left table where predicate, only push to left table
         sql = "select join1.id\n" +
@@ -1921,15 +1940,14 @@ public class JoinTest extends PlanTestBase {
                 "left semi join join2 on join1.id = join2.id\n" +
                 "where join1.id > 1;";
         explainString = getFragmentPlan(sql);
-        Assert.assertTrue(explainString.contains("  3:HASH JOIN\n" +
+        assertContains(explainString, "  3:HASH JOIN\n" +
                 "  |  join op: LEFT SEMI JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
-                "  |  equal join conjunct: 2: id = 5: id"));
-        Assert.assertTrue(explainString.contains("  0:OlapScanNode\n" +
+                "  |  equal join conjunct: 2: id = 5: id");
+        assertContains(explainString, "  0:OlapScanNode\n" +
                 "     TABLE: join1\n" +
                 "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: 2: id > 1"));
+                "     PREDICATES: 2: id > 1");
     }
 
     @Test
@@ -1940,9 +1958,8 @@ public class JoinTest extends PlanTestBase {
                 "    SELECT MAX(k9)\n" +
                 "    FROM test.pushdown_test);";
         String plan = starRocksAssert.query(sql).explainQuery();
-        assertContains(plan, "  3:SELECT\n" +
-                "  |  predicates: CAST(23: max AS DOUBLE) > 0.0\n" +
-                "  |  \n" +
+        assertContains(plan, "    UNPARTITIONED\n" +
+                "\n" +
                 "  2:AGGREGATE (update finalize)\n" +
                 "  |  output: max(22: k9)\n" +
                 "  |  group by: \n" +
@@ -2008,7 +2025,6 @@ public class JoinTest extends PlanTestBase {
                 "  |  \n" +
                 "  9:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 1: v4 = 10: cast");
     }
@@ -2042,7 +2058,7 @@ public class JoinTest extends PlanTestBase {
     public void testEquivalenceLoopDependency() throws Exception {
         String sql = "select * from t0 join t1 on t0.v1 = t1.v4 and cast(t0.v1 as STRING) = t0.v1";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "|  equal join conjunct: 1: v1 = 4: v4");
+        assertContains(plan, "equal join conjunct: 4: v4 = 1: v1");
         assertContains(plan, "     TABLE: t0\n" +
                 "     PREAGGREGATION: ON\n" +
                 "     PREDICATES: CAST(1: v1 AS VARCHAR(65533)) = CAST(1: v1 AS VARCHAR(1048576))\n" +
@@ -2051,7 +2067,7 @@ public class JoinTest extends PlanTestBase {
 
     @Test
     public void testJoinCastFloat() throws Exception {
-        String sql = "select * from t1, t3 right semi join test_all_type as a on t3.v10 = a.t1a and 1 > 2;";
+        String sql = "select * from t1, t3 right semi join test_all_type as a on t3.v10 = a.t1a and 1 > abs(2);";
         String plan = getFragmentPlan(sql);
         assertContains(plan, "equal join conjunct: 7: t1a = 17: cast");
     }
@@ -2060,61 +2076,44 @@ public class JoinTest extends PlanTestBase {
     public void testWherePredicatesToOnPredicate() throws Exception {
         String sql =
                 "SELECT t0.v1 from t0 join test_all_type on t0.v2 = test_all_type.t1d where t0.v1 = test_all_type.t1d";
-        String planFragment = getFragmentPlan(sql);
-        Assert.assertTrue(planFragment.contains("join op: INNER JOIN"));
-        Assert.assertTrue(planFragment.contains("  |  equal join conjunct: 2: v2 = 7: t1d\n"
-                + "  |  equal join conjunct: 1: v1 = 7: t1d"));
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "join op: INNER JOIN");
+        assertContains(plan, "  |  equal join conjunct: 2: v2 = 7: t1d\n"
+                + "  |  equal join conjunct: 1: v1 = 7: t1d");
     }
 
     @Test
     public void testDeriveOutputColumns() throws Exception {
-        String sql = "select \n" +
-                "  rand() as c0, \n" +
-                "  round(\n" +
-                "    cast(\n" +
-                "      rand() as DOUBLE\n" +
-                "    )\n" +
-                "  ) as c1 \n" +
-                "from \n" +
-                "  (\n" +
-                "    select \n" +
-                "      subq_0.v1 as c0 \n" +
-                "    from \n" +
-                "      (\n" +
-                "        select \n" +
-                "          v1,v2,v3\n" +
-                "        from \n" +
-                "          t0 as ref_0 \n" +
-                "        where \n" +
-                "          ref_0.v1 = ref_0.v2 \n" +
-                "        limit \n" +
-                "          72\n" +
+        String sql = "select rand() as c0, round(cast(rand() as DOUBLE)) as c1 \n" +
+                "from (\n" +
+                "    select subq_0.v1 as c0 \n" +
+                "    from ( select v1,v2,v3\n" +
+                "        from t0 as ref_0 \n" +
+                "        where ref_0.v1 = ref_0.v2 \n" +
+                "        limit 72\n" +
                 "      ) as subq_0 \n" +
                 "      right join t1 as ref_1 on (subq_0.v3 = ref_1.v5) \n" +
-                "    where \n" +
-                "      subq_0.v2 <> subq_0.v3 \n" +
-                "    limit \n" +
-                "      126\n" +
-                "  ) as subq_1 \n" +
-                "where \n" +
-                "  66 <= unix_timestamp() \n" +
-                "limit \n" +
-                "  155;";
+                "    where subq_0.v2 <> subq_0.v3 \n" +
+                "    limit 126 ) as subq_1 \n" +
+                "where 66 <= unix_timestamp() \n" +
+                "limit 155;";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "7:Project\n" +
-                "  |  <slot 2> : 2: v2");
+        assertContains(plan, "  7:Project\n" +
+                "  |  <slot 7> : rand()\n" +
+                "  |  <slot 8> : round(rand())\n" +
+                "  |  limit: 126");
     }
 
     @Test
     public void testEmptyTableDisableBucketJoin() throws Exception {
-        String sql =
-                "select colocate1.k1 from colocate1 join[bucket] test_agg on colocate1.k1 = test_agg.k1 and colocate1.k2 = test_agg.k2";
+        String sql = "select colocate1.k1 from colocate1 " +
+                "join[bucket] test_agg on colocate1.k1 = test_agg.k1 and colocate1.k2 = test_agg.k2";
         String plan = getFragmentPlan(sql);
         assertContains(plan, " 4:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (PARTITIONED)");
 
-        sql =
-                "select colocate1.k1 from colocate1 join[bucket] colocate2 on colocate1.k1 = colocate2.k2 and colocate1.k2 = colocate2.k3";
+        sql = "select colocate1.k1 from colocate1 " +
+                "join[bucket] colocate2 on colocate1.k1 = colocate2.k2 and colocate1.k2 = colocate2.k3";
         plan = getFragmentPlan(sql);
         assertContains(plan, "4:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (PARTITIONED)");
@@ -2133,78 +2132,10 @@ public class JoinTest extends PlanTestBase {
         plan = getFragmentPlan(sql);
         assertContains(plan, " 5:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                "  |  hash predicates:\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 1: t1a = 21: cast\n" +
                 "  |  equal join conjunct: 22: cast = 11: t1a");
         FeConstants.runningUnitTest = false;
-    }
-
-    @Test
-    public void testParallelism() throws Exception {
-        int numCores = 8;
-        int expectedParallelism = numCores / 2;
-        new MockUp<BackendCoreStat>() {
-            @Mock
-            public int getAvgNumOfHardwareCoresOfBe() {
-                return numCores;
-            }
-        };
-
-        SessionVariable sessionVariable = connectContext.getSessionVariable();
-        boolean enablePipeline = sessionVariable.isEnablePipelineEngine();
-        int pipelineDop = sessionVariable.getPipelineDop();
-        int parallelExecInstanceNum = sessionVariable.getParallelExecInstanceNum();
-
-        try {
-            // Enable DopAutoEstimate.
-            sessionVariable.setEnablePipelineEngine(true);
-            sessionVariable.setPipelineDop(0);
-            sessionVariable.setParallelExecInstanceNum(1);
-            FeConstants.runningUnitTest = true;
-
-            // Case 1: local bucket shuffle join should use fragment instance parallel.
-            String sql = "select a.v1 from t0 a join [bucket] t0 b on a.v1 = b.v2 and a.v2 = b.v1";
-            ExecPlan plan = getExecPlan(sql);
-            PlanFragment fragment = plan.getFragments().get(1);
-            assertContains(fragment.getExplainString(TExplainLevel.NORMAL), "join op: INNER JOIN (BUCKET_SHUFFLE)");
-            Assert.assertEquals(expectedParallelism, fragment.getParallelExecNum());
-            Assert.assertEquals(1, fragment.getPipelineDop());
-
-            // Case 2: colocate join should use fragment instance parallel.
-            sql = "select * from colocate1 left join colocate2 " +
-                    "on colocate1.k1=colocate2.k1 and colocate1.k2=colocate2.k2;";
-            plan = getExecPlan(sql);
-            fragment = plan.getFragments().get(1);
-            assertContains(fragment.getExplainString(TExplainLevel.NORMAL), "join op: LEFT OUTER JOIN (COLOCATE)");
-            Assert.assertEquals(expectedParallelism, fragment.getParallelExecNum());
-            Assert.assertEquals(1, fragment.getPipelineDop());
-
-            // Case 3: broadcast join should use pipeline parallel.
-            sql = "select a.v1 from t0 a join [broadcast] t0 b on a.v1 = b.v2 and a.v2 = b.v1";
-            plan = getExecPlan(sql);
-            fragment = plan.getFragments().get(1);
-            assertContains(fragment.getExplainString(TExplainLevel.NORMAL), "join op: INNER JOIN (BROADCAST)");
-            Assert.assertEquals(1, fragment.getParallelExecNum());
-            Assert.assertEquals(expectedParallelism, fragment.getPipelineDop());
-
-            // Case 4: local bucket shuffle join succeeded by broadcast should use fragment instance parallel.
-            sql = "select a.v1 from t0 a " +
-                    "join [bucket] t0 b on a.v1 = b.v2 and a.v2 = b.v1 " +
-                    "join [broadcast] t0 c on a.v1 = c.v2";
-            plan = getExecPlan(sql);
-            fragment = plan.getFragments().get(1);
-            String fragmentString = fragment.getExplainString(TExplainLevel.NORMAL);
-            assertContains(fragmentString, "join op: INNER JOIN (BROADCAST)");
-            assertContains(fragmentString, "join op: INNER JOIN (BUCKET_SHUFFLE)");
-            Assert.assertEquals(expectedParallelism, fragment.getParallelExecNum());
-            Assert.assertEquals(1, fragment.getPipelineDop());
-        } finally {
-            sessionVariable.setEnablePipelineEngine(enablePipeline);
-            sessionVariable.setPipelineDop(pipelineDop);
-            sessionVariable.setParallelExecInstanceNum(parallelExecInstanceNum);
-            FeConstants.runningUnitTest = false;
-        }
     }
 
     @Test
@@ -2225,7 +2156,6 @@ public class JoinTest extends PlanTestBase {
                     "select * from ( select * from t0 join[shuffle] t1 on t0.v2 = t1.v5 ) s1 join[shuffle] t2 on s1.v5 = t2.v8";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 5: v5 = 8: v8\n" +
                     "  |  \n" +
@@ -2233,7 +2163,6 @@ public class JoinTest extends PlanTestBase {
                     "  |    \n" +
                     "  4:HASH JOIN\n" +
                     "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 2: v2 = 5: v5");
         }
@@ -2243,7 +2172,6 @@ public class JoinTest extends PlanTestBase {
                             "join[shuffle] t2 on s1.v2 = t2.v8 and s1.v6 = t2.v9";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 2: v2 = 8: v8\n" +
                     "  |  equal join conjunct: 6: v6 = 9: v9\n" +
@@ -2252,7 +2180,6 @@ public class JoinTest extends PlanTestBase {
                     "  |    \n" +
                     "  4:HASH JOIN\n" +
                     "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 2: v2 = 5: v5\n" +
                     "  |  equal join conjunct: 3: v3 = 6: v6");
@@ -2263,7 +2190,6 @@ public class JoinTest extends PlanTestBase {
                             "join[shuffle] t2 on s1.v5 = t2.v8 and s1.v3 = t2.v9";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 5: v5 = 8: v8\n" +
                     "  |  equal join conjunct: 3: v3 = 9: v9\n" +
@@ -2272,7 +2198,6 @@ public class JoinTest extends PlanTestBase {
                     "  |    \n" +
                     "  4:HASH JOIN\n" +
                     "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 2: v2 = 5: v5\n" +
                     "  |  equal join conjunct: 3: v3 = 6: v6");
@@ -2283,7 +2208,6 @@ public class JoinTest extends PlanTestBase {
                             "join[shuffle] t2 on s1.v5 = t2.v8 and s1.v6 = t2.v9";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 5: v5 = 8: v8\n" +
                     "  |  equal join conjunct: 6: v6 = 9: v9\n" +
@@ -2292,7 +2216,6 @@ public class JoinTest extends PlanTestBase {
                     "  |    \n" +
                     "  4:HASH JOIN\n" +
                     "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 2: v2 = 5: v5\n" +
                     "  |  equal join conjunct: 3: v3 = 6: v6");
@@ -2305,7 +2228,6 @@ public class JoinTest extends PlanTestBase {
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  7:HASH JOIN\n" +
                     "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 6: v6 = 9: v9\n" +
                     "  |  equal join conjunct: 5: v5 = 8: v8\n" +
@@ -2314,7 +2236,6 @@ public class JoinTest extends PlanTestBase {
                     "  |    \n" +
                     "  4:HASH JOIN\n" +
                     "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 2: v2 = 5: v5\n" +
                     "  |  equal join conjunct: 3: v3 = 6: v6\n" +
@@ -2343,7 +2264,6 @@ public class JoinTest extends PlanTestBase {
                     "select * from ( select * from t0 join[bucket] t1 on t0.v1 = t1.v4 ) s1 join[bucket] t2 on s1.v4 = t2.v7";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 4: v4 = 7: v7");
         }
@@ -2353,7 +2273,6 @@ public class JoinTest extends PlanTestBase {
                     "select * from ( select * from t0 join[bucket] t1 on t1.v4 = t0.v1 ) s1 join[bucket] t2 on s1.v4 = t2.v7";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 4: v4 = 7: v7");
         }
@@ -2363,7 +2282,6 @@ public class JoinTest extends PlanTestBase {
                     "select * from ( select t1.v4 from t0 join[bucket] t1 on t0.v1 = t1.v4 ) s1 join[bucket] t2 on s1.v4 = t2.v7";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 4: v4 = 7: v7");
         }
@@ -2376,7 +2294,6 @@ public class JoinTest extends PlanTestBase {
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  9:HASH JOIN\n" +
                     "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 4: v4 = 10: v10");
         }
@@ -2388,7 +2305,6 @@ public class JoinTest extends PlanTestBase {
                             "join[bucket] t3 on t2.v7 = t3.v10";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 7: v7 = 10: v10");
         }
@@ -2401,7 +2317,6 @@ public class JoinTest extends PlanTestBase {
                             "join[bucket] t4 on t3.v10 = t4.v13";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 10: v10 = 13: v13");
         }
@@ -2417,7 +2332,6 @@ public class JoinTest extends PlanTestBase {
                             "join[bucket] t2 on s1.v1 = t2.v7 and s1.v5 = t2.v8";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 1: v1 = 7: v7\n" +
                     "  |  equal join conjunct: 5: v5 = 8: v8");
@@ -2428,7 +2342,6 @@ public class JoinTest extends PlanTestBase {
                             "join[bucket] t2 on s1.v4 = t2.v7 and s1.v2 = t2.v8";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 4: v4 = 7: v7\n" +
                     "  |  equal join conjunct: 2: v2 = 8: v8");
@@ -2439,7 +2352,6 @@ public class JoinTest extends PlanTestBase {
                             "join[bucket] t2 on s1.v4 = t2.v7 and s1.v5 = t2.v8";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 4: v4 = 7: v7\n" +
                     "  |  equal join conjunct: 5: v5 = 8: v8");
@@ -2451,24 +2363,23 @@ public class JoinTest extends PlanTestBase {
     public void testColocateSingleJoinEqEquivalentPropertyInfo() throws Exception {
         FeConstants.runningUnitTest = true;
         {
-            String sql =
-                    "select * from ( select * from colocate_t0 join[colocate] colocate_t1 on colocate_t0.v1 = colocate_t1.v4 ) s1 " +
-                            "join[bucket] colocate_t2 on s1.v4 = colocate_t2.v7";
+            String sql = "select * from ( select * from colocate_t0 " +
+                    "join[colocate] colocate_t1 on colocate_t0.v1 = colocate_t1.v4 ) s1 " +
+                    "join[bucket] colocate_t2 on s1.v4 = colocate_t2.v7";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 4: v4 = 7: v7");
         }
         {
-            String sql =
-                    "select * from ( select * from colocate_t0 join[colocate] colocate_t1 on colocate_t0.v1 = colocate_t1.v4 ) s1, " +
-                            "( select * from colocate_t2 join[colocate] colocate_t3 on colocate_t2.v7 = colocate_t3.v10 ) s2 " +
-                            "where s1.v4 = s2.v10";
+            String sql = "select * from ( select * from colocate_t0 " +
+                    "join[colocate] colocate_t1 on colocate_t0.v1 = colocate_t1.v4 ) s1, " +
+                    "( select * from colocate_t2 join[colocate] colocate_t3 " +
+                    "on colocate_t2.v7 = colocate_t3.v10 ) s2 " +
+                    "where s1.v4 = s2.v10";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  7:HASH JOIN\n" +
                     "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 4: v4 = 10: v10");
         }
@@ -2479,7 +2390,6 @@ public class JoinTest extends PlanTestBase {
                             "join [colocate] colocate_t3 on s1.v7 = colocate_t3.v10";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 4: v7 = 7: v10\n" +
                     "  |  \n" +
@@ -2487,7 +2397,6 @@ public class JoinTest extends PlanTestBase {
                     "  |    \n" +
                     "  3:HASH JOIN\n" +
                     "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 1: v1 = 4: v7");
         }
@@ -2498,20 +2407,19 @@ public class JoinTest extends PlanTestBase {
     public void testJoinOnPredicateCommutativityNotInnerJoin() throws Exception {
         FeConstants.runningUnitTest = true;
         {
-            String sql =
-                    "select * from ( select * from t0 left join[bucket] t1 on t0.v1 = t1.v4 ) s1 join[bucket] t2 on s1.v4 = t2.v7";
+            String sql = "select * from ( select * from t0 left join[bucket] t1 on t0.v1 = t1.v4 ) s1 " +
+                    "join[bucket] t2 on s1.v4 = t2.v7";
             String plan = getFragmentPlan(sql);
-            assertContains(plan, "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                    "  |  hash predicates:\n" +
+            assertContains(plan, "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 4: v4 = 7: v7");
         }
         {
-            String sql =
-                    "select * from ( select * from t0 right join[bucket] t1 on t0.v1 = t1.v4 ) s1 join[bucket] t2 on s1.v4 = t2.v7";
+            String sql = "select * from ( select * from t0 right join[bucket] t1 on t0.v1 = t1.v4 ) s1 " +
+                    "join[bucket] t2 on s1.v4 = t2.v7";
             String plan = getFragmentPlan(sql);
-            assertContains(plan, "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                    "  |  hash predicates:\n" +
+            assertContains(plan, "6:HASH JOIN\n" +
+                    "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 4: v4 = 7: v7");
         }
@@ -2527,7 +2435,6 @@ public class JoinTest extends PlanTestBase {
                             "join[bucket] t2 on s1.v5 = t2.v8";
             String plan = getFragmentPlan(sql);
             assertContains(plan, "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                    "  |  hash predicates:\n" +
                     "  |  colocate: false, reason: \n" +
                     "  |  equal join conjunct: 5: v5 = 8: v8\n" +
                     "  |  \n" +
@@ -2556,62 +2463,37 @@ public class JoinTest extends PlanTestBase {
     public void testValueNodeJoin() throws Exception {
         String sql = "select count(*) from (select test_all_type.t1c as left_int, " +
                 "test_all_type1.t1c as right_int from (select * from test_all_type limit 0) " +
-                "test_all_type cross join (select * from test_all_type limit 0) test_all_type1 cross join (select * from test_all_type limit 0) test_all_type6) t;";
+                "test_all_type cross join (select * from test_all_type limit 0) test_all_type1 " +
+                "cross join (select * from test_all_type limit 0) test_all_type6) t;";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "1:EMPTYSET");
-        assertContains(plan, "2:EMPTYSET");
+        assertContains(plan, "1:AGGREGATE (update finalize)\n" +
+                "  |  output: count(*)\n" +
+                "  |  group by: \n" +
+                "  |  \n" +
+                "  0:EMPTYSET");
     }
 
     @Test
     public void testSemiJoinReorderProjections() throws Exception {
         String sql = "WITH with_t_0 as (\n" +
-                "  SELECT \n" +
-                "    t1_3.t1b, \n" +
-                "    t1_3.t1d \n" +
-                "  FROM \n" +
-                "    test_all_type AS t1_3 \n" +
-                "  WHERE \n" +
-                "    (\n" +
-                "      (\n" +
-                "        SELECT \n" +
-                "          t1_3.t1a \n" +
-                "        FROM \n" +
-                "          test_all_type AS t1_3\n" +
-                "      )\n" +
-                "    ) < (\n" +
-                "      (\n" +
-                "        SELECT \n" +
-                "          11\n" +
-                "      )\n" +
-                "    )\n" +
+                "  SELECT t1_3.t1b, t1_3.t1d \n" +
+                "  FROM test_all_type AS t1_3 \n" +
+                "  WHERE ((SELECT t1_3.t1a FROM test_all_type AS t1_3)) < ((SELECT 11))\n" +
                 ") \n" +
                 "SELECT \n" +
                 "  SUM(count) \n" +
-                "FROM \n" +
-                "  (\n" +
-                "    SELECT \n" +
+                "FROM (SELECT \n" +
                 "      CAST(false AS INT) as count \n" +
-                "    FROM \n" +
-                "      test_all_type AS t1_3 FULL \n" +
+                "    FROM test_all_type AS t1_3 FULL \n" +
                 "      JOIN (\n" +
-                "        SELECT \n" +
-                "          with_t_0.t1b \n" +
-                "        FROM \n" +
-                "          with_t_0 AS with_t_0 \n" +
-                "        WHERE \n" +
-                "          (with_t_0.t1d) IN (\n" +
-                "            (\n" +
-                "              SELECT \n" +
-                "                t1_3.t1d \n" +
-                "              FROM \n" +
-                "                test_all_type AS t1_3\n" +
-                "            )\n" +
-                "          )\n" +
+                "        SELECT with_t_0.t1b \n" +
+                "        FROM with_t_0 AS with_t_0 \n" +
+                "        WHERE (with_t_0.t1d) IN ((SELECT t1_3.t1d FROM test_all_type AS t1_3))\n" +
                 "      ) subwith_t_0 ON t1_3.id_decimal = subwith_t_0.t1b\n" +
                 "  ) t;";
         String plan = getFragmentPlan(sql);
         // check no error
-        assertContains(plan, "16:ASSERT NUMBER OF ROWS");
+        assertContains(plan, "11:ASSERT NUMBER OF ROWS");
     }
 
     @Test
@@ -2619,16 +2501,7 @@ public class JoinTest extends PlanTestBase {
         String sql = "select * from t0 full outer join t2 on t0.v1 = t2.v7 and t0.v1 > t2.v7 " +
                 "where t0.v2 in (select t1.v4 from t1 where false)";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "  7:HASH JOIN\n" +
-                "  |  join op: LEFT SEMI JOIN (BROADCAST)\n" +
-                "  |  hash predicates:\n" +
-                "  |  colocate: false, reason: \n" +
-                "  |  equal join conjunct: 2: v2 = 7: v4\n" +
-                "  |  \n" +
-                "  |----6:EXCHANGE\n" +
-                "  |    \n" +
-                "  4:HASH JOIN\n" +
-                "  |  join op: FULL OUTER JOIN (PARTITIONED)");
+        assertContains(plan, "0:EMPTYSET");
     }
 
     @Test
@@ -2636,11 +2509,12 @@ public class JoinTest extends PlanTestBase {
         // supported
         String sql = "select * from t0 join t2 on t0.v1 < t2.v7";
         String plan = getVerboseExplain(sql);
-        assertContains(plan, "  3:CROSS JOIN\n" +
-                "  |  cross join:\n" +
-                "  |  predicates: 1: v1 < 4: v7\n" +
+        assertContains(plan, "  3:NESTLOOP JOIN\n" +
+                "  |  join op: INNER JOIN\n" +
+                "  |  other join predicates: [1: v1, BIGINT, true] < [4: v7, BIGINT, true]\n" +
                 "  |  build runtime filters:\n" +
-                "  |  - filter_id = 0, build_expr = (4: v7), remote = false");
+                "  |  - filter_id = 0, build_expr = (4: v7), remote = false\n" +
+                "  |  cardinality: 1\n");
 
         sql = "select * from t0 join t2 on t0.v1 + t2.v7 < 2";
         plan = getVerboseExplain(sql);
@@ -2652,19 +2526,780 @@ public class JoinTest extends PlanTestBase {
 
         sql = "select * from t0 join t2 on t0.v1 < t2.v7 + t2.v8";
         plan = getVerboseExplain(sql);
-        assertContains(plan, "  3:CROSS JOIN\n" +
-                "  |  cross join:\n" +
-                "  |  predicates: 1: v1 < 4: v7 + 5: v8\n" +
+        assertContains(plan, "  3:NESTLOOP JOIN\n" +
+                "  |  join op: INNER JOIN\n" +
+                "  |  other join predicates: [1: v1, BIGINT, true] < [4: v7, BIGINT, true] + [5: v8, BIGINT, true]\n" +
                 "  |  build runtime filters:\n" +
-                "  |  - filter_id = 0, build_expr = (4: v7 + 5: v8), remote = false");
+                "  |  - filter_id = 0, build_expr = (4: v7 + 5: v8), remote = false\n" +
+                "  |  cardinality: 1\n");
 
         // avoid push down CrossJoin RF across ExchangeNode
-        sql = "select * from t1 join [shuffle] t2 on v4 = v7 join t0 on v4 < v1 ";
-        plan = getVerboseExplain(sql);
+        /*
+        String sql = "select * from t1 join [shuffle] t2 on v4 = v7 join t0 on v4 < v1 ";
+        String plan = getVerboseExplain(sql);
         assertContains(plan, "  1:EXCHANGE\n" +
                 "     cardinality: 1\n" +
                 "     probe runtime filters:\n" +
                 "     - filter_id = 1, probe_expr = (1: v4)");
+         */
     }
 
+    @Test
+    public void testIsNotNullOnPredicate() throws Exception {
+        String sql = "select * from " +
+                "t0 left outer join t1 on t0.v3 = t1.v6 " +
+                "              join t2 on t1.v5 = t2.v8";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "PREDICATES: 5: v5 IS NOT NULL");
+        assertContains(plan, "PREDICATES: 8: v8 IS NOT NULL");
+        assertContains(plan, "PREDICATES: 3: v3 IS NOT NULL");
+    }
+
+    @Test
+    public void testIsNotNullWherePredicate() throws Exception {
+        String sql = "select * from " +
+                "t0 left outer join t1 on t0.v3 = t1.v6 " +
+                "              ,t2 " +
+                "where t1.v5 = t2.v8";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "PREDICATES: 5: v5 IS NOT NULL");
+        assertContains(plan, "PREDICATES: 8: v8 IS NOT NULL");
+        assertContains(plan, "PREDICATES: 3: v3 IS NOT NULL");
+    }
+
+    @Test
+    public void testJoinWithAnalytic() throws Exception {
+        FeConstants.runningUnitTest = true;
+        String sql = "SELECT t0.*, cnt\n" +
+                "FROM t0\n" +
+                "left outer JOIN (\n" +
+                "    SELECT *,\n" +
+                "    count(*) over(partition by v1) as cnt\n" +
+                "    FROM t0 \n" +
+                ") b\n" +
+                "ON t0.v1 = b.v1;";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "  4:HASH JOIN\n" +
+                "  |  join op: LEFT OUTER JOIN (COLOCATE)\n" +
+                "  |  colocate: true\n" +
+                "  |  equal join conjunct: 1: v1 = 4: v1");
+        FeConstants.runningUnitTest = false;
+    }
+
+    @Test
+    public void testComplexExpr() throws Exception {
+        String sql = "select count(v1) as c, if(v4 is not null, v4, '未知') as k2 from ( select A.v1, B.v4 from " +
+                "( select v1 from t0 where v2 = 1 ) A left join ( select v4, if( v5 = 0, '未知', if( v5 = 1, '广东', " +
+                "if( v5 = 2, '广西', if( v5 = 3, '北京', if( v5 = 4, '海南', if( v5 = 5, '福建', if( v5 = 6, '天津', " +
+                "if( v5 = 7, '湖南', if( v5 = 8, '湖北', if( v5 = 9, '河南', if( v5 = 10, '河北', if( v5 = 11, '山东', " +
+                "if( v5 = 12, '山西', if( v5 = 13, '黑龙江', if( v5 = 14, '辽宁', if( v5 = 15, '上海', if( v5 = 16, '甘肃', " +
+                "if( v5 = 17, '青海', if( v5 = 18, '新疆', if( v5 = 19, '西藏', if( v5 = 20, '宁夏', if( v5 = 21, '四川', " +
+                "if( v5 = 22, '云南', if( v5 = 23, '吉林', if( v5 = 24, '内蒙古', if( v5 = 25, '陕西', if( v5 = 26, '安徽', " +
+                "if( v5 = 27, '贵州', if( v5 = 28, '江苏', if( v5 = 29, '重庆', if( v5 = 30, '浙江', if( v5 = 31, '江西', " +
+                "if( v5 = 32, '国外', if( v5 = 33, '台湾', if(v5 = 34, '香港', if(v5 = 35, '澳门', 'Default')) ) ) ) ) ) ) " +
+                ") ) ) ) ) ) ) ) ) ) ) ) ) ) ) ) ) ) ) ) ) ) ) ) ) ) ) ) as k from t1 ) B on A.v1 = B.k ) C group by v4;";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "if(5: v5 = 0, '未知'");
+    }
+
+    @Test
+    public void testJoinKeyHasExpr() throws Exception {
+        String sql = "select subq_1.c0 from " +
+                "(select subq_0.c0 as c0, subq_0.c0 as c4, subq_0.c1 as c5, " +
+                "max(cast(subq_0.c0 as INT)) over (partition by ref_1.n_nationkey, subq_0.c0) as c8, ref_1.n_name as c13 " +
+                "from ( select ref_0.C_CUSTKEY as c0, ref_0.C_CUSTKEY as c1 from customer as ref_0 ) as subq_0 " +
+                "inner join nation as ref_1 on (subq_0.c0 = ref_1.n_name) ) as subq_1 where subq_1.c13 = subq_1.c5;";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "4:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (BROADCAST)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 11: N_NAME = 16: cast\n" +
+                "  |  equal join conjunct: 11: N_NAME = CAST(1: C_CUSTKEY AS VARCHAR(1048576))");
+    }
+
+    @Test
+    public void testComplexProjectionJoin() throws Exception {
+        connectContext.getSessionVariable().disableDPJoinReorder();
+        connectContext.getSessionVariable().disableGreedyJoinReorder();
+        connectContext.getSessionVariable().setMaxTransformReorderJoins(3);
+
+        String sql = "select * from t4 join (   \n" +
+                "    select abs(xx1) as xxx1 from t3 join (       \n" +
+                "        select abs(x1) as xx1 from t2 join (          \n" +
+                "            select abs(t0.v1) as x1 from t0 join t1 \n" +
+                "            on v1 = t1.v4) y1        \n" +
+                "        on t2.v7 = x1) y2    \n" +
+                "    on t3.v10 = xx1) y3  \n" +
+                "on t4.v13 = xxx1";
+
+        String plan = getFragmentPlan(sql);
+        connectContext.getSessionVariable().enableDPJoinReorder();
+        connectContext.getSessionVariable().enableGreedyJoinReorder();
+        connectContext.getSessionVariable().setMaxTransformReorderJoins(4);
+
+        assertContains(plan, "  13:Project\n" +
+                "  |  <slot 17> : abs(16: abs)\n" +
+                "  |  \n" +
+                "  12:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (BROADCAST)");
+    }
+
+    @Test
+    public void testSmallestColInJoin() throws Exception {
+        String sql = "select 1 from (select v1, v2, 3, 4, 'a' from t0) t, t1, t2 where t.v1 = t1.v4 and t2.v7 = 1";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "3:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (BROADCAST)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 7: v4\n" +
+                "  |  \n" +
+                "  |----2:EXCHANGE\n" +
+                "  |    \n" +
+                "  0:OlapScanNode");
+        sql = "select 1 from (select v1, v2, 3, 4, 'a' from t0) t, t1, t2";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "|----4:EXCHANGE\n" +
+                "  |    \n" +
+                "  1:Project\n" +
+                "  |  <slot 21> : 1\n" +
+                "  |  \n" +
+                "  0:OlapScanNode\n" +
+                "     TABLE: t0");
+    }
+
+    @Test
+    public void testShuffleAgg() throws Exception {
+        String sql = "select j0.* \n" +
+                "    from t6 j0 join[shuffle] t6 j1 on j0.v2 = j1.v2 and j0.v3 = j1.v3\n" +
+                "               join[shuffle] t6 j2 on j0.v2 = j2.v2 and j0.v3 = j2.v3 and j0.v4 = j2.v4\n" +
+                "               join[shuffle] (select v4,v2,v3 from t6 group by v4,v2,v3) j4 " +
+                "                             on j0.v2 =j4.v2 and j0.v3=j4.v3 and j0.v4 = j4.v4;\n" +
+                "\n";
+
+        connectContext.getSessionVariable().setNewPlanerAggStage(2);
+        String plan = getFragmentPlan(sql);
+        connectContext.getSessionVariable().setNewPlanerAggStage(0);
+
+        assertContains(plan, "  15:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 2: v2 = 14: v2\n" +
+                "  |  equal join conjunct: 3: v3 = 15: v3\n" +
+                "  |  equal join conjunct: 4: v4 = 16: v4\n" +
+                "  |  \n" +
+                "  |----14:EXCHANGE\n" +
+                "  |    \n" +
+                "  9:Project");
+        assertContains(plan, "  PARTITION: HASH_PARTITIONED: 14: v2, 15: v3, 16: v4\n" +
+                "\n" +
+                "  STREAM DATA SINK\n" +
+                "    EXCHANGE ID: 14\n" +
+                "    HASH_PARTITIONED: 14: v2, 15: v3\n" +
+                "\n" +
+                "  13:AGGREGATE (merge finalize)\n" +
+                "  |  group by: 16: v4, 14: v2, 15: v3");
+    }
+
+    @Test // shouldn't have exception
+    public void testRemoveAggregationFromAggTableRuluWithJoinAssociateRule() throws Exception {
+        String sql = "select t0.v1 from t0 inner join (select a.k1, a.k2 from " +
+                "(select k1, k2, k3 from test_agg group by k1, k2, k3) as a " +
+                "where EXISTS (select a.k2 from " +
+                "(select k1, k2, k3 from test_agg group by k1, k2, k3) as a )) " +
+                "subv0 on t0.v1 = subv0.k1;";
+        getFragmentPlan(sql);
+    }
+
+    @Test
+    public void testTopNGroupMerge() throws Exception {
+        String sql = "with tmp1 as (select * from t0 order by v1 asc), tmp2 as (select v4 from t1 group by v4)" +
+                "select count(*) from t0, tmp2, tmp1, t1 " +
+                "where 1 in (select v4 from t1);";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "21:NESTLOOP JOIN\n" +
+                "  |  join op: LEFT SEMI JOIN\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  other join predicates: 13: v4 = 1");
+    }
+
+    @Test
+    public void testTopFragmentOnComputeNode() throws Exception {
+        String sql = "select t0.v1 from t0 join[shuffle] t1 on t0.v2 = t1.v5";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "PLAN FRAGMENT 0\n" +
+                " OUTPUT EXPRS:1: v1\n" +
+                "  PARTITION: HASH_PARTITIONED: 2: v2\n" +
+                "\n" +
+                "  RESULT SINK");
+
+        try {
+            connectContext.getSessionVariable().setPreferComputeNode(true);
+            plan = getFragmentPlan(sql);
+            assertContains(plan, "PLAN FRAGMENT 0\n" +
+                    " OUTPUT EXPRS:1: v1\n" +
+                    "  PARTITION: UNPARTITIONED\n" +
+                    "\n" +
+                    "  RESULT SINK");
+        } finally {
+            connectContext.getSessionVariable().setPreferComputeNode(false);
+        }
+    }
+
+
+
+    @Test
+    public void testPushDownTopWithOuterJoin() throws Exception {
+        String sql = "SELECT\n" +
+                "    *\n" +
+                "FROM\n" +
+                "    (\n" +
+                "        SELECT\n" +
+                "            t0.*,\n" +
+                "            t1.v5,\n" +
+                "            t1.v6\n" +
+                "        FROM\n" +
+                "            t0\n" +
+                "            LEFT JOIN t1 ON t0.v1 = t1.v4\n" +
+                "    ) AS mocktable\n" +
+                "ORDER BY\n" +
+                "    mocktable.v2 DESC\n" +
+                "LIMIT\n" +
+                "    20";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "1:TOP-N\n" +
+                "  |  order by: <slot 2> 2: v2 DESC\n" +
+                "  |  offset: 0\n" +
+                "  |  limit: 20\n" +
+                "  |  \n" +
+                "  0:OlapScanNode\n" +
+                "     TABLE: t0");
+
+        sql = "SELECT\n" +
+                "    *\n" +
+                "FROM\n" +
+                "    (\n" +
+                "        SELECT\n" +
+                "            t0.*,\n" +
+                "            t1.v5,\n" +
+                "            t1.v6\n" +
+                "        FROM\n" +
+                "            t0\n" +
+                "            RIGHT JOIN t1 ON t0.v1 = t1.v4\n" +
+                "    ) AS mocktable\n" +
+                "ORDER BY\n" +
+                "    mocktable.v5 DESC\n" +
+                "LIMIT\n" +
+                "    20";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "3:TOP-N\n" +
+                "  |  order by: <slot 5> 5: v5 DESC\n" +
+                "  |  offset: 0\n" +
+                "  |  limit: 20\n" +
+                "  |  \n" +
+                "  2:OlapScanNode\n" +
+                "     TABLE: t1");
+
+        sql = "select\n" +
+                "    *\n" +
+                "from\n" +
+                "    (\n" +
+                "        select\n" +
+                "            *\n" +
+                "        from\n" +
+                "            (\n" +
+                "                SELECT\n" +
+                "                    *\n" +
+                "                FROM\n" +
+                "                    (\n" +
+                "                        SELECT\n" +
+                "                            c.*,\n" +
+                "                            p.v5,\n" +
+                "                            p.v6\n" +
+                "                        FROM\n" +
+                "                            t0 c\n" +
+                "                            RIGHT JOIN t1 p ON c.v1 = p.v4\n" +
+                "                    ) AS one_level\n" +
+                "                ORDER BY\n" +
+                "                    one_level.v5\n" +
+                "                LIMIT\n" +
+                "                    20\n" +
+                "            ) AS two_level\n" +
+                "            LEFT JOIN t2 o ON two_level.v1 = o.v7\n" +
+                "    ) twice_join\n" +
+                "ORDER BY\n" +
+                "    twice_join.v2\n" +
+                "limit\n" +
+                "    10;";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "3:TOP-N\n" +
+                "  |  order by: <slot 5> 5: v5 ASC\n" +
+                "  |  offset: 0\n" +
+                "  |  limit: 20\n" +
+                "  |  \n" +
+                "  2:OlapScanNode\n" +
+                "     TABLE: t1");
+        assertContains(plan, "14:TOP-N\n" +
+                "  |  order by: <slot 2> 2: v2 ASC\n" +
+                "  |  offset: 0\n" +
+                "  |  limit: 10\n" +
+                "  |  \n" +
+                "  13:HASH JOIN\n" +
+                "  |  join op: LEFT OUTER JOIN (BROADCAST)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 7: v7\n" +
+                "  |  \n" +
+                "  |----12:EXCHANGE\n" +
+                "  |    \n" +
+                "  10:TOP-N\n" +
+                "  |  order by: <slot 2> 2: v2 ASC\n" +
+                "  |  offset: 0\n" +
+                "  |  limit: 10");
+
+        sql = "select\n" +
+                "    *\n" +
+                "from\n" +
+                "    (\n" +
+                "        select\n" +
+                "            *\n" +
+                "        from\n" +
+                "            (\n" +
+                "                SELECT\n" +
+                "                    *\n" +
+                "                FROM\n" +
+                "                    (\n" +
+                "                        SELECT\n" +
+                "                            c.*,\n" +
+                "                            p.v5,\n" +
+                "                            p.v6\n" +
+                "                        FROM\n" +
+                "                            t0 c\n" +
+                "                            RIGHT JOIN t1 p ON c.v1 = p.v4\n" +
+                "                    ) AS one_level\n" +
+                "                ORDER BY\n" +
+                "                    one_level.v5\n" +
+                "                LIMIT\n" +
+                "                    20\n" +
+                "            ) AS two_level\n" +
+                "            RIGHT JOIN t2 o ON two_level.v1 = o.v7\n" +
+                "    ) twice_join\n" +
+                "ORDER BY\n" +
+                "    twice_join.v8\n" +
+                "limit\n" +
+                "    10;";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "3:TOP-N\n" +
+                "  |  order by: <slot 5> 5: v5 ASC\n" +
+                "  |  offset: 0\n" +
+                "  |  limit: 20\n" +
+                "  |  \n" +
+                "  2:OlapScanNode\n" +
+                "     TABLE: t1");
+
+        assertContains(plan, "12:TOP-N\n" +
+                "  |  order by: <slot 8> 8: v8 ASC\n" +
+                "  |  offset: 0\n" +
+                "  |  limit: 10\n" +
+                "  |  \n" +
+                "  11:OlapScanNode\n" +
+                "     TABLE: t2");
+
+        sql = "SELECT\n" +
+                "    *\n" +
+                "FROM\n" +
+                "    (\n" +
+                "        SELECT\n" +
+                "            t0.*,\n" +
+                "            t1.v5,\n" +
+                "            t1.v6\n" +
+                "        FROM\n" +
+                "            t0\n" +
+                "            LEFT JOIN t1 ON t0.v1 = t1.v4\n" +
+                "    ) AS mocktable\n" +
+                "ORDER BY\n" +
+                "    mocktable.v2, mocktable.v6 DESC\n" +
+                "LIMIT\n" +
+                "    20";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "5:TOP-N\n" +
+                "  |  order by: <slot 2> 2: v2 ASC, <slot 6> 6: v6 DESC\n" +
+                "  |  offset: 0\n" +
+                "  |  limit: 20\n" +
+                "  |  \n" +
+                "  4:Project\n" +
+                "  |  <slot 1> : 1: v1\n" +
+                "  |  <slot 2> : 2: v2\n" +
+                "  |  <slot 3> : 3: v3\n" +
+                "  |  <slot 5> : 5: v5\n" +
+                "  |  <slot 6> : 6: v6\n" +
+                "  |  \n" +
+                "  3:HASH JOIN\n" +
+                "  |  join op: LEFT OUTER JOIN (BROADCAST)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 4: v4\n" +
+                "  |  \n" +
+                "  |----2:EXCHANGE");
+
+        sql = "SELECT\n" +
+                "    *\n" +
+                "FROM\n" +
+                "    (\n" +
+                "        SELECT\n" +
+                "            t0.*,\n" +
+                "            t1.v5,\n" +
+                "            t1.v6\n" +
+                "        FROM\n" +
+                "            t0\n" +
+                "            FULL OUTER JOIN t1 ON t0.v1 = t1.v4\n" +
+                "    ) AS mocktable\n" +
+                "ORDER BY\n" +
+                "    mocktable.v2 DESC\n" +
+                "LIMIT\n" +
+                "    20";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "6:TOP-N\n" +
+                "  |  order by: <slot 2> 2: v2 DESC\n" +
+                "  |  offset: 0\n" +
+                "  |  limit: 20\n" +
+                "  |  \n" +
+                "  5:Project\n" +
+                "  |  <slot 1> : 1: v1\n" +
+                "  |  <slot 2> : 2: v2\n" +
+                "  |  <slot 3> : 3: v3\n" +
+                "  |  <slot 5> : 5: v5\n" +
+                "  |  <slot 6> : 6: v6\n" +
+                "  |  \n" +
+                "  4:HASH JOIN\n" +
+                "  |  join op: FULL OUTER JOIN (PARTITIONED)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 4: v4\n" +
+                "  |  \n" +
+                "  |----3:EXCHANGE\n" +
+                "  |    \n" +
+                "  1:EXCHANGE");
+
+        sql = "SELECT\n" +
+                "    *\n" +
+                "FROM\n" +
+                "    (\n" +
+                "        SELECT\n" +
+                "            t0.*,\n" +
+                "            t1.v5,\n" +
+                "            t1.v6\n" +
+                "        FROM\n" +
+                "            t0\n" +
+                "            JOIN t1 ON t0.v1 = t1.v4\n" +
+                "    ) AS mocktable\n" +
+                "ORDER BY\n" +
+                "    mocktable.v2 DESC\n" +
+                "LIMIT\n" +
+                "    20";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "5:TOP-N\n" +
+                "  |  order by: <slot 2> 2: v2 DESC\n" +
+                "  |  offset: 0\n" +
+                "  |  limit: 20\n" +
+                "  |  \n" +
+                "  4:Project\n" +
+                "  |  <slot 1> : 1: v1\n" +
+                "  |  <slot 2> : 2: v2\n" +
+                "  |  <slot 3> : 3: v3\n" +
+                "  |  <slot 5> : 5: v5\n" +
+                "  |  <slot 6> : 6: v6\n" +
+                "  |  \n" +
+                "  3:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (BROADCAST)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 4: v4\n" +
+                "  |  \n" +
+                "  |----2:EXCHANGE\n" +
+                "  |    \n" +
+                "  0:OlapScanNode");
+
+        sql = "SELECT\n" +
+                "    *\n" +
+                "FROM\n" +
+                "    (\n" +
+                "        SELECT\n" +
+                "            t0.*,\n" +
+                "            t1.v5,\n" +
+                "            t1.v6\n" +
+                "        FROM\n" +
+                "            t0\n" +
+                "            LEFT JOIN t1 ON t0.v1 = t1.v4\n" +
+                "    ) AS mocktable\n" +
+                "ORDER BY\n" +
+                "    mocktable.v2 DESC\n" +
+                "LIMIT\n" +
+                "    2000";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "3:HASH JOIN\n" +
+                "  |  join op: LEFT OUTER JOIN (BROADCAST)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 4: v4\n" +
+                "  |  \n" +
+                "  |----2:EXCHANGE\n" +
+                "  |    \n" +
+                "  0:OlapScanNode\n" +
+                "     TABLE: t0");
+
+        sql = "SELECT\n" +
+                "    *\n" +
+                "FROM\n" +
+                "    (\n" +
+                "        SELECT\n" +
+                "            t0.*,\n" +
+                "            t1.v5,\n" +
+                "            t1.v6\n" +
+                "        FROM\n" +
+                "            t0\n" +
+                "            LEFT JOIN t1 ON t0.v1 = t1.v4 where t1.v5 is null\n" +
+                "    ) AS mocktable\n" +
+                "ORDER BY\n" +
+                "    mocktable.v2 DESC\n" +
+                "LIMIT\n" +
+                "    20";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "3:HASH JOIN\n" +
+                "  |  join op: LEFT OUTER JOIN (BROADCAST)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 4: v4\n" +
+                "  |  other predicates: 5: v5 IS NULL\n" +
+                "  |  \n" +
+                "  |----2:EXCHANGE\n" +
+                "  |    \n" +
+                "  0:OlapScanNode");
+
+        sql = "select\n" +
+                "    *\n" +
+                "from\n" +
+                "    (\n" +
+                "        select\n" +
+                "            *\n" +
+                "        from\n" +
+                "            (\n" +
+                "                SELECT\n" +
+                "                    *\n" +
+                "                FROM\n" +
+                "                    (\n" +
+                "                        SELECT\n" +
+                "                            c.*,\n" +
+                "                            p.v5,\n" +
+                "                            p.v6\n" +
+                "                        FROM\n" +
+                "                            t0 c\n" +
+                "                            RIGHT JOIN t1 p ON c.v1 = p.v4\n" +
+                "                    ) AS one_level\n" +
+                "                ORDER BY\n" +
+                "                    one_level.v5\n" +
+                "                LIMIT\n" +
+                "                    20\n" +
+                "            ) AS two_level\n" +
+                "            LEFT JOIN t2 o ON two_level.v1 = o.v7\n" +
+                "    ) twice_join\n" +
+                "ORDER BY\n" +
+                "    twice_join.v2\n" +
+                "limit\n" +
+                "    100;";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "13:TOP-N\n" +
+                "  |  order by: <slot 2> 2: v2 ASC\n" +
+                "  |  offset: 0\n" +
+                "  |  limit: 100\n" +
+                "  |  \n" +
+                "  12:HASH JOIN\n" +
+                "  |  join op: LEFT OUTER JOIN (BROADCAST)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 7: v7\n" +
+                "  |  \n" +
+                "  |----11:EXCHANGE\n" +
+                "  |    \n" +
+                "  9:MERGING-EXCHANGE\n" +
+                "     limit: 20");
+
+        FeConstants.runningUnitTest = true;
+        sql = "SELECT t0.v1 FROM t0 LEFT JOIN[BUCKET] t1 ON t0.v1 = t1.v4 order by t0.v1";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "3:HASH JOIN\n" +
+                "  |  join op: LEFT OUTER JOIN (BUCKET_SHUFFLE)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 4: v4\n" +
+                "  |  \n" +
+                "  |----2:EXCHANGE\n" +
+                "  |    \n" +
+                "  0:OlapScanNode\n" +
+                "     TABLE: t0");
+
+        sql = "SELECT t0.v1 FROM t0 LEFT JOIN[BUCKET] t1 ON t0.v1 = t1.v4 order by t0.v1 limit 5";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "5:TOP-N\n" +
+                "  |  order by: <slot 1> 1: v1 ASC\n" +
+                "  |  offset: 0\n" +
+                "  |  limit: 5\n" +
+                "  |  \n" +
+                "  4:Project\n" +
+                "  |  <slot 1> : 1: v1\n" +
+                "  |  \n" +
+                "  3:HASH JOIN\n" +
+                "  |  join op: LEFT OUTER JOIN (BUCKET_SHUFFLE)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 4: v4\n" +
+                "  |  \n" +
+                "  |----2:EXCHANGE");
+
+        sql = "SELECT\n" +
+                "    *\n" +
+                "FROM\n" +
+                "    (\n" +
+                "        SELECT\n" +
+                "            t0.*,\n" +
+                "            t1.v5,\n" +
+                "            t1.v6\n" +
+                "        FROM\n" +
+                "            t0\n" +
+                "            RIGHT JOIN t1 ON t0.v1 = t1.v4\n" +
+                "    ) AS mocktable\n" +
+                "ORDER BY\n" +
+                "    mocktable.v5 DESC\n" +
+                "LIMIT\n" +
+                "    20,20";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "3:HASH JOIN\n" +
+                "  |  join op: RIGHT OUTER JOIN (BUCKET_SHUFFLE)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 1: v1 = 4: v4\n" +
+                "  |  \n" +
+                "  |----2:EXCHANGE\n" +
+                "  |    \n" +
+                "  0:OlapScanNode\n" +
+                "     TABLE: t0");
+
+        FeConstants.runningUnitTest = false;
+    }
+
+    @Test
+    public void testNullAwareLeftAntiJoin() throws Exception {
+        String query = "SELECT subt0.v1\n" +
+                "FROM\n" +
+                "  (SELECT t0_6.v1,\n" +
+                "          t0_6.v2,\n" +
+                "          t0_6.v3\n" +
+                "   FROM t0 AS t0_6) subt0 \n" +
+                "WHERE (NOT ((subt0.v2) IN (\n" +
+                "                                (SELECT t0_6.v2\n" +
+                "                                 FROM t0 AS t0_6\n" +
+                "                                 WHERE (t0_6.v1) = (subt0.v1)))))";
+        String plan = getFragmentPlan(query);
+        assertContainsIgnoreColRefs(plan, "other join predicates: 4: v1 = 1: v1");
+    }
+
+    @Test
+    public void testJoinOnAnonymousSubquery() throws Exception {
+        String query = "select 'a' " +
+                "FROM t0 join t1 on t0.v2 = t1.v5 and t1.v6 in ((((" +
+                "(select v8 from t2)" +
+                "))))";
+        String plan = getFragmentPlan(query);
+        assertContains(plan, "HASH JOIN\n" +
+                "  |  join op: LEFT SEMI JOIN (BROADCAST)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 6: v6 = 8: v8");
+    }
+
+    @Test
+    public void testOuterJoinOnConstValue() throws Exception {
+        String query = "WITH `ID_TABLE` AS (\n" +
+                "    SELECT\n" +
+                "        \"A\" AS `ID`\n" +
+                "),\n" +
+                "`MAP_TABLE` AS (\n" +
+                "    SELECT\n" +
+                "        [\"A\", \"B\", \"C\"] AS `MAP_KEYS`\n" +
+                "),\n" +
+                "`AGGED_MAP_TABLE_EX` AS (\n" +
+                "    SELECT\n" +
+                "        ARRAY_AGG(\n" +
+                "            `AGGED_MAP_TABLE`.`MAP_KEYS`\n" +
+                "        ) AS `AGGED_MAP_KEYS`\n" +
+                "    FROM\n" +
+                "        `MAP_TABLE` AS `AGGED_MAP_TABLE`\n" +
+                "),\n" +
+                "`AGGED_MAP_FIND_TABLE` AS (\n" +
+                "    SELECT\n" +
+                "        [\"A\", \"B\", \"C\"] AS `FIND_AGGED_KEY`\n" +
+                "    FROM\n" +
+                "        `AGGED_MAP_TABLE_EX`\n" +
+                "),\n" +
+                "`GROUPED_FIND_TABLE` AS (\n" +
+                "    SELECT\n" +
+                "        `GROUPED_AGGED_MAP_FIND_TABLE`.`FIND_AGGED_KEY` AS `FIND_AGGED_KEY`\n" +
+                "    FROM\n" +
+                "        `AGGED_MAP_FIND_TABLE` AS `GROUPED_AGGED_MAP_FIND_TABLE`\n" +
+                "    GROUP BY\n" +
+                "        `GROUPED_AGGED_MAP_FIND_TABLE`.`FIND_AGGED_KEY`\n" +
+                "),\n" +
+                "`AGGED_GROUPED_FIND_SEQUENCE` AS (\n" +
+                "    SELECT\n" +
+                "        `AGGED_GROUPED_FIND_TABLE`.`FIND_AGGED_KEY` AS `FIND_AGGED_KEY`,\n" +
+                "        123 AS `GROUPED_FIND_LITERAL`\n" +
+                "    FROM\n" +
+                "        `GROUPED_FIND_TABLE` AS `AGGED_GROUPED_FIND_TABLE`\n" +
+                "),\n" +
+                "`HANDLE_SEQUENCE_TABLE` AS (\n" +
+                "    SELECT\n" +
+                "        `MockTOSQL_UNNEST`.`FIND_AGGED_KEY` AS `FIND_AGGED_KEY`,\n" +
+                "        `SEQUENCE_TABLE`.`GROUPED_FIND_LITERAL` AS `GROUPED_FIND_LITERAL`\n" +
+                "    FROM\n" +
+                "        `AGGED_GROUPED_FIND_SEQUENCE` AS `SEQUENCE_TABLE`,\n" +
+                "        UNNEST(\n" +
+                "            `SEQUENCE_TABLE`.`FIND_AGGED_KEY`\n" +
+                "        ) AS MockTOSQL_UNNEST(\n" +
+                "            `FIND_AGGED_KEY`\n" +
+                "        )\n" +
+                "),\n" +
+                "`JOINED_SEQUENCE` AS (\n" +
+                "    SELECT\n" +
+                "        `R_TABLE`.`ID` AS `JOINED_ID`,\n" +
+                "        `HANDLE_SEQUENCE_TABLE_JOINED`.`GROUPED_FIND_LITERAL` AS `JOINED_LITERAL`\n" +
+                "    FROM\n" +
+                "        `HANDLE_SEQUENCE_TABLE` AS `HANDLE_SEQUENCE_TABLE_JOINED`\n" +
+                "        LEFT JOIN `ID_TABLE` AS `R_TABLE` ON (\n" +
+                "            `HANDLE_SEQUENCE_TABLE_JOINED`.`FIND_AGGED_KEY` = `R_TABLE`.`ID`\n" +
+                "        )\n" +
+                "),\n" +
+                "`JOINED_AGGED_SEQUENCE` AS (\n" +
+                "    SELECT\n" +
+                "        `JOINED_TABLE_SEQUENCE`.`JOINED_LITERAL` AS `JOINED_LITERAL`,\n" +
+                "            `JOINED_TABLE_SEQUENCE`.`JOINED_ID`\n" +
+                "         AS `JOINED_TABLE_AGGED_SEQUENCE`\n" +
+                "    FROM\n" +
+                "        `JOINED_SEQUENCE` AS `JOINED_TABLE_SEQUENCE`\n" +
+                ")\n" +
+                "SELECT\n" +
+                "    `JOINED_AGGED_SEQUENCE_R_TABLE`.`JOINED_TABLE_AGGED_SEQUENCE` AS `RENAME_9`\n" +
+                "FROM\n" +
+                "    `AGGED_GROUPED_FIND_SEQUENCE` AS `AGGED_GROUP_FIND_L_TABLE`\n" +
+                "    LEFT JOIN `JOINED_AGGED_SEQUENCE` AS `JOINED_AGGED_SEQUENCE_R_TABLE` ON (\n" +
+                "        `AGGED_GROUP_FIND_L_TABLE`.`GROUPED_FIND_LITERAL` = `JOINED_AGGED_SEQUENCE_R_TABLE`.`JOINED_LITERAL`\n" +
+                "    );";
+        String plan = getFragmentPlan(query);
+        //outer join can not use const expr replacement optimization because it may generate null values
+        assertContains(plan, "11:Project\n" +
+                "  |  <slot 29> : 29: expr\n" +
+                "  |  \n" +
+                "  10:NESTLOOP JOIN\n" +
+                "  |  join op: RIGHT OUTER JOIN\n" +
+                "  |  colocate: false, reason: ");
+    }
+
+    @Test
+    public void testJoinOnConstValue() throws Exception {
+        String query = "select coalesce(b.v1, a.v1) as v1, a.v2 \n" +
+                "from t0 a left join (select 'cccc' as v1, 'dddd' as v2) b on a.v1 = b.v1 \n" +
+                "where coalesce(b.v1, a.v1) = '1';";
+        String plan = getFragmentPlan(query);
+        assertContainsIgnoreColRefs(plan, "  0:OlapScanNode\n" +
+                "     TABLE: t0\n" +
+                "     PREAGGREGATION: ON\n" +
+                "     PREDICATES: coalesce('cccc', CAST(1: v1 AS VARCHAR)) = '1'");
+    }
 }

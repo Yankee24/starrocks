@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/exprs/expr.cpp
 
@@ -30,43 +43,53 @@
 #include "column/fixed_length_column.h"
 #include "common/object_pool.h"
 #include "common/status.h"
-#include "exprs/vectorized/arithmetic_expr.h"
-#include "exprs/vectorized/array_element_expr.h"
-#include "exprs/vectorized/array_expr.h"
-#include "exprs/vectorized/binary_predicate.h"
-#include "exprs/vectorized/case_expr.h"
-#include "exprs/vectorized/cast_expr.h"
-#include "exprs/vectorized/clone_expr.h"
-#include "exprs/vectorized/column_ref.h"
-#include "exprs/vectorized/compound_predicate.h"
-#include "exprs/vectorized/condition_expr.h"
-#include "exprs/vectorized/dictmapping_expr.h"
-#include "exprs/vectorized/function_call_expr.h"
-#include "exprs/vectorized/in_predicate.h"
-#include "exprs/vectorized/info_func.h"
-#include "exprs/vectorized/is_null_predicate.h"
-#include "exprs/vectorized/java_function_call_expr.h"
-#include "exprs/vectorized/literal.h"
-#include "exprs/vectorized/placeholder_ref.h"
-#include "gen_cpp/Exprs_types.h"
-#include "gen_cpp/Types_types.h"
-#include "runtime/primitive_type.h"
-#include "runtime/raw_value.h"
+#include "common/statusor.h"
+#include "exprs/arithmetic_expr.h"
+#include "exprs/array_element_expr.h"
+#include "exprs/array_expr.h"
+#include "exprs/array_map_expr.h"
+#include "exprs/arrow_function_call.h"
+#include "exprs/binary_predicate.h"
+#include "exprs/case_expr.h"
+#include "exprs/cast_expr.h"
+#include "exprs/clone_expr.h"
+#include "exprs/column_ref.h"
+#include "exprs/compound_predicate.h"
+#include "exprs/condition_expr.h"
+#include "exprs/dict_query_expr.h"
+#include "exprs/dictionary_get_expr.h"
+#include "exprs/dictmapping_expr.h"
+#include "exprs/function_call_expr.h"
+#include "exprs/in_predicate.h"
+#include "exprs/info_func.h"
+#include "exprs/is_null_predicate.h"
+#include "exprs/java_function_call_expr.h"
+#include "exprs/lambda_function.h"
+#include "exprs/literal.h"
+#include "exprs/map_apply_expr.h"
+#include "exprs/map_element_expr.h"
+#include "exprs/map_expr.h"
+#include "exprs/match_expr.h"
+#include "exprs/placeholder_ref.h"
+#include "exprs/subfield_expr.h"
+#include "gutil/casts.h"
+#include "gutil/strings/substitute.h"
 #include "runtime/runtime_state.h"
+#include "types/logical_type.h"
+#include "util/failpoint/fail_point.h"
+
+#ifdef STARROCKS_JIT_ENABLE
+#include <llvm/IR/Value.h>
+
+#include "exprs/jit/ir_helper.h"
+#include "exprs/jit/jit_engine.h"
+#include "exprs/jit/jit_expr.h"
+#endif
 
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "EndlessLoop"
 using std::vector;
 namespace starrocks {
-
-using vectorized::Int8Column;
-using vectorized::Int16Column;
-using vectorized::Int32Column;
-using vectorized::Int64Column;
-using vectorized::Int128Column;
-using vectorized::DoubleColumn;
-using vectorized::FloatColumn;
-using vectorized::BooleanColumn;
 
 // No children here
 Expr::Expr(const Expr& expr)
@@ -75,12 +98,13 @@ Expr::Expr(const Expr& expr)
           _opcode(expr._opcode),
           _is_slotref(expr._is_slotref),
           _is_nullable(expr._is_nullable),
+          _is_monotonic(expr._is_monotonic),
           _type(expr._type),
           _output_scale(expr._output_scale),
           _fn(expr._fn),
           _fn_context_index(expr._fn_context_index) {}
 
-Expr::Expr(TypeDescriptor type) : Expr(type, false) {}
+Expr::Expr(TypeDescriptor type) : Expr(std::move(type), false) {}
 
 Expr::Expr(TypeDescriptor type, bool is_slotref)
         : _opcode(TExprOpcode::INVALID_OPCODE),
@@ -138,13 +162,17 @@ Expr::Expr(TypeDescriptor type, bool is_slotref)
         case TYPE_ARRAY:
             _node_type = (TExprNodeType::ARRAY_EXPR);
             break;
-        case INVALID_TYPE:
-        case TYPE_BINARY:
-        case TYPE_STRUCT:
-        case TYPE_MAP:
+        case TYPE_VARBINARY:
+            _node_type = (TExprNodeType::BINARY_LITERAL);
+            break;
         case TYPE_DECIMAL32:
         case TYPE_DECIMAL64:
         case TYPE_DECIMAL128:
+            _node_type = TExprNodeType::DECIMAL_LITERAL;
+            break;
+        case TYPE_UNKNOWN:
+        case TYPE_STRUCT:
+        case TYPE_MAP:
         case TYPE_JSON:
             break;
 
@@ -172,11 +200,15 @@ Expr::Expr(const TExprNode& node, bool is_slotref)
     if (node.__isset.is_monotonic) {
         _is_monotonic = node.is_monotonic;
     }
+    if (node.__isset.is_index_only_filter) {
+        _is_index_only_filter = node.is_index_only_filter;
+    }
 }
 
 Expr::~Expr() = default;
 
-Status Expr::create_expr_tree(ObjectPool* pool, const TExpr& texpr, ExprContext** ctx) {
+Status Expr::create_expr_tree(ObjectPool* pool, const TExpr& texpr, ExprContext** ctx, RuntimeState* state,
+                              bool can_jit) {
     // input is empty
     if (texpr.nodes.empty()) {
         *ctx = nullptr;
@@ -184,60 +216,119 @@ Status Expr::create_expr_tree(ObjectPool* pool, const TExpr& texpr, ExprContext*
     }
     int node_idx = 0;
     Expr* e = nullptr;
-    Status status = create_tree_from_thrift(pool, texpr.nodes, nullptr, &node_idx, &e, ctx);
+    Status status;
+    if (can_jit) {
+        status = create_tree_from_thrift_with_jit(pool, texpr.nodes, nullptr, &node_idx, &e, ctx, state);
+    } else {
+        status = create_tree_from_thrift(pool, texpr.nodes, nullptr, &node_idx, &e, ctx, state);
+    }
     if (status.ok() && node_idx + 1 != texpr.nodes.size()) {
         status = Status::InternalError("Expression tree only partially reconstructed. Not all thrift nodes were used.");
     }
     if (!status.ok()) {
         LOG(ERROR) << "Could not construct expr tree.\n"
-                   << status.get_error_msg() << "\n"
+                   << status.message() << "\n"
                    << apache::thrift::ThriftDebugString(texpr);
+        return status;
     }
+
     return status;
 }
 
-Status Expr::create_expr_trees(ObjectPool* pool, const std::vector<TExpr>& texprs, std::vector<ExprContext*>* ctxs) {
+#ifdef STARROCKS_JIT_ENABLE
+Status Expr::prepare_jit_expr(RuntimeState* state, ExprContext* context) {
+    if (this->node_type() == TExprNodeType::JIT_EXPR) {
+        RETURN_IF_ERROR(((JITExpr*)this)->prepare_impl(state, context));
+    }
+    for (auto child : _children) {
+        RETURN_IF_ERROR(child->prepare_jit_expr(state, context));
+    }
+    return Status::OK();
+}
+#endif
+
+Status Expr::create_expr_trees(ObjectPool* pool, const std::vector<TExpr>& texprs, std::vector<ExprContext*>* ctxs,
+                               RuntimeState* state, bool can_jit) {
     ctxs->clear();
     for (const auto& texpr : texprs) {
         ExprContext* ctx = nullptr;
-        RETURN_IF_ERROR(create_expr_tree(pool, texpr, &ctx));
+        RETURN_IF_ERROR(create_expr_tree(pool, texpr, &ctx, state, can_jit));
         ctxs->push_back(ctx);
     }
     return Status::OK();
 }
 
+Status Expr::create_tree_from_thrift_with_jit(ObjectPool* pool, const std::vector<TExprNode>& nodes, Expr* parent,
+                                              int* node_idx, Expr** root_expr, ExprContext** ctx, RuntimeState* state) {
+    Status status = create_tree_from_thrift(pool, nodes, parent, node_idx, root_expr, ctx, state);
+    // Enable JIT based on the "jit_level" parameters.
+    if (state == nullptr || !status.ok() || !state->is_jit_enabled()) {
+        return status;
+    }
+
+#ifdef STARROCKS_JIT_ENABLE
+    bool replaced = false;
+    status = (*root_expr)->replace_compilable_exprs(root_expr, pool, state, replaced);
+    if (!status.ok()) {
+        LOG(WARNING) << "Can't replace compilable exprs.\n" << status.message() << "\n" << (*root_expr)->debug_string();
+        // Fall back to the non-JIT path.
+        return Status::OK();
+    }
+
+    if (replaced) {
+        // The node was replaced, so we need to update the context.
+        *ctx = pool->add(new ExprContext(*root_expr));
+    }
+#endif
+
+    return status;
+}
+
 Status Expr::create_tree_from_thrift(ObjectPool* pool, const std::vector<TExprNode>& nodes, Expr* parent, int* node_idx,
-                                     Expr** root_expr, ExprContext** ctx) {
+                                     Expr** root_expr, ExprContext** ctx, RuntimeState* state) {
     // propagate error case
     if (*node_idx >= nodes.size()) {
-        return Status::InternalError("Failed to reconstruct expression tree from thrift.");
+        return Status::InternalError(
+                strings::Substitute("Failed to reconstruct expression tree from thrift, "
+                                    "node_idx:$0, nodes size:$1.",
+                                    *node_idx, nodes.size()));
     }
     int num_children = nodes[*node_idx].num_children;
     Expr* expr = nullptr;
-    RETURN_IF_ERROR(create_vectorized_expr(pool, nodes[*node_idx], &expr));
+    RETURN_IF_ERROR(create_vectorized_expr(pool, nodes[*node_idx], &expr, state));
     DCHECK(expr != nullptr);
     if (parent != nullptr) {
         parent->add_child(expr);
-    } else {
-        DCHECK(root_expr != nullptr);
-        DCHECK(ctx != nullptr);
-        *root_expr = expr;
-        *ctx = pool->add(new ExprContext(expr));
     }
     for (int i = 0; i < num_children; i++) {
         *node_idx += 1;
-        RETURN_IF_ERROR(create_tree_from_thrift(pool, nodes, expr, node_idx, nullptr, nullptr));
+        RETURN_IF_ERROR(create_tree_from_thrift(pool, nodes, expr, node_idx, nullptr, nullptr, state));
         // we are expecting a child, but have used all nodes
         // this means we have been given a bad tree and must fail
         if (*node_idx >= nodes.size()) {
-            return Status::InternalError("Failed to reconstruct expression tree from thrift.");
+            return Status::InternalError(
+                    strings::Substitute("Failed to reconstruct expression tree from thrift, "
+                                        "node_idx:$0, nodes size:$1.",
+                                        *node_idx, nodes.size()));
+        }
+    }
+    if (parent == nullptr) {
+        DCHECK(root_expr != nullptr);
+        DCHECK(ctx != nullptr);
+        if (root_expr == nullptr || ctx == nullptr) {
+            return Status::InternalError(
+                    "Failed to reconstruct expression tree from thrift. Invalid input root_expr or ctx");
+        } else {
+            *root_expr = expr;
+            *ctx = pool->add(new ExprContext(expr));
         }
     }
     return Status::OK();
 }
 
 Status Expr::create_vectorized_expr(starrocks::ObjectPool* pool, const starrocks::TExprNode& texpr_node,
-                                    starrocks::Expr** expr) {
+                                    starrocks::Expr** expr, RuntimeState* state) {
+    FAIL_POINT_TRIGGER_RETURN_ERROR(random_error);
     switch (texpr_node.node_type) {
     case TExprNodeType::BOOL_LITERAL:
     case TExprNodeType::INT_LITERAL:
@@ -246,21 +337,22 @@ Status Expr::create_vectorized_expr(starrocks::ObjectPool* pool, const starrocks
     case TExprNodeType::DECIMAL_LITERAL:
     case TExprNodeType::DATE_LITERAL:
     case TExprNodeType::STRING_LITERAL:
+    case TExprNodeType::BINARY_LITERAL:
     case TExprNodeType::NULL_LITERAL: {
-        *expr = pool->add(new vectorized::VectorizedLiteral(texpr_node));
+        *expr = pool->add(new VectorizedLiteral(texpr_node));
         break;
     }
     case TExprNodeType::COMPOUND_PRED: {
-        *expr = pool->add(vectorized::VectorizedCompoundPredicateFactory::from_thrift(texpr_node));
+        *expr = pool->add(VectorizedCompoundPredicateFactory::from_thrift(texpr_node));
         break;
     }
     case TExprNodeType::BINARY_PRED: {
-        *expr = pool->add(vectorized::VectorizedBinaryPredicateFactory::from_thrift(texpr_node));
+        *expr = pool->add(VectorizedBinaryPredicateFactory::from_thrift(texpr_node));
         break;
     }
     case TExprNodeType::ARITHMETIC_EXPR: {
         if (texpr_node.opcode != TExprOpcode::INVALID_OPCODE) {
-            *expr = pool->add(vectorized::VectorizedArithmeticExprFactory::from_thrift(texpr_node));
+            *expr = pool->add(VectorizedArithmeticExprFactory::from_thrift(texpr_node));
             break;
         } else {
             // @TODO: will call FunctionExpr, implement later
@@ -269,8 +361,23 @@ Status Expr::create_vectorized_expr(starrocks::ObjectPool* pool, const starrocks
     }
     case TExprNodeType::CAST_EXPR: {
         if (texpr_node.__isset.child_type || texpr_node.__isset.child_type_desc) {
-            *expr = pool->add(vectorized::VectorizedCastExprFactory::from_thrift(texpr_node));
-            break;
+            *expr = pool->add(VectorizedCastExprFactory::from_thrift(
+                    pool, texpr_node, (state == nullptr) ? false : state->query_options().allow_throw_exception));
+            if (*expr == nullptr) {
+                TypeDescriptor to_type = TypeDescriptor::from_thrift(texpr_node.type);
+                TypeDescriptor from_type(thrift_to_type(texpr_node.child_type));
+                // In cast TExprNode, child_type is used to represent scalar type,
+                // and child_type_desc is used to represent complex types, such as struct, map, array
+                if (texpr_node.__isset.child_type_desc) {
+                    from_type = TypeDescriptor::from_thrift(texpr_node.child_type_desc);
+                }
+                auto err_msg =
+                        fmt::format("Not support cast {} to {}.", from_type.debug_string(), to_type.debug_string());
+                LOG(WARNING) << err_msg;
+                return Status::InternalError(err_msg);
+            } else {
+                break;
+            }
         } else {
             // @TODO: will call FunctionExpr, implement later
             return Status::InternalError("Vectorized engine not support unknown child type cast");
@@ -279,32 +386,38 @@ Status Expr::create_vectorized_expr(starrocks::ObjectPool* pool, const starrocks
     case TExprNodeType::COMPUTE_FUNCTION_CALL:
     case TExprNodeType::FUNCTION_CALL: {
         if (texpr_node.fn.binary_type == TFunctionBinaryType::SRJAR) {
-            *expr = pool->add(new vectorized::JavaFunctionCallExpr(texpr_node));
+            *expr = pool->add(new JavaFunctionCallExpr(texpr_node));
+        } else if (texpr_node.fn.binary_type == TFunctionBinaryType::PYTHON) {
+            *expr = pool->add(new ArrowFunctionCallExpr(texpr_node));
         } else if (texpr_node.fn.name.function_name == "if") {
-            *expr = pool->add(vectorized::VectorizedConditionExprFactory::create_if_expr(texpr_node));
+            *expr = pool->add(VectorizedConditionExprFactory::create_if_expr(texpr_node));
         } else if (texpr_node.fn.name.function_name == "nullif") {
-            *expr = pool->add(vectorized::VectorizedConditionExprFactory::create_null_if_expr(texpr_node));
+            *expr = pool->add(VectorizedConditionExprFactory::create_null_if_expr(texpr_node));
         } else if (texpr_node.fn.name.function_name == "ifnull") {
-            *expr = pool->add(vectorized::VectorizedConditionExprFactory::create_if_null_expr(texpr_node));
+            *expr = pool->add(VectorizedConditionExprFactory::create_if_null_expr(texpr_node));
         } else if (texpr_node.fn.name.function_name == "coalesce") {
-            *expr = pool->add(vectorized::VectorizedConditionExprFactory::create_coalesce_expr(texpr_node));
+            *expr = pool->add(VectorizedConditionExprFactory::create_coalesce_expr(texpr_node));
         } else if (texpr_node.fn.name.function_name == "is_null_pred" ||
                    texpr_node.fn.name.function_name == "is_not_null_pred") {
-            *expr = pool->add(vectorized::VectorizedIsNullPredicateFactory::from_thrift(texpr_node));
+            *expr = pool->add(VectorizedIsNullPredicateFactory::from_thrift(texpr_node));
+        } else if (texpr_node.fn.name.function_name == "array_map") {
+            *expr = pool->add(new ArrayMapExpr(texpr_node));
+        } else if (texpr_node.fn.name.function_name == "map_apply") {
+            *expr = pool->add(new MapApplyExpr(texpr_node));
         } else {
-            *expr = pool->add(new vectorized::VectorizedFunctionCallExpr(texpr_node));
+            *expr = pool->add(new VectorizedFunctionCallExpr(texpr_node));
         }
         break;
     }
     case TExprNodeType::IN_PRED: {
-        *expr = pool->add(vectorized::VectorizedInPredicateFactory::from_thrift(texpr_node));
+        *expr = pool->add(VectorizedInPredicateFactory::from_thrift(texpr_node));
         break;
     }
     case TExprNodeType::SLOT_REF: {
         if (!texpr_node.__isset.slot_ref) {
             return Status::InternalError("Slot reference not set in thrift node");
         }
-        *expr = pool->add(new vectorized::ColumnRef(texpr_node));
+        *expr = pool->add(new ColumnRef(texpr_node));
         break;
     }
     case TExprNodeType::CASE_EXPR: {
@@ -312,26 +425,47 @@ Status Expr::create_vectorized_expr(starrocks::ObjectPool* pool, const starrocks
             return Status::InternalError("Case expression not set in thrift node");
         }
 
-        *expr = pool->add(vectorized::VectorizedCaseExprFactory::from_thrift(texpr_node));
+        *expr = pool->add(VectorizedCaseExprFactory::from_thrift(texpr_node));
         break;
     }
     case TExprNodeType::ARRAY_EXPR:
-        *expr = pool->add(vectorized::ArrayExprFactory::from_thrift(texpr_node));
+        *expr = pool->add(ArrayExprFactory::from_thrift(texpr_node));
         break;
     case TExprNodeType::ARRAY_ELEMENT_EXPR:
-        *expr = pool->add(vectorized::ArrayElementExprFactory::from_thrift(texpr_node));
+        *expr = pool->add(ArrayElementExprFactory::from_thrift(texpr_node));
+        break;
+    case TExprNodeType::MAP_ELEMENT_EXPR:
+        *expr = pool->add(MapElementExprFactory::from_thrift(texpr_node));
+        break;
+    case TExprNodeType::MAP_EXPR:
+        *expr = pool->add(MapExprFactory::from_thrift(texpr_node));
+        break;
+    case TExprNodeType::SUBFIELD_EXPR:
+        *expr = pool->add(SubfieldExprFactory::from_thrift(texpr_node));
         break;
     case TExprNodeType::INFO_FUNC:
-        *expr = pool->add(new vectorized::VectorizedInfoFunc(texpr_node));
+        *expr = pool->add(new VectorizedInfoFunc(texpr_node));
         break;
     case TExprNodeType::PLACEHOLDER_EXPR:
-        *expr = pool->add(new vectorized::PlaceHolderRef(texpr_node));
+        *expr = pool->add(new PlaceHolderRef(texpr_node));
         break;
     case TExprNodeType::DICT_EXPR:
-        *expr = pool->add(new vectorized::DictMappingExpr(texpr_node));
+        *expr = pool->add(new DictMappingExpr(texpr_node));
+        break;
+    case TExprNodeType::LAMBDA_FUNCTION_EXPR:
+        *expr = pool->add(new LambdaFunction(texpr_node));
         break;
     case TExprNodeType::CLONE_EXPR:
-        *expr = pool->add(new vectorized::CloneExpr(texpr_node));
+        *expr = pool->add(new CloneExpr(texpr_node));
+        break;
+    case TExprNodeType::DICT_QUERY_EXPR:
+        *expr = pool->add(new DictQueryExpr(texpr_node));
+        break;
+    case TExprNodeType::DICTIONARY_GET_EXPR:
+        *expr = pool->add(new DictionaryGetExpr(texpr_node));
+        break;
+    case TExprNodeType::MATCH_EXPR:
+        *expr = pool->add(new MatchExpr(texpr_node));
         break;
     case TExprNodeType::ARRAY_SLICE_EXPR:
     case TExprNodeType::AGG_EXPR:
@@ -340,6 +474,8 @@ Status Expr::create_vectorized_expr(starrocks::ObjectPool* pool, const starrocks
     case TExprNodeType::LIKE_PRED:
     case TExprNodeType::LITERAL_PRED:
     case TExprNodeType::TUPLE_IS_NULL_PRED:
+    case TExprNodeType::RUNTIME_FILTER_MIN_MAX_EXPR:
+    case TExprNodeType::JIT_EXPR:
         break;
     }
     if (*expr == nullptr) {
@@ -372,52 +508,6 @@ struct MemLayoutData {
     }
 };
 
-// Returns the byte size of 'type'  Returns 0 for variable length types.
-inline static int get_byte_size_of_primitive_type(PrimitiveType type) {
-    switch (type) {
-    case TYPE_OBJECT:
-    case TYPE_HLL:
-    case TYPE_PERCENTILE:
-    case TYPE_VARCHAR:
-        return 0;
-
-    case TYPE_NULL:
-    case TYPE_BOOLEAN:
-    case TYPE_TINYINT:
-        return 1;
-
-    case TYPE_SMALLINT:
-        return 2;
-
-    case TYPE_DECIMAL32:
-    case TYPE_INT:
-    case TYPE_FLOAT:
-        return 4;
-
-    case TYPE_DECIMAL64:
-    case TYPE_BIGINT:
-    case TYPE_TIME:
-    case TYPE_DOUBLE:
-        return 8;
-
-    case TYPE_DECIMAL128:
-    case TYPE_LARGEINT:
-    case TYPE_DATETIME:
-    case TYPE_DATE:
-    case TYPE_DECIMALV2:
-        return 16;
-
-    case TYPE_DECIMAL:
-        return 40;
-
-    case INVALID_TYPE:
-    default:
-        DCHECK(false);
-    }
-
-    return 0;
-}
-
 Status Expr::prepare(const std::vector<ExprContext*>& ctxs, RuntimeState* state) {
     for (auto ctx : ctxs) {
         RETURN_IF_ERROR(ctx->prepare(state));
@@ -426,7 +516,8 @@ Status Expr::prepare(const std::vector<ExprContext*>& ctxs, RuntimeState* state)
 }
 
 Status Expr::prepare(RuntimeState* state, ExprContext* context) {
-    DCHECK(_type.type != INVALID_TYPE);
+    FAIL_POINT_TRIGGER_RETURN_ERROR(randome_error);
+    DCHECK(_type.type != TYPE_UNKNOWN);
     for (auto& i : _children) {
         RETURN_IF_ERROR(i->prepare(state, context));
     }
@@ -441,7 +532,8 @@ Status Expr::open(const std::vector<ExprContext*>& ctxs, RuntimeState* state) {
 }
 
 Status Expr::open(RuntimeState* state, ExprContext* context, FunctionContext::FunctionStateScope scope) {
-    DCHECK(_type.type != INVALID_TYPE);
+    FAIL_POINT_TRIGGER_RETURN_ERROR(random_error);
+    DCHECK(_type.type != TYPE_UNKNOWN);
     for (auto& i : _children) {
         RETURN_IF_ERROR(i->open(state, context, scope));
     }
@@ -472,7 +564,7 @@ void Expr::close(RuntimeState* state, ExprContext* context, FunctionContext::Fun
 #endif
 }
 
-Status Expr::clone_if_not_exists(const std::vector<ExprContext*>& ctxs, RuntimeState* state,
+Status Expr::clone_if_not_exists(RuntimeState* state, ObjectPool* pool, const std::vector<ExprContext*>& ctxs,
                                  std::vector<ExprContext*>* new_ctxs) {
     DCHECK(new_ctxs != nullptr);
     if (!new_ctxs->empty()) {
@@ -486,7 +578,7 @@ Status Expr::clone_if_not_exists(const std::vector<ExprContext*>& ctxs, RuntimeS
 
     new_ctxs->resize(ctxs.size());
     for (int i = 0; i < ctxs.size(); ++i) {
-        RETURN_IF_ERROR(ctxs[i]->clone(state, &(*new_ctxs)[i]));
+        RETURN_IF_ERROR(ctxs[i]->clone(state, pool, &(*new_ctxs)[i]));
     }
     return Status::OK();
 }
@@ -574,6 +666,22 @@ int Expr::get_slot_ids(std::vector<SlotId>* slot_ids) const {
     return n;
 }
 
+void Expr::for_each_slot_id(const std::function<void(SlotId)>& cb) const {
+    for (auto child : _children) {
+        child->for_each_slot_id(cb);
+    }
+}
+
+int Expr::get_subfields(std::vector<std::vector<std::string>>* subfields) const {
+    int n = 0;
+
+    for (auto i : _children) {
+        n += i->get_subfields(subfields);
+    }
+
+    return n;
+}
+
 Expr* Expr::copy(ObjectPool* pool, Expr* old_expr) {
     auto new_expr = old_expr->clone(pool);
     for (auto child : old_expr->_children) {
@@ -612,21 +720,181 @@ StatusOr<ColumnPtr> Expr::evaluate_const(ExprContext* context) {
     return _constant_column;
 }
 
-ColumnPtr Expr::evaluate(ExprContext* context, vectorized::Chunk* ptr) {
-    return nullptr;
+StatusOr<ColumnPtr> Expr::evaluate_with_filter(ExprContext* context, Chunk* ptr, uint8_t* filter) {
+    return evaluate_checked(context, ptr);
 }
 
-vectorized::ColumnRef* Expr::get_column_ref() {
+ColumnRef* Expr::get_column_ref() {
     if (this->is_slotref()) {
-        return down_cast<vectorized::ColumnRef*>(this);
+        return down_cast<ColumnRef*>(this);
     }
     for (auto child : this->children()) {
-        vectorized::ColumnRef* ref = nullptr;
+        ColumnRef* ref = nullptr;
         if ((ref = child->get_column_ref()) != nullptr) {
             return ref;
         }
     }
     return nullptr;
+}
+
+#ifdef STARROCKS_JIT_ENABLE
+StatusOr<LLVMDatum> Expr::generate_ir(ExprContext* context, JITContext* jit_ctx) {
+    if (this->is_compilable(context->_runtime_state)) {
+        return this->generate_ir_impl(context, jit_ctx);
+    } else {
+        return Expr::generate_ir_impl(context, jit_ctx);
+    }
+}
+
+StatusOr<LLVMDatum> Expr::generate_ir_impl(ExprContext* context, JITContext* jit_ctx) {
+    if (is_compilable(context->_runtime_state)) {
+#if BE_TEST
+        throw std::runtime_error("[JIT] compilable expressions must not be here : " + debug_string());
+#else
+        return Status::NotSupported("[JIT] compilable expressions must override generate_ir_impl()");
+#endif
+    }
+    if (jit_ctx->input_index >= jit_ctx->columns.size() - 1) {
+#if BE_TEST
+        throw std::runtime_error("[JIT] vector overflow for expr :" + debug_string());
+#else
+        return Status::RuntimeError("[JIT] vector overflow for uncompilable expr");
+#endif
+    }
+    LLVMDatum datum(jit_ctx->builder);
+    datum.value = jit_ctx->builder.CreateLoad(
+            jit_ctx->columns[jit_ctx->input_index].value_type,
+            jit_ctx->builder.CreateInBoundsGEP(jit_ctx->columns[jit_ctx->input_index].value_type,
+                                               jit_ctx->columns[jit_ctx->input_index].values, jit_ctx->index_phi));
+    if (is_nullable()) {
+        datum.null_flag = jit_ctx->builder.CreateLoad(
+                jit_ctx->builder.getInt8Ty(),
+                jit_ctx->builder.CreateInBoundsGEP(jit_ctx->builder.getInt8Ty(),
+                                                   jit_ctx->columns[jit_ctx->input_index].null_flags,
+                                                   jit_ctx->index_phi));
+    }
+    jit_ctx->input_index++;
+    return datum;
+}
+
+void Expr::get_uncompilable_exprs(std::vector<Expr*>& exprs, RuntimeState* state) {
+    if (!this->is_compilable(state)) {
+        exprs.emplace_back(this);
+        return;
+    }
+    for (auto child : this->children()) {
+        child->get_uncompilable_exprs(exprs, state);
+    }
+}
+
+std::string Expr::jit_func_name(RuntimeState* state) const {
+    if (this->is_compilable(state)) {
+        return this->jit_func_name_impl(state);
+    } else {
+        return Expr::jit_func_name_impl(state);
+    }
+}
+
+std::string Expr::jit_func_name_impl(RuntimeState* state) const {
+    DCHECK(!is_compilable(state));
+    // uncompilable inputs, reducing string size.
+    return std::string("col[") + (is_constant() ? "c:" : "") + (is_nullable() ? "n:" : "") + type().debug_string() +
+           "]";
+}
+
+// This method attempts to traverse the entire expression tree from the current expression downwards, seeking to replace expressions with JITExprs.
+// This method searches from top to bottom for compilable expressions.
+// Once a compilable expression is found, it skips over its compilable subexpressions and continues the search downwards.
+Status Expr::replace_compilable_exprs(Expr** expr, ObjectPool* pool, RuntimeState* state, bool& replaced) {
+    if (_node_type == TExprNodeType::DICT_EXPR || _node_type == TExprNodeType::DICT_QUERY_EXPR ||
+        _node_type == TExprNodeType::DICTIONARY_GET_EXPR || _node_type == TExprNodeType::PLACEHOLDER_EXPR ||
+        _node_type == TExprNodeType::MATCH_EXPR) {
+        return Status::OK();
+    }
+    DCHECK(JITEngine::get_instance()->support_jit());
+    if ((*expr)->should_compile(state)) {
+        // If the current expression is compilable, we will replace it with a JITExpr.
+        // This expression and its compilable subexpressions will be compiled into a single function.
+        auto* jit_expr = JITExpr::create(pool, *expr);
+        jit_expr->set_uncompilable_children(state);
+        *expr = jit_expr;
+        replaced = true;
+    }
+
+    for (auto& child : (*expr)->_children) {
+        RETURN_IF_ERROR(child->replace_compilable_exprs(&child, pool, state, replaced));
+    }
+    return Status::OK();
+}
+
+JitScore Expr::compute_jit_score(RuntimeState* state) const {
+    JitScore jit_score = {0, 0};
+    if (!is_compilable(state)) {
+        return jit_score;
+    }
+    for (auto child : _children) {
+        auto tmp = child->compute_jit_score(state);
+        jit_score.score += tmp.score;
+        jit_score.num += tmp.num;
+    }
+    jit_score.num++;
+    jit_score.score++; // helpful by default.
+    return jit_score;
+}
+
+bool Expr::should_compile(RuntimeState* state) const {
+    if (!is_compilable(state) || _children.empty() || is_constant()) {
+        return false;
+    }
+
+    if (state->is_adaptive_jit()) {
+        auto score = compute_jit_score(state);
+        auto valid = (score.score > score.num * IRHelper::jit_score_ratio && score.num > 2);
+        VLOG_QUERY << "JIT score expr: score = " << score.score << " / " << score.num << " = "
+                   << score.score * 1.0 / score.num << " valid = " << valid << "  " << jit_func_name(state);
+        if (!valid) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+bool Expr::support_ngram_bloom_filter(ExprContext* context) const {
+    bool support = false;
+    for (auto& child : _children) {
+        if (child->support_ngram_bloom_filter(context)) {
+            return true;
+        }
+    }
+    return support;
+}
+
+bool Expr::ngram_bloom_filter(ExprContext* context, const BloomFilter* bf,
+                              const NgramBloomFilterReaderOptions& reader_options) const {
+    bool no_need_to_filt = true;
+    for (auto& child : _children) {
+        if (!child->ngram_bloom_filter(context, bf, reader_options)) {
+            return false;
+        }
+    }
+    return no_need_to_filt;
+}
+
+bool Expr::is_index_only_filter() const {
+    bool is_index_only_filter = _is_index_only_filter;
+    for (auto& child : _children) {
+        if (child->is_index_only_filter()) {
+            return true;
+        }
+    }
+    return is_index_only_filter;
+}
+
+SlotId Expr::max_used_slot_id() const {
+    SlotId max_slot_id = 0;
+    for_each_slot_id([&max_slot_id](SlotId slot_id) { max_slot_id = std::max(max_slot_id, slot_id); });
+    return max_slot_id;
 }
 
 } // namespace starrocks

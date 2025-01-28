@@ -1,20 +1,35 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include <type_traits>
 
 #include "column/column.h"
+#include "column/column_helper.h"
 #include "column/nullable_column.h"
+#include "column/vectorized_fwd.h"
 #include "gutil/casts.h"
 #include "roaring/roaring.hh"
+#include "storage/column_predicate.h"
 #include "storage/in_predicate_utils.h"
 #include "storage/rowset/bitmap_index_reader.h"
 #include "storage/rowset/bloom_filter.h"
-#include "storage/vectorized_column_predicate.h"
+#include "types/logical_type.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
-template <FieldType field_type, typename ItemSet>
-class ColumnInPredicate : public ColumnPredicate {
+template <LogicalType field_type, typename ItemSet>
+class ColumnInPredicate final : public ColumnPredicate {
     using ValueType = typename CppTypeTraits<field_type>::CppType;
     static_assert(std::is_same_v<ValueType, typename ItemSet::value_type>);
 
@@ -88,14 +103,16 @@ public:
         return false;
     }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return true; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         range->clear();
         for (auto value : _values) {
             bool exact_match = false;
             Status s = iter->seek_dictionary(&value, &exact_match);
             if (s.ok() && exact_match) {
                 rowid_t seeked_ordinal = iter->current_ordinal();
-                range->add(Range(seeked_ordinal, seeked_ordinal + 1));
+                range->add(Range<>(seeked_ordinal, seeked_ordinal + 1));
             } else if (!s.ok() && !s.is_not_found()) {
                 return s;
             }
@@ -103,12 +120,25 @@ public:
         return Status::OK();
     }
 
-    bool support_bloom_filter() const override { return true; }
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::EQUAL_QUERY;
+        roaring::Roaring indices;
+        for (auto value : _values) {
+            roaring::Roaring index;
+            RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &value, query_type, &index));
+            indices |= index;
+        }
+        *row_bitmap &= indices;
+        return Status::OK();
+    }
 
-    bool bloom_filter(const BloomFilter* bf) const override {
-        static_assert(field_type != OLAP_FIELD_TYPE_HLL, "TODO");
-        static_assert(field_type != OLAP_FIELD_TYPE_OBJECT, "TODO");
-        static_assert(field_type != OLAP_FIELD_TYPE_PERCENTILE, "TODO");
+    bool support_original_bloom_filter() const override { return true; }
+
+    bool original_bloom_filter(const BloomFilter* bf) const override {
+        static_assert(field_type != TYPE_HLL, "TODO");
+        static_assert(field_type != TYPE_OBJECT, "TODO");
+        static_assert(field_type != TYPE_PERCENTILE, "TODO");
         for (const ValueType& v : _values) {
             RETURN_IF(bf->test_bytes(reinterpret_cast<const char*>(&v), sizeof(v)), true);
         }
@@ -147,7 +177,7 @@ public:
 
     std::string debug_string() const override {
         std::stringstream ss;
-        ss << "(columnId=" << _column_id << ",In(";
+        ss << "((columnId=" << _column_id << ")IN(";
         int i = 0;
         for (auto& item : _values) {
             if (i++ != 0) {
@@ -155,7 +185,7 @@ public:
             }
             ss << this->type_info()->to_string(&item);
         }
-        ss << ")";
+        ss << "))";
         return ss.str();
     }
 
@@ -164,8 +194,8 @@ private:
 };
 
 // Template specialization for binary column
-template <FieldType field_type>
-class BinaryColumnInPredicate : public ColumnPredicate {
+template <LogicalType field_type>
+class BinaryColumnInPredicate final : public ColumnPredicate {
 public:
     BinaryColumnInPredicate(const TypeInfoPtr& type_info, ColumnId id, std::vector<std::string> strings)
             : ColumnPredicate(type_info, id), _zero_padded_strs(std::move(strings)) {
@@ -257,7 +287,9 @@ public:
         return false;
     }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return true; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         range->clear();
         for (const std::string& s : _zero_padded_strs) {
             Slice padded_value(s);
@@ -265,7 +297,7 @@ public:
             Status st = iter->seek_dictionary(&padded_value, &exact_match);
             if (st.ok() && exact_match) {
                 rowid_t seeked_ordinal = iter->current_ordinal();
-                range->add(Range(seeked_ordinal, seeked_ordinal + 1));
+                range->add(Range<>(seeked_ordinal, seeked_ordinal + 1));
             } else if (!st.ok() && !st.is_not_found()) {
                 return st;
             }
@@ -273,9 +305,23 @@ public:
         return Status::OK();
     }
 
-    bool support_bloom_filter() const override { return true; }
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::EQUAL_QUERY;
+        roaring::Roaring indices;
+        for (const std::string& s : _zero_padded_strs) {
+            Slice padded_value(s);
+            roaring::Roaring index;
+            RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &padded_value, query_type, &index));
+            indices |= index;
+        }
+        *row_bitmap &= indices;
+        return Status::OK();
+    }
 
-    bool bloom_filter(const BloomFilter* bf) const override {
+    bool support_original_bloom_filter() const override { return true; }
+
+    bool original_bloom_filter(const BloomFilter* bf) const override {
         for (const auto& str : _zero_padded_strs) {
             Slice v(str);
             RETURN_IF(bf->test_bytes(v.data, v.size), true);
@@ -322,116 +368,201 @@ private:
     ItemHashSet<Slice> _slices;
 };
 
+class DictionaryCodeInPredicate final : public ColumnPredicate {
+private:
+    enum LogicOp { ASSIGN, AND, OR };
+
+public:
+    DictionaryCodeInPredicate(const TypeInfoPtr& type_info, ColumnId id, const std::vector<int32_t>& operands,
+                              size_t size)
+            : ColumnPredicate(type_info, id), _bit_mask(size) {
+        for (auto item : operands) {
+            DCHECK(item < size);
+            _bit_mask[item] = 1;
+        }
+    }
+
+    ~DictionaryCodeInPredicate() override = default;
+
+    template <LogicOp Op>
+    inline void t_evaluate(const Column* column, uint8_t* sel, uint16_t from, uint16_t to) const {
+        const Int32Column* dict_code_column = down_cast<const Int32Column*>(ColumnHelper::get_data_column(column));
+        const auto& data = dict_code_column->get_data();
+        Filter filter(to - from, 1);
+
+        if (column->has_null()) {
+            const NullColumn* null_column = down_cast<const NullableColumn*>(column)->null_column().get();
+            const auto& null_data = null_column->get_data();
+            for (auto i = from; i < to; i++) {
+                auto index = data[i] >= _bit_mask.size() ? 0 : data[i];
+                filter[i - from] = (!null_data[i]) & _bit_mask[index];
+            }
+        } else {
+            for (auto i = from; i < to; i++) {
+                filter[i - from] = _bit_mask[data[i]];
+            }
+        }
+
+        for (auto i = from; i < to; i++) {
+            if constexpr (Op == ASSIGN) {
+                sel[i] = filter[i - from];
+            } else if constexpr (Op == AND) {
+                sel[i] &= filter[i - from];
+            } else {
+                sel[i] |= filter[i - from];
+            }
+        }
+    }
+
+    Status evaluate(const Column* column, uint8_t* selection, uint16_t from, uint16_t to) const override {
+        t_evaluate<ASSIGN>(column, selection, from, to);
+        return Status::OK();
+    }
+
+    Status evaluate_and(const Column* column, uint8_t* selection, uint16_t from, uint16_t to) const override {
+        t_evaluate<AND>(column, selection, from, to);
+        return Status::OK();
+    }
+
+    Status evaluate_or(const Column* column, uint8_t* selection, uint16_t from, uint16_t to) const override {
+        t_evaluate<OR>(column, selection, from, to);
+        return Status::OK();
+    }
+
+    bool can_vectorized() const override { return false; }
+
+    PredicateType type() const override { return PredicateType::kInList; }
+
+    Status convert_to(const ColumnPredicate** output, const TypeInfoPtr& target_type_info,
+                      ObjectPool* obj_pool) const override {
+        const auto to_type = target_type_info->type();
+        if (to_type == LogicalType::TYPE_INT) {
+            *output = this;
+            return Status::OK();
+        }
+        CHECK(false) << "Not support, from_type=" << LogicalType::TYPE_INT << ", to_type=" << to_type;
+        return Status::OK();
+    }
+
+private:
+    std::vector<uint8_t> _bit_mask;
+};
+
 template <template <typename, size_t...> typename Set, size_t... Args>
 ColumnPredicate* new_column_in_predicate_generic(const TypeInfoPtr& type_info, ColumnId id,
                                                  const std::vector<std::string>& strs) {
     auto type = type_info->type();
     auto scale = type_info->scale();
     switch (type) {
-    case OLAP_FIELD_TYPE_BOOL: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_BOOL>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_set<OLAP_FIELD_TYPE_BOOL>(strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_BOOL, SetType>(type_info, id, std::move(values));
+    case TYPE_BOOLEAN: {
+        using SetType = Set<CppTypeTraits<TYPE_BOOLEAN>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_set<TYPE_BOOLEAN>(strs);
+        return new ColumnInPredicate<TYPE_BOOLEAN, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_TINYINT: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_TINYINT>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_set<OLAP_FIELD_TYPE_TINYINT>(strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_TINYINT, SetType>(type_info, id, std::move(values));
+    case TYPE_TINYINT: {
+        using SetType = Set<CppTypeTraits<TYPE_TINYINT>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_set<TYPE_TINYINT>(strs);
+        return new ColumnInPredicate<TYPE_TINYINT, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_SMALLINT: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_SMALLINT>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_set<OLAP_FIELD_TYPE_SMALLINT>(strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_SMALLINT, SetType>(type_info, id, std::move(values));
+    case TYPE_SMALLINT: {
+        using SetType = Set<CppTypeTraits<TYPE_SMALLINT>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_set<TYPE_SMALLINT>(strs);
+        return new ColumnInPredicate<TYPE_SMALLINT, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_INT: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_INT>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_set<OLAP_FIELD_TYPE_INT>(strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_INT, SetType>(type_info, id, std::move(values));
+    case TYPE_INT: {
+        using SetType = Set<CppTypeTraits<TYPE_INT>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_set<TYPE_INT>(strs);
+        return new ColumnInPredicate<TYPE_INT, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_BIGINT: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_BIGINT>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_set<OLAP_FIELD_TYPE_BIGINT>(strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_BIGINT, SetType>(type_info, id, std::move(values));
+    case TYPE_BIGINT: {
+        using SetType = Set<CppTypeTraits<TYPE_BIGINT>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_set<TYPE_BIGINT>(strs);
+        return new ColumnInPredicate<TYPE_BIGINT, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_LARGEINT: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_LARGEINT>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_set<OLAP_FIELD_TYPE_LARGEINT>(strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_LARGEINT, SetType>(type_info, id, std::move(values));
+    case TYPE_LARGEINT: {
+        using SetType = Set<CppTypeTraits<TYPE_LARGEINT>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_set<TYPE_LARGEINT>(strs);
+        return new ColumnInPredicate<TYPE_LARGEINT, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_DECIMAL: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_DECIMAL>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_set<OLAP_FIELD_TYPE_DECIMAL>(strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_DECIMAL, SetType>(type_info, id, std::move(values));
+    case TYPE_DECIMAL: {
+        using SetType = Set<CppTypeTraits<TYPE_DECIMAL>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_set<TYPE_DECIMAL>(strs);
+        return new ColumnInPredicate<TYPE_DECIMAL, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_DECIMAL_V2: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_DECIMAL_V2>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_set<OLAP_FIELD_TYPE_DECIMAL_V2>(strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_DECIMAL_V2, SetType>(type_info, id, std::move(values));
+    case TYPE_DECIMALV2: {
+        using SetType = Set<CppTypeTraits<TYPE_DECIMALV2>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_set<TYPE_DECIMALV2>(strs);
+        return new ColumnInPredicate<TYPE_DECIMALV2, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_DECIMAL32: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_DECIMAL32>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_decimal_set<OLAP_FIELD_TYPE_DECIMAL32>(scale, strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_DECIMAL32, SetType>(type_info, id, std::move(values));
+    case TYPE_DECIMAL32: {
+        using SetType = Set<CppTypeTraits<TYPE_DECIMAL32>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_decimal_set<TYPE_DECIMAL32>(scale, strs);
+        return new ColumnInPredicate<TYPE_DECIMAL32, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_DECIMAL64: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_DECIMAL64>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_decimal_set<OLAP_FIELD_TYPE_DECIMAL64>(scale, strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_DECIMAL64, SetType>(type_info, id, std::move(values));
+    case TYPE_DECIMAL64: {
+        using SetType = Set<CppTypeTraits<TYPE_DECIMAL64>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_decimal_set<TYPE_DECIMAL64>(scale, strs);
+        return new ColumnInPredicate<TYPE_DECIMAL64, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_DECIMAL128: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_DECIMAL128>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_decimal_set<OLAP_FIELD_TYPE_DECIMAL128>(scale, strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_DECIMAL128, SetType>(type_info, id, std::move(values));
+    case TYPE_DECIMAL128: {
+        using SetType = Set<CppTypeTraits<TYPE_DECIMAL128>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_decimal_set<TYPE_DECIMAL128>(scale, strs);
+        return new ColumnInPredicate<TYPE_DECIMAL128, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_CHAR:
-        return new BinaryColumnInPredicate<OLAP_FIELD_TYPE_CHAR>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_VARCHAR:
-        return new BinaryColumnInPredicate<OLAP_FIELD_TYPE_VARCHAR>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_DATE: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_DATE>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_set<OLAP_FIELD_TYPE_DATE>(strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_DATE, SetType>(type_info, id, std::move(values));
+    case TYPE_CHAR:
+        return new BinaryColumnInPredicate<TYPE_CHAR>(type_info, id, strs);
+    case TYPE_VARCHAR:
+        return new BinaryColumnInPredicate<TYPE_VARCHAR>(type_info, id, strs);
+    case TYPE_DATE_V1: {
+        using SetType = Set<CppTypeTraits<TYPE_DATE_V1>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_set<TYPE_DATE_V1>(strs);
+        return new ColumnInPredicate<TYPE_DATE_V1, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_DATE_V2: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_DATE_V2>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_set<OLAP_FIELD_TYPE_DATE_V2>(strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_DATE_V2, SetType>(type_info, id, std::move(values));
+    case TYPE_DATE: {
+        using SetType = Set<CppTypeTraits<TYPE_DATE>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_set<TYPE_DATE>(strs);
+        return new ColumnInPredicate<TYPE_DATE, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_DATETIME: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_DATETIME>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_set<OLAP_FIELD_TYPE_DATETIME>(strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_DATETIME, SetType>(type_info, id, std::move(values));
+    case TYPE_DATETIME_V1: {
+        using SetType = Set<CppTypeTraits<TYPE_DATETIME_V1>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_set<TYPE_DATETIME_V1>(strs);
+        return new ColumnInPredicate<TYPE_DATETIME_V1, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_TIMESTAMP: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_TIMESTAMP>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_set<OLAP_FIELD_TYPE_TIMESTAMP>(strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_TIMESTAMP, SetType>(type_info, id, std::move(values));
+    case TYPE_DATETIME: {
+        using SetType = Set<CppTypeTraits<TYPE_DATETIME>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_set<TYPE_DATETIME>(strs);
+        return new ColumnInPredicate<TYPE_DATETIME, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_FLOAT: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_FLOAT>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_set<OLAP_FIELD_TYPE_FLOAT>(strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_FLOAT, SetType>(type_info, id, std::move(values));
+    case TYPE_FLOAT: {
+        using SetType = Set<CppTypeTraits<TYPE_FLOAT>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_set<TYPE_FLOAT>(strs);
+        return new ColumnInPredicate<TYPE_FLOAT, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_DOUBLE: {
-        using SetType = Set<CppTypeTraits<OLAP_FIELD_TYPE_DOUBLE>::CppType, (Args)...>;
-        SetType values = predicate_internal::strings_to_set<OLAP_FIELD_TYPE_DOUBLE>(strs);
-        return new ColumnInPredicate<OLAP_FIELD_TYPE_DOUBLE, SetType>(type_info, id, std::move(values));
+    case TYPE_DOUBLE: {
+        using SetType = Set<CppTypeTraits<TYPE_DOUBLE>::CppType, (Args)...>;
+        SetType values = predicate_internal::strings_to_set<TYPE_DOUBLE>(strs);
+        return new ColumnInPredicate<TYPE_DOUBLE, SetType>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_UNSIGNED_TINYINT:
-    case OLAP_FIELD_TYPE_UNSIGNED_SMALLINT:
-    case OLAP_FIELD_TYPE_UNSIGNED_INT:
-    case OLAP_FIELD_TYPE_UNSIGNED_BIGINT:
-    case OLAP_FIELD_TYPE_DISCRETE_DOUBLE:
-    case OLAP_FIELD_TYPE_STRUCT:
-    case OLAP_FIELD_TYPE_ARRAY:
-    case OLAP_FIELD_TYPE_MAP:
-    case OLAP_FIELD_TYPE_UNKNOWN:
-    case OLAP_FIELD_TYPE_NONE:
-    case OLAP_FIELD_TYPE_HLL:
-    case OLAP_FIELD_TYPE_OBJECT:
-    case OLAP_FIELD_TYPE_PERCENTILE:
-    case OLAP_FIELD_TYPE_JSON:
-    case OLAP_FIELD_TYPE_MAX_VALUE:
+    case TYPE_UNSIGNED_TINYINT:
+    case TYPE_UNSIGNED_SMALLINT:
+    case TYPE_UNSIGNED_INT:
+    case TYPE_UNSIGNED_BIGINT:
+    case TYPE_DISCRETE_DOUBLE:
+    case TYPE_STRUCT:
+    case TYPE_ARRAY:
+    case TYPE_MAP:
+    case TYPE_UNKNOWN:
+    case TYPE_NONE:
+    case TYPE_HLL:
+    case TYPE_OBJECT:
+    case TYPE_PERCENTILE:
+    case TYPE_JSON:
+    case TYPE_NULL:
+    case TYPE_FUNCTION:
+    case TYPE_TIME:
+    case TYPE_BINARY:
+    case TYPE_VARBINARY:
+    case TYPE_MAX_VALUE:
         return nullptr;
         // No default to ensure newly added enumerator will be handled.
     }
@@ -459,4 +590,19 @@ ColumnPredicate* new_column_in_predicate(const TypeInfoPtr& type_info, ColumnId 
     }
 }
 
-} //namespace starrocks::vectorized
+ColumnPredicate* new_dictionary_code_in_predicate(const TypeInfoPtr& type, ColumnId id,
+                                                  const std::vector<int32_t>& operands, size_t size) {
+    DCHECK(is_integer_type(type->type()));
+    if (operands.size() <= 3 || size > 1024) {
+        std::vector<std::string> str_codes;
+        str_codes.reserve(operands.size());
+        for (int code : operands) {
+            str_codes.emplace_back(std::to_string(code));
+        }
+        return new_column_in_predicate(type, id, str_codes);
+    } else {
+        return new DictionaryCodeInPredicate(type, id, operands, size);
+    }
+}
+
+} //namespace starrocks

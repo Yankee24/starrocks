@@ -24,8 +24,8 @@
 namespace starrocks {
 class UidUtilTest : public testing::Test {
 public:
-    UidUtilTest() {}
-    virtual ~UidUtilTest() {}
+    UidUtilTest() = default;
+    ~UidUtilTest() override = default;
 };
 
 TEST_F(UidUtilTest, UniqueId) {
@@ -107,6 +107,25 @@ TEST_F(UidUtilTest, Hash) {
         tuid.__set_lo(1);
 
         ASSERT_NE(hasher(uid), hasher(tuid));
+    }
+}
+
+TEST_F(UidUtilTest, PrintId) {
+    {
+        UniqueId id(12345678987654321, 98765432123456789);
+        ASSERT_STREQ("002bdc54-6291-f4b1-015e-e2a321ce7d15", print_id(id).c_str());
+    }
+    {
+        PUniqueId puid;
+        puid.set_hi(12345678987654321);
+        puid.set_lo(98765432123456789);
+        ASSERT_STREQ("002bdc54-6291-f4b1-015e-e2a321ce7d15", print_id(puid).c_str());
+    }
+    {
+        TUniqueId tuid;
+        tuid.__set_hi(12345678987654321);
+        tuid.__set_lo(98765432123456789);
+        ASSERT_STREQ("002bdc54-6291-f4b1-015e-e2a321ce7d15", print_id(tuid).c_str());
     }
 }
 

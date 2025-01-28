@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/RandomDistributionInfo.java
 
@@ -21,20 +34,24 @@
 
 package com.starrocks.catalog;
 
+import com.google.common.base.Objects;
 import com.google.common.collect.Lists;
-import com.starrocks.analysis.DistributionDesc;
-import com.starrocks.analysis.RandomDistributionDesc;
+import com.google.gson.annotations.SerializedName;
+import com.starrocks.sql.ast.DistributionDesc;
+import com.starrocks.sql.ast.RandomDistributionDesc;
 
-import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Random partition.
  */
 public class RandomDistributionInfo extends DistributionInfo {
 
+    @SerializedName("b")
     private int bucketNum;
 
     public RandomDistributionInfo() {
@@ -47,9 +64,13 @@ public class RandomDistributionInfo extends DistributionInfo {
     }
 
     @Override
-    public DistributionDesc toDistributionDesc() {
-        DistributionDesc distributionDesc = new RandomDistributionDesc(bucketNum);
-        return distributionDesc;
+    public DistributionDesc toDistributionDesc(Map<ColumnId, Column> schema) {
+        return new RandomDistributionDesc(bucketNum);
+    }
+
+    @Override
+    public boolean supportColocate() {
+        return false;
     }
 
     @Override
@@ -58,9 +79,22 @@ public class RandomDistributionInfo extends DistributionInfo {
     }
 
     @Override
-    public String toSql() {
+    public void setBucketNum(int bucketNum) {
+        this.bucketNum = bucketNum;
+    }
+
+    @Override
+    public RandomDistributionInfo copy() {
+        return new RandomDistributionInfo(bucketNum);
+    }
+
+    @Override
+    public String toSql(Map<ColumnId, Column> schema) {
         StringBuilder builder = new StringBuilder();
-        builder.append("DISTRIBUTED BY RANDOM BUCKETS ").append(bucketNum);
+        builder.append("DISTRIBUTED BY RANDOM");
+        if (bucketNum > 0) {
+            builder.append(" BUCKETS ").append(bucketNum);
+        }
         return builder.toString();
     }
 
@@ -69,15 +103,14 @@ public class RandomDistributionInfo extends DistributionInfo {
         out.writeInt(bucketNum);
     }
 
-    public void readFields(DataInput in) throws IOException {
-        super.readFields(in);
-        bucketNum = in.readInt();
+    @Override
+    public List<ColumnId> getDistributionColumns() {
+        return Collections.emptyList();
     }
 
-    public static DistributionInfo read(DataInput in) throws IOException {
-        DistributionInfo distributionInfo = new RandomDistributionInfo();
-        distributionInfo.readFields(in);
-        return distributionInfo;
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(type, bucketNum);
     }
 
     @Override

@@ -17,13 +17,13 @@
 
 package com.starrocks.http.action;
 
-import com.starrocks.analysis.SetType;
 import com.starrocks.common.Config;
 import com.starrocks.http.ActionController;
 import com.starrocks.http.BaseRequest;
 import com.starrocks.http.BaseResponse;
 import com.starrocks.http.IllegalArgException;
-import com.starrocks.qe.VariableMgr;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.SetType;
 import io.netty.handler.codec.http.HttpMethod;
 
 import java.util.HashMap;
@@ -68,7 +68,8 @@ public class VariableAction extends WebBaseAction {
     private void appendVariableInfo(StringBuilder buffer) {
         buffer.append("<h2>Variable Info</h2>");
         buffer.append("<pre>");
-        List<List<String>> variableInfo = VariableMgr.dump(SetType.GLOBAL, null, null);
+        List<List<String>> variableInfo = GlobalStateMgr.getCurrentState().getVariableMgr()
+                .dump(SetType.GLOBAL, null, null);
         for (List<String> list : variableInfo) {
             buffer.append(list.get(0) + "=" + list.get(1) + "\n");
         }

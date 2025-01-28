@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/common/proc/DbsProcDirTest.java
 
@@ -70,27 +83,27 @@ public class DbsProcDirTest {
     public void testLookupNormal() throws AnalysisException {
         new Expectations(globalStateMgr) {
             {
-                globalStateMgr.getDb("db1");
+                globalStateMgr.getLocalMetastore().getDb("db1");
                 minTimes = 0;
                 result = db1;
 
-                globalStateMgr.getDb("db2");
+                globalStateMgr.getLocalMetastore().getDb("db2");
                 minTimes = 0;
                 result = db2;
 
-                globalStateMgr.getDb("db3");
+                globalStateMgr.getLocalMetastore().getDb("db3");
                 minTimes = 0;
                 result = null;
 
-                globalStateMgr.getDb(db1.getId());
+                globalStateMgr.getLocalMetastore().getDb(db1.getId());
                 minTimes = 0;
                 result = db1;
 
-                globalStateMgr.getDb(db2.getId());
+                globalStateMgr.getLocalMetastore().getDb(db2.getId());
                 minTimes = 0;
                 result = db2;
 
-                globalStateMgr.getDb(anyLong);
+                globalStateMgr.getLocalMetastore().getDb(anyLong);
                 minTimes = 0;
                 result = null;
             }
@@ -147,31 +160,31 @@ public class DbsProcDirTest {
     public void testFetchResultNormal() throws AnalysisException {
         new Expectations(globalStateMgr) {
             {
-                globalStateMgr.getDbNames();
+                globalStateMgr.getLocalMetastore().listDbNames();
                 minTimes = 0;
                 result = Lists.newArrayList("db1", "db2");
 
-                globalStateMgr.getDb("db1");
+                globalStateMgr.getLocalMetastore().getDb("db1");
                 minTimes = 0;
                 result = db1;
 
-                globalStateMgr.getDb("db2");
+                globalStateMgr.getLocalMetastore().getDb("db2");
                 minTimes = 0;
                 result = db2;
 
-                globalStateMgr.getDb("db3");
+                globalStateMgr.getLocalMetastore().getDb("db3");
                 minTimes = 0;
                 result = null;
 
-                globalStateMgr.getDb(db1.getId());
+                globalStateMgr.getLocalMetastore().getDb(db1.getId());
                 minTimes = 0;
                 result = db1;
 
-                globalStateMgr.getDb(db2.getId());
+                globalStateMgr.getLocalMetastore().getDb(db2.getId());
                 minTimes = 0;
                 result = db2;
 
-                globalStateMgr.getDb(anyLong);
+                globalStateMgr.getLocalMetastore().getDb(anyLong);
                 minTimes = 0;
                 result = null;
             }
@@ -189,10 +202,10 @@ public class DbsProcDirTest {
                 Lists.newArrayList("DbId", "DbName", "TableNum", "Quota", "LastConsistencyCheckTime", "ReplicaQuota"),
                 result.getColumnNames());
         List<List<String>> rows = Lists.newArrayList();
-        rows.add(Arrays.asList(String.valueOf(db1.getId()), db1.getFullName(), "0", "8388608.000 TB",
-                FeConstants.null_string, "9223372036854775807"));
-        rows.add(Arrays.asList(String.valueOf(db2.getId()), db2.getFullName(), "0", "8388608.000 TB",
-                FeConstants.null_string, "9223372036854775807"));
+        rows.add(Arrays.asList(String.valueOf(db1.getId()), db1.getOriginName(), "0", "8388608.000 TB",
+                FeConstants.NULL_STRING, "9223372036854775807"));
+        rows.add(Arrays.asList(String.valueOf(db2.getId()), db2.getOriginName(), "0", "8388608.000 TB",
+                FeConstants.NULL_STRING, "9223372036854775807"));
         Assert.assertEquals(rows, result.getRows());
     }
 
@@ -200,7 +213,7 @@ public class DbsProcDirTest {
     public void testFetchResultInvalid() throws AnalysisException {
         new Expectations(globalStateMgr) {
             {
-                globalStateMgr.getDbNames();
+                globalStateMgr.getLocalMetastore().listDbNames();
                 minTimes = 0;
                 result = null;
             }

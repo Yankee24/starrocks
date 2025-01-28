@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/backup/BackupHandler.java
 
@@ -22,38 +35,54 @@
 package com.starrocks.backup;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import com.starrocks.analysis.AbstractBackupStmt;
-import com.starrocks.analysis.BackupStmt;
-import com.starrocks.analysis.BackupStmt.BackupType;
-import com.starrocks.analysis.CancelBackupStmt;
-import com.starrocks.analysis.CreateRepositoryStmt;
-import com.starrocks.analysis.DropRepositoryStmt;
-import com.starrocks.analysis.PartitionNames;
-import com.starrocks.analysis.RestoreStmt;
+import com.google.gson.annotations.SerializedName;
+import com.starrocks.analysis.FunctionName;
 import com.starrocks.analysis.TableRef;
 import com.starrocks.backup.AbstractJob.JobType;
 import com.starrocks.backup.BackupJob.BackupJobState;
 import com.starrocks.backup.BackupJobInfo.BackupTableInfo;
+import com.starrocks.backup.mv.MvRestoreContext;
+import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Database;
-import com.starrocks.catalog.KeysType;
+import com.starrocks.catalog.Function;
+import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
+import com.starrocks.catalog.MaterializedView;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Table;
-import com.starrocks.catalog.Table.TableType;
-import com.starrocks.cluster.ClusterNamespace;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
-import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.Pair;
 import com.starrocks.common.io.Writable;
-import com.starrocks.common.util.MasterDaemon;
+import com.starrocks.common.util.FrontendDaemon;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
+import com.starrocks.memory.MemoryTrackable;
+import com.starrocks.persist.ImageWriter;
+import com.starrocks.persist.metablock.SRMetaBlockEOFException;
+import com.starrocks.persist.metablock.SRMetaBlockException;
+import com.starrocks.persist.metablock.SRMetaBlockID;
+import com.starrocks.persist.metablock.SRMetaBlockReader;
+import com.starrocks.persist.metablock.SRMetaBlockWriter;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.WarehouseManager;
+import com.starrocks.sql.ast.AbstractBackupStmt;
+import com.starrocks.sql.ast.BackupStmt;
+import com.starrocks.sql.ast.BackupStmt.BackupType;
+import com.starrocks.sql.ast.CancelBackupStmt;
+import com.starrocks.sql.ast.CatalogRef;
+import com.starrocks.sql.ast.CreateRepositoryStmt;
+import com.starrocks.sql.ast.DropRepositoryStmt;
+import com.starrocks.sql.ast.FunctionRef;
+import com.starrocks.sql.ast.PartitionNames;
+import com.starrocks.sql.ast.RestoreStmt;
 import com.starrocks.task.DirMoveTask;
 import com.starrocks.task.DownloadTask;
 import com.starrocks.task.SnapshotTask;
@@ -64,26 +93,37 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
-import java.io.DataInputStream;
 import java.io.DataOutput;
-import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
 
-public class BackupHandler extends MasterDaemon implements Writable {
+import static com.starrocks.scheduler.MVActiveChecker.MV_BACKUP_INACTIVE_REASON;
+
+public class BackupHandler extends FrontendDaemon implements Writable, MemoryTrackable {
+
     private static final Logger LOG = LogManager.getLogger(BackupHandler.class);
+    
+    private static final long FAKE_DB_ID = -1;
 
     public static final int SIGNATURE_VERSION = 1;
     public static final Path BACKUP_ROOT_DIR = Paths.get(Config.tmp_dir, "backup").normalize();
     public static final Path RESTORE_ROOT_DIR = Paths.get(Config.tmp_dir, "restore").normalize();
 
+    public static final Path TEST_BACKUP_ROOT_DIR = Paths.get(Config.tmp_dir, "test_backup").normalize();
+
+    @SerializedName("rm")
     private RepositoryMgr repoMgr = new RepositoryMgr();
 
     // db id -> last running or finished backup/restore jobs
@@ -92,7 +132,11 @@ public class BackupHandler extends MasterDaemon implements Writable {
     // If the last job is finished, user can get the job info from repository. If the last job is cancelled,
     // user can get the error message before submitting the next one.
     // Use ConcurrentMap to get rid of locks.
-    private Map<Long, AbstractJob> dbIdToBackupOrRestoreJob = Maps.newConcurrentMap();
+    // Backup/Restore job for external catalog using -1 to identify the job in dbIdToBackupOrRestoreJob
+    // which means that only one external catalog backup/restore job can be run in entire cluster
+    protected Map<Long, AbstractJob> dbIdToBackupOrRestoreJob = Maps.newConcurrentMap();
+
+    protected MvRestoreContext mvRestoreContext = new MvRestoreContext();
 
     // this lock is used for handling one backup or restore request at a time.
     private ReentrantLock seqlock = new ReentrantLock();
@@ -177,12 +221,14 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
     // handle create repository stmt
     public void createRepository(CreateRepositoryStmt stmt) throws DdlException {
-        if (!globalStateMgr.getBrokerMgr().containsBroker(stmt.getBrokerName())) {
-            ErrorReport
-                    .reportDdlException(ErrorCode.ERR_COMMON_ERROR, "broker does not exist: " + stmt.getBrokerName());
+        if (stmt.hasBroker()) {
+            if (!globalStateMgr.getBrokerMgr().containsBroker(stmt.getBrokerName())) {
+                ErrorReport
+                        .reportDdlException(ErrorCode.ERR_COMMON_ERROR, "broker does not exist: " + stmt.getBrokerName());
+            }
         }
 
-        BlobStorage storage = new BlobStorage(stmt.getBrokerName(), stmt.getProperties());
+        BlobStorage storage = new BlobStorage(stmt.getBrokerName(), stmt.getProperties(), stmt.hasBroker());
         long repoId = globalStateMgr.getNextId();
         Repository repo = new Repository(repoId, stmt.getName(), stmt.isReadOnly(), stmt.getLocation(), storage);
 
@@ -225,15 +271,67 @@ public class BackupHandler extends MasterDaemon implements Writable {
         // check if repo exist
         String repoName = stmt.getRepoName();
         Repository repository = repoMgr.getRepo(repoName);
+        Database db = null;
+        BackupJobInfo jobInfo = null;
         if (repository == null) {
             ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR, "Repository " + repoName + " does not exist");
         }
 
-        // check if db exist
-        String dbName = stmt.getDbName();
-        Database db = globalStateMgr.getDb(dbName);
-        if (db == null) {
-            ErrorReport.reportDdlException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
+        if (stmt instanceof RestoreStmt) {
+            // Check if snapshot exist in repository, if existed, get jobInfo for restore process
+            List<BackupJobInfo> infos = Lists.newArrayList();
+            Status status = repository.getSnapshotInfoFile(stmt.getLabel(), ((RestoreStmt) stmt).getBackupTimestamp(), infos);
+            if (!status.ok()) {
+                ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
+                        "Failed to get info of snapshot '" + stmt.getLabel() + "' because: "
+                                + status.getErrMsg() + ". Maybe specified wrong backup timestamp");
+            }
+            Preconditions.checkState(infos.size() == 1);
+            jobInfo = infos.get(0);
+
+            if (jobInfo.dbName == null || jobInfo.dbName.isEmpty()) {
+                // if jobInfo.dbName == null, means that this snapshot only contains external catalog info
+                if ((stmt.getOriginDbName() != null && !stmt.getOriginDbName().isEmpty()) ||
+                        stmt.getDbName() != null && !stmt.getDbName().isEmpty()) {
+                    ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
+                                                   "Can not specify database for external catalog snapshot");
+                }
+
+                if (!stmt.containsExternalCatalog()) {
+                    // set `ALL` flag for external catalog restore if no `CATALOG(s)` set in restore stmt
+                    stmt.setAllExternalCatalog();
+                }
+            } else if (stmt.containsExternalCatalog()) {
+                ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
+                                "This is not a snapshot for external catalog restore, snapshot: " + stmt.getLabel());
+            }
+        }
+
+        if (!stmt.containsExternalCatalog()) {
+            // check if db exist
+            String dbName = stmt.getDbName();
+            if (dbName == null) {
+                // if target dbName if null, use dbName in snapshot
+                dbName = jobInfo.dbName;
+            }
+    
+            db = globalStateMgr.getLocalMetastore().getDb(dbName);
+            if (db == null) {
+                if (stmt instanceof RestoreStmt) {
+                    try {
+                        globalStateMgr.getLocalMetastore().createDb(dbName, null);
+                        db = globalStateMgr.getLocalMetastore().getDb(dbName);
+                        if (db == null) {
+                            ErrorReport.reportDdlException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
+                        }
+                    } catch (Exception e) {
+                        ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
+                                    "Can not create database: " + dbName + " in restore process");
+                    }
+                } else {
+                    ErrorReport.reportDdlException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
+                }
+            }
         }
 
         // Try to get sequence lock.
@@ -243,8 +341,11 @@ public class BackupHandler extends MasterDaemon implements Writable {
         tryLock();
         try {
             // Check if there is backup or restore job running on this database
-            AbstractJob currentJob = dbIdToBackupOrRestoreJob.get(db.getId());
-            if (currentJob != null && !currentJob.isDone()) {
+            AbstractJob currentJob = dbIdToBackupOrRestoreJob.get(stmt.containsExternalCatalog() ? FAKE_DB_ID : db.getId());
+            if (currentJob != null && currentJob.getDbId() == FAKE_DB_ID && !currentJob.isDone()) {
+                ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
+                        "Can only run one backup or restore job of external catalog");
+            } else if (currentJob != null && !currentJob.isDone()) {
                 ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
                         "Can only run one backup or restore job of a database at same time");
             }
@@ -252,7 +353,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
             if (stmt instanceof BackupStmt) {
                 backup(repository, db, (BackupStmt) stmt);
             } else if (stmt instanceof RestoreStmt) {
-                restore(repository, db, (RestoreStmt) stmt);
+                restore(repository, db, (RestoreStmt) stmt, jobInfo);
             }
         } finally {
             seqlock.unlock();
@@ -278,38 +379,45 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
 
         // Check if backup objects are valid
-        // This is just a pre-check to avoid most of invalid backup requests.
+        // This is just a pre-check to avoid most of the invalid backup requests.
         // Also calculate the signature for incremental backup check.
         List<TableRef> tblRefs = stmt.getTableRefs();
         BackupMeta curBackupMeta = null;
-        db.readLock();
+        Locker locker = new Locker();
+        if (!stmt.containsExternalCatalog()) {
+            locker.lockDatabase(db.getId(), LockType.READ);
+        }
         try {
             List<Table> backupTbls = Lists.newArrayList();
             for (TableRef tblRef : tblRefs) {
                 String tblName = tblRef.getName().getTbl();
-                Table tbl = db.getTable(tblName);
+                Table tbl = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), tblName);
                 if (tbl == null) {
                     ErrorReport.reportDdlException(ErrorCode.ERR_BAD_TABLE_ERROR, tblName);
+                    return;
                 }
-                if (tbl.getType() != TableType.OLAP) {
-                    ErrorReport.reportDdlException(ErrorCode.ERR_NOT_OLAP_TABLE, tblName);
+                if (!tbl.isSupportBackupRestore()) {
+                    ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
+                                                   "Table: " + tblName + " can not support backup restore, type: " +
+                                                   tbl.getType());
+                }
+
+                if (tbl.isOlapView()) {
+                    backupTbls.add(tbl);
+                    continue;
                 }
 
                 OlapTable olapTbl = (OlapTable) tbl;
-                if (olapTbl.getKeysType() == KeysType.PRIMARY_KEYS) {
-                    ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
-                            "backup do not support primary key table: " + tblName);
-                }
                 if (olapTbl.existTempPartitions()) {
                     ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
-                            "Do not support backup table with temp partitions");
+                            "Do not support backing up table with temp partitions");
                 }
 
                 PartitionNames partitionNames = tblRef.getPartitionNames();
                 if (partitionNames != null) {
                     if (partitionNames.isTemp()) {
                         ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
-                                "Do not support backuping temp partitions");
+                                "Do not support backing up temp partitions");
                     }
 
                     for (String partName : partitionNames.getPartitionNames()) {
@@ -328,11 +436,18 @@ public class BackupHandler extends MasterDaemon implements Writable {
                     ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
                             "Failed to copy table " + tblName + " with selected partitions");
                 }
+                if (copiedTbl.isMaterializedView()) {
+                    MaterializedView copiedMv = (MaterializedView) copiedTbl;
+                    copiedMv.setInactiveAndReason(String.format("Set the materialized view %s inactive because %s",
+                            copiedMv.getName(), MV_BACKUP_INACTIVE_REASON));
+                }
                 backupTbls.add(copiedTbl);
             }
             curBackupMeta = new BackupMeta(backupTbls);
         } finally {
-            db.readUnlock();
+            if (!stmt.containsExternalCatalog()) {
+                locker.unLockDatabase(db.getId(), LockType.READ);   
+            }
         }
 
         // Check if label already be used
@@ -370,53 +485,164 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
 
         // Create a backup job
-        BackupJob backupJob = new BackupJob(stmt.getLabel(), db.getId(),
-                ClusterNamespace.getNameFromFullName(db.getFullName()),
-                tblRefs, stmt.getTimeoutMs(),
-                globalStateMgr, repository.getId());
+        long dbId = stmt.containsExternalCatalog() ? FAKE_DB_ID : db.getId();
+        String dbName = stmt.containsExternalCatalog() ? "" : db.getOriginName();
+
+        BackupJob backupJob = new BackupJob(stmt.getLabel(), dbId, dbName, tblRefs,
+                stmt.getTimeoutMs(), globalStateMgr, repository.getId());
+        List<Function> allFunctions = Lists.newArrayList();
+        for (FunctionRef fnRef : stmt.getFnRefs()) {
+            allFunctions.addAll(fnRef.getFunctions());
+        }
+        backupJob.setBackupFunctions(allFunctions);
+        backupJob.setBackupCatalogs(stmt.getExternalCatalogRefs().stream()
+                                    .map(CatalogRef::getCatalog).collect(Collectors.toList()));
         // write log
         globalStateMgr.getEditLog().logBackupJob(backupJob);
 
         // must put to dbIdToBackupOrRestoreJob after edit log, otherwise the state of job may be changed.
-        dbIdToBackupOrRestoreJob.put(db.getId(), backupJob);
+        dbIdToBackupOrRestoreJob.put(dbId, backupJob);
 
         LOG.info("finished to submit backup job: {}", backupJob);
     }
 
-    private void restore(Repository repository, Database db, RestoreStmt stmt) throws DdlException {
-        // Check if snapshot exist in repository
-        List<BackupJobInfo> infos = Lists.newArrayList();
-        Status status = repository.getSnapshotInfoFile(stmt.getLabel(), stmt.getBackupTimestamp(), infos);
-        if (!status.ok()) {
+    private void restore(Repository repository, Database db, RestoreStmt stmt, BackupJobInfo jobInfo) throws DdlException {
+        BackupMeta backupMeta = downloadAndDeserializeMetaInfo(jobInfo, repository, stmt);
+
+        // check the original dbName existed in snapshot or not
+        if (!stmt.getOriginDbName().isEmpty() && !stmt.getOriginDbName().equals(jobInfo.dbName)) {
             ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
-                    "Failed to get info of snapshot '" + stmt.getLabel() + "' because: "
-                            + status.getErrMsg() + ". Maybe specified wrong backup timestamp");
+                        "target database: " + stmt.getOriginDbName() + " is not existed in snapshot");
         }
 
-        // Check if all restore objects are exist in this snapshot.
-        // Also remove all unrelated objs
-        Preconditions.checkState(infos.size() == 1);
-        BackupJobInfo jobInfo = infos.get(0);
-        checkAndFilterRestoreObjsExistInSnapshot(jobInfo, stmt.getTableRefs());
+        // If restore statement contains `ON` clause, filter the specified backup objects which are needed through infomation
+        // provide in stmt and BackupMeta.
+        if (stmt.withOnClause()) {
+            checkAndFilterRestoreObjsExistInSnapshot(jobInfo, stmt.getTableRefs(), stmt, backupMeta);
+        }
+
+        // For UDFs restore, restore all functions in BackupMeta if statement does not contains `ON` clause or contains `ON`
+        // and `ALL` clause for functions. Otherwise, restore the functions specified after `ON` clause in restore statement.
+        if (stmt.withOnClause() && backupMeta != null) {
+            checkAndFilterRestoreFunctionsInBackupMeta(stmt, backupMeta);
+        }
+
+        if (stmt.containsExternalCatalog()) {
+            checkAndFilterRestoreCatalogsInBackupMeta(stmt, backupMeta);
+        }
 
         // Create a restore job
-        RestoreJob restoreJob = new RestoreJob(stmt.getLabel(), stmt.getBackupTimestamp(),
-                db.getId(), db.getFullName(), jobInfo, stmt.allowLoad(), stmt.getReplicationNum(),
-                stmt.getTimeoutMs(), stmt.getMetaVersion(), stmt.getStarRocksMetaVersion(), globalStateMgr,
-                repository.getId());
+        RestoreJob restoreJob = null;
+        if (backupMeta != null) {
+            for (BackupTableInfo tblInfo : jobInfo.tables.values()) {
+                Table remoteTbl = backupMeta.getTable(tblInfo.name);
+                if (!remoteTbl.isSupportBackupRestore()) {
+                    ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
+                                                   "Table: " + remoteTbl.getName() +
+                                                   " can not support backup restore, type: " + remoteTbl.getType());
+                }
+                mvRestoreContext.addIntoMvBaseTableBackupInfoIfNeeded(db.getOriginName(), remoteTbl, jobInfo, tblInfo);
+            }
+        }
+
+        long dbId = stmt.containsExternalCatalog() ? FAKE_DB_ID : db.getId();
+        String dbName = stmt.containsExternalCatalog() ? "" : db.getOriginName();
+
+        restoreJob = new RestoreJob(stmt.getLabel(), stmt.getBackupTimestamp(),
+                dbId, dbName, jobInfo, stmt.allowLoad(), stmt.getReplicationNum(),
+                stmt.getTimeoutMs(), globalStateMgr, repository.getId(), backupMeta, mvRestoreContext);
         globalStateMgr.getEditLog().logRestoreJob(restoreJob);
 
         // must put to dbIdToBackupOrRestoreJob after edit log, otherwise the state of job may be changed.
-        dbIdToBackupOrRestoreJob.put(db.getId(), restoreJob);
+        dbIdToBackupOrRestoreJob.put(dbId, restoreJob);
 
         LOG.info("finished to submit restore job: {}", restoreJob);
     }
 
-    private void checkAndFilterRestoreObjsExistInSnapshot(BackupJobInfo jobInfo, List<TableRef> tblRefs)
-            throws DdlException {
+    protected BackupMeta downloadAndDeserializeMetaInfo(BackupJobInfo jobInfo, Repository repo, RestoreStmt stmt) {
+        // the meta version is used when reading backup meta from file.
+        // we do not persist this field, because this is just a temporary solution.
+        // the true meta version should be getting from backup job info, which is saved when doing backup job.
+        // But the earlier version of StarRocks do not save the meta version in backup job info, so we allow user to
+        // set this 'metaVersion' in restore stmt.
+        // NOTICE: because we do not persist it, this info may be lost if Frontend restart,
+        // and if you don't want to lose it, backup your data again by using latest StarRocks version.
+        List<BackupMeta> backupMetas = Lists.newArrayList();
+        Status st = repo.getSnapshotMetaFile(jobInfo.name, backupMetas,
+                stmt.getMetaVersion() == -1 ? jobInfo.metaVersion : stmt.getMetaVersion(),
+                stmt.getStarRocksMetaVersion() == -1 ? jobInfo.starrocksMetaVersion : stmt.getStarRocksMetaVersion());
+        if (!st.ok()) {
+            return null;
+        }
+        Preconditions.checkState(backupMetas.size() == 1);
+        return backupMetas.get(0);
+    }
+
+    protected void checkAndFilterRestoreCatalogsInBackupMeta(RestoreStmt stmt, BackupMeta backupMeta) throws DdlException {
+        List<Catalog> catalogsInBackupMeta = backupMeta.getCatalogs();
+        List<Catalog> restoredCatalogs = Lists.newArrayList();
+        for (CatalogRef catalogRef : stmt.getExternalCatalogRefs()) {
+            Optional<Catalog> hitCatalog = catalogsInBackupMeta.stream().filter(x -> catalogRef.getCatalogName()
+                                    .equalsIgnoreCase(x.getName())).findFirst();
+            if (!hitCatalog.isPresent()) {
+                ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
+                                               "Can not find restore catalog: " + catalogRef.getCatalogName());
+            }
+
+            if (catalogRef.getAlias() != null && !catalogRef.getAlias().isEmpty()) {
+                if (catalogRef.getAlias().equalsIgnoreCase(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME)) {
+                    ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
+                                "Do not support set alias as default catalog for external catalog restore");   
+                }
+                hitCatalog.get().setName(catalogRef.getAlias());
+            }
+
+            restoredCatalogs.add(hitCatalog.get());
+        }
+
+        if (!restoredCatalogs.isEmpty()) {
+            backupMeta.setCatalogs(restoredCatalogs);
+        }
+    }
+
+    protected void checkAndFilterRestoreFunctionsInBackupMeta(RestoreStmt stmt, BackupMeta backupMeta) throws DdlException {
+        List<Function> functionsInBackupMeta = backupMeta.getFunctions();
+        List<Function> restoredFunctions = Lists.newArrayList();
+        Set<String> hitFnNames = Sets.newHashSet();
+        for (FunctionRef fnRef : stmt.getFnRefs()) {
+            List<Function> hitFunc = functionsInBackupMeta.stream().filter(x -> fnRef.checkSameFunctionNameForRestore(x))
+                                     .collect(Collectors.toList());
+            if (hitFunc.isEmpty()) {
+                ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
+                                               "Can not find restore function: " + fnRef.getFnName().toString());
+            }
+
+            if (fnRef.getAlias() != null && !fnRef.getAlias().isEmpty()) {
+                hitFunc.stream().forEach(fn -> fn.setFunctionName(
+                                         new FunctionName(fn.getFunctionName().getDb(), fnRef.getAlias())));
+            }
+            hitFnNames.add(hitFunc.get(0).getFunctionName().getFunction());
+            restoredFunctions.addAll(hitFunc);
+        }
+
+        if (stmt.allFunction()) {
+            for (Function fn : functionsInBackupMeta) {
+                if (hitFnNames.contains(fn.getFunctionName().getFunction())) {
+                    continue;
+                }
+                restoredFunctions.add(fn);
+            }
+        }
+        backupMeta.setFunctions(restoredFunctions);
+    }
+
+    private void checkAndFilterRestoreObjsExistInSnapshot(BackupJobInfo jobInfo, List<TableRef> tblRefs, RestoreStmt stmt,
+            BackupMeta backupMeta) throws DdlException {
         Set<String> allTbls = Sets.newHashSet();
+        Set<String> originTblName = Sets.newHashSet();
         for (TableRef tblRef : tblRefs) {
             String tblName = tblRef.getName().getTbl();
+            originTblName.add(tblName);
             if (!jobInfo.containsTbl(tblName)) {
                 ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
                         "Table " + tblName + " does not exist in snapshot " + jobInfo.name);
@@ -448,18 +674,45 @@ public class BackupHandler extends MasterDaemon implements Writable {
             allTbls.add(tblName);
         }
 
+        if (backupMeta != null) {
+            if (stmt.allTable()) {
+                allTbls.addAll(backupMeta.getTables().values().stream()
+                               .filter(x -> x.isOlapTable() && !originTblName.contains(x.getName()))
+                               .map(x -> x.getName()).collect(Collectors.toSet()));
+            }
+
+            if (stmt.allMV()) {
+                allTbls.addAll(backupMeta.getTables().values().stream()
+                               .filter(x -> x.isOlapMaterializedView() && !originTblName.contains(x.getName()))
+                               .map(x -> x.getName()).collect(Collectors.toSet()));
+            }
+
+            if (stmt.allView()) {
+                allTbls.addAll(backupMeta.getTables().values().stream()
+                               .filter(x -> x.isOlapView() && !originTblName.contains(x.getName()))
+                               .map(x -> x.getName()).collect(Collectors.toSet()));
+            }
+        }
+
         // only retain restore tables
         jobInfo.retainTables(allTbls);
     }
 
-    public void cancel(CancelBackupStmt stmt) throws DdlException {
-        String dbName = stmt.getDbName();
-        Database db = globalStateMgr.getDb(dbName);
+    public AbstractJob getAbstractJob(boolean isExternalCatalog, String dbName) throws DdlException {
+        return isExternalCatalog ? dbIdToBackupOrRestoreJob.get(FAKE_DB_ID) : getAbstractJobByDbName(dbName);
+    }
+
+    public AbstractJob getAbstractJobByDbName(String dbName) throws DdlException {
+        Database db = globalStateMgr.getLocalMetastore().getDb(dbName);
         if (db == null) {
             ErrorReport.reportDdlException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
         }
+        return dbIdToBackupOrRestoreJob.get(db.getId());
+    }
 
-        AbstractJob job = dbIdToBackupOrRestoreJob.get(db.getId());
+    public void cancel(CancelBackupStmt stmt) throws DdlException {
+        AbstractJob job = null;
+        job = getAbstractJob(stmt.isExternalCatalog(), stmt.getDbName());
         if (job == null || (job instanceof BackupJob && stmt.isRestore())
                 || (job instanceof RestoreJob && !stmt.isRestore())) {
             ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR, "No "
@@ -559,7 +812,12 @@ public class BackupHandler extends MasterDaemon implements Writable {
             // for example: In restore job, PENDING will transfer to SNAPSHOTING, not DOWNLOAD.
             job.replayRun();
         }
+        if (isJobExpired(job, System.currentTimeMillis())) {
+            LOG.warn("skip expired job {}", job);
+            return;
+        }
         dbIdToBackupOrRestoreJob.put(job.getDbId(), job);
+        mvRestoreContext.addIntoMvBaseTableBackupInfo(job);
     }
 
     public boolean report(TTaskType type, long jobId, long taskId, int finishedNum, int totalNum) {
@@ -598,26 +856,89 @@ public class BackupHandler extends MasterDaemon implements Writable {
     public void readFields(DataInput in) throws IOException {
         repoMgr = RepositoryMgr.read(in);
 
+        long currentTimeMs = System.currentTimeMillis();
         int size = in.readInt();
         for (int i = 0; i < size; i++) {
             AbstractJob job = AbstractJob.read(in);
+            if (isJobExpired(job, currentTimeMs)) {
+                LOG.warn("skip expired job {}", job);
+                continue;
+            }
             dbIdToBackupOrRestoreJob.put(job.getDbId(), job);
+            mvRestoreContext.addIntoMvBaseTableBackupInfo(job);
+        }
+        LOG.info("finished replay {} backup/store jobs from image", dbIdToBackupOrRestoreJob.size());
+    }
+
+    public void saveBackupHandlerV2(ImageWriter imageWriter) throws IOException, SRMetaBlockException {
+        SRMetaBlockWriter writer = imageWriter.getBlockWriter(
+                SRMetaBlockID.BACKUP_MGR, 2 + dbIdToBackupOrRestoreJob.size());
+        writer.writeJson(this);
+        writer.writeInt(dbIdToBackupOrRestoreJob.size());
+        for (AbstractJob job : dbIdToBackupOrRestoreJob.values()) {
+            writer.writeJson(job);
+        }
+        writer.close();
+    }
+
+    public void loadBackupHandlerV2(SRMetaBlockReader reader) throws IOException, SRMetaBlockException, SRMetaBlockEOFException {
+        BackupHandler data = reader.readJson(BackupHandler.class);
+        this.repoMgr = data.repoMgr;
+
+        long currentTimeMs = System.currentTimeMillis();
+        reader.readCollection(AbstractJob.class, job -> {
+            if (isJobExpired(job, currentTimeMs)) {
+                LOG.warn("skip expired job {}", job);
+                return;
+            }
+            dbIdToBackupOrRestoreJob.put(job.getDbId(), job);
+            mvRestoreContext.addIntoMvBaseTableBackupInfo(job);
+        });
+    }
+
+    /**
+     * will remove finished/cancelled job periodically
+     */
+    private boolean isJobExpired(AbstractJob job, long currentTimeMs) {
+        return (job.isDone() || job.isCancelled())
+                && (currentTimeMs - job.getFinishedTime()) / 1000 > Config.history_job_keep_max_second;
+    }
+
+    public void removeOldJobs() throws DdlException {
+        tryLock();
+        try {
+            long currentTimeMs = System.currentTimeMillis();
+            Iterator<Map.Entry<Long, AbstractJob>> iterator = dbIdToBackupOrRestoreJob.entrySet().iterator();
+            while (iterator.hasNext()) {
+                AbstractJob job = iterator.next().getValue();
+                if (isJobExpired(job, currentTimeMs)) {
+                    // discard mv backup table info if needed.
+                    mvRestoreContext.discardExpiredBackupTableInfo(job);
+
+                    LOG.warn("discard expired job {}", job);
+                    iterator.remove();
+                }
+            }
+        } finally {
+            seqlock.unlock();
         }
     }
 
-    public long saveBackupHandler(DataOutputStream dos, long checksum) throws IOException {
-        write(dos);
-        return checksum;
+    @Override
+    public Map<String, Long> estimateCount() {
+        return ImmutableMap.of("BackupOrRestoreJob", (long) dbIdToBackupOrRestoreJob.size());
     }
 
-    public long loadBackupHandler(DataInputStream dis, long checksum, GlobalStateMgr globalStateMgr) throws IOException {
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_42) {
-            readFields(dis);
-        }
-        setGlobalStateMgr(globalStateMgr);
-        LOG.info("finished replay backupHandler from image");
-        return checksum;
+    @Override
+    public List<Pair<List<Object>, Long>> getSamples() {
+        List<Object> jobSamples = new ArrayList<>(dbIdToBackupOrRestoreJob.values());
+        return Lists.newArrayList(Pair.create(jobSamples, (long) dbIdToBackupOrRestoreJob.size()));
+    }
+
+    public Map<Long, Long> getRunningBackupRestoreCount() {
+        long count = dbIdToBackupOrRestoreJob.values().stream().filter(job -> !job.isDone()).count();
+        Map<Long, Long> result = new HashMap<>();
+        result.put(WarehouseManager.DEFAULT_WAREHOUSE_ID, count);
+        return result;
     }
 }
-
-

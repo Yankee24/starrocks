@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/catalog/ColumnTypeTest.java
 
@@ -24,6 +37,7 @@ package com.starrocks.catalog;
 import com.starrocks.analysis.TypeDef;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.FeConstants;
+import com.starrocks.sql.analyzer.SemanticException;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -40,7 +54,7 @@ public class ColumnTypeTest {
     @Before
     public void setUp() {
         fakeGlobalStateMgr = new FakeGlobalStateMgr();
-        FakeGlobalStateMgr.setMetaVersion(FeConstants.meta_version);
+        FakeGlobalStateMgr.setMetaVersion(FeConstants.META_VERSION);
     }
 
     @Test
@@ -61,7 +75,7 @@ public class ColumnTypeTest {
         Assert.assertNotSame(type.getType(), type3.getType());
     }
 
-    @Test(expected = AnalysisException.class)
+    @Test(expected = SemanticException.class)
     public void testInvalidType() throws AnalysisException {
         TypeDef type = TypeDef.create(PrimitiveType.INVALID_TYPE);
         type.analyze(null);
@@ -88,7 +102,7 @@ public class ColumnTypeTest {
         Assert.assertNotEquals(type.getType(), type4.getType());
     }
 
-    @Test(expected = AnalysisException.class)
+    @Test(expected = SemanticException.class)
     public void testCharInvalid() throws AnalysisException {
         TypeDef type = TypeDef.createVarchar(-1);
         type.analyze(null);
@@ -119,19 +133,19 @@ public class ColumnTypeTest {
         Assert.assertNotEquals(type.getType(), type4.getType());
     }
 
-    @Test(expected = AnalysisException.class)
+    @Test(expected = SemanticException.class)
     public void testDecimalPreFail() throws AnalysisException {
         TypeDef type = TypeDef.createDecimal(28, 3);
         type.analyze(null);
     }
 
-    @Test(expected = AnalysisException.class)
+    @Test(expected = SemanticException.class)
     public void testDecimalScaleFail() throws AnalysisException {
         TypeDef type = TypeDef.createDecimal(27, 10);
         type.analyze(null);
     }
 
-    @Test(expected = AnalysisException.class)
+    @Test(expected = SemanticException.class)
     public void testDecimalScaleLargeFial() throws AnalysisException {
         TypeDef type = TypeDef.createDecimal(8, 9);
         type.analyze(null);

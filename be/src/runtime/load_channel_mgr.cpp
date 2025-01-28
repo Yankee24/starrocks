@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/load_channel_mgr.cpp
 
@@ -24,10 +37,14 @@
 #include <memory>
 
 #include "common/closure_guard.h"
+#include "fs/key_cache.h"
 #include "gutil/strings/substitute.h"
+#include "runtime/exec_env.h"
 #include "runtime/load_channel.h"
 #include "runtime/mem_tracker.h"
-#include "service/backend_options.h"
+#include "runtime/tablets_channel.h"
+#include "storage/lake/tablet_manager.h"
+#include "storage/utils.h"
 #include "util/starrocks_metrics.h"
 #include "util/stopwatch.hpp"
 #include "util/thread.h"
@@ -52,17 +69,27 @@ static int64_t calc_job_timeout_s(int64_t timeout_in_req_s) {
     return load_channel_timeout_s;
 }
 
-LoadChannelMgr::LoadChannelMgr() : _is_stopped(false) {
+LoadChannelMgr::LoadChannelMgr() : _mem_tracker(nullptr), _load_channels_clean_thread(INVALID_BTHREAD) {
     REGISTER_GAUGE_STARROCKS_METRIC(load_channel_count, [this]() {
-        std::lock_guard<std::mutex> l(_lock);
+        std::lock_guard l(_lock);
         return _load_channels.size();
     });
 }
 
 LoadChannelMgr::~LoadChannelMgr() {
-    _is_stopped.store(true);
-    if (_load_channels_clean_thread.joinable()) {
-        _load_channels_clean_thread.join();
+    if (_load_channels_clean_thread != INVALID_BTHREAD) {
+        [[maybe_unused]] void* ret;
+        bthread_stop(_load_channels_clean_thread);
+        bthread_join(_load_channels_clean_thread, &ret);
+    }
+}
+
+void LoadChannelMgr::close() {
+    std::lock_guard l(_lock);
+    for (auto iter = _load_channels.begin(); iter != _load_channels.end();) {
+        iter->second->cancel();
+        iter->second->abort();
+        iter = _load_channels.erase(iter);
     }
 }
 
@@ -75,14 +102,26 @@ Status LoadChannelMgr::init(MemTracker* mem_tracker) {
 void LoadChannelMgr::open(brpc::Controller* cntl, const PTabletWriterOpenRequest& request,
                           PTabletWriterOpenResult* response, google::protobuf::Closure* done) {
     ClosureGuard done_guard(done);
+    if (!request.encryption_meta().empty()) {
+        Status st = KeyCache::instance().refresh_keys(request.encryption_meta());
+        if (!st.ok()) {
+            response->mutable_status()->set_status_code(TStatusCode::INTERNAL_ERROR);
+            response->mutable_status()->add_error_msgs(fmt::format(
+                    "refresh keys using encryption_meta in PTabletWriterOpenRequest failed {}", st.detailed_message()));
+            return;
+        }
+    }
     UniqueId load_id(request.id());
-    scoped_refptr<LoadChannel> channel;
+    int64_t txn_id = request.txn_id();
+    std::shared_ptr<LoadChannel> channel;
     {
-        std::lock_guard<std::mutex> l(_lock);
+        std::lock_guard l(_lock);
         auto it = _load_channels.find(load_id);
         if (it != _load_channels.end()) {
             channel = it->second;
-        } else if (!_mem_tracker->limit_exceeded() || config::enable_new_load_on_memory_limit_exceeded) {
+        } else if (!is_tracker_hit_hard_limit(_mem_tracker, config::load_process_max_memory_hard_limit_ratio) ||
+                   config::enable_new_load_on_memory_limit_exceeded) {
+            // When loading memory usage is larger than hard limit, we will reject new loading task.
             int64_t mem_limit_in_req = request.has_load_mem_limit() ? request.load_mem_limit() : -1;
             int64_t job_max_memory = calc_job_max_load_memory(mem_limit_in_req, _mem_tracker->limit());
 
@@ -90,32 +129,58 @@ void LoadChannelMgr::open(brpc::Controller* cntl, const PTabletWriterOpenRequest
             int64_t job_timeout_s = calc_job_timeout_s(timeout_in_req_s);
             auto job_mem_tracker = std::make_unique<MemTracker>(job_max_memory, load_id.to_string(), _mem_tracker);
 
-            channel.reset(new LoadChannel(this, load_id, request.txn_trace_parent(), job_timeout_s,
-                                          std::move(job_mem_tracker)));
+            channel.reset(new LoadChannel(this, ExecEnv::GetInstance()->lake_tablet_manager(), load_id, txn_id,
+                                          request.txn_trace_parent(), job_timeout_s, std::move(job_mem_tracker)));
+            if (request.has_load_channel_profile_config()) {
+                channel->set_profile_config(request.load_channel_profile_config());
+            }
             _load_channels.insert({load_id, channel});
         } else {
             response->mutable_status()->set_status_code(TStatusCode::MEM_LIMIT_EXCEEDED);
             response->mutable_status()->add_error_msgs(
                     "memory limit exceeded, please reduce load frequency or increase config "
-                    "`load_process_max_memory_limit_percent` or `load_process_max_memory_limit_bytes` "
-                    "or add more BE nodes");
+                    "`load_process_max_memory_hard_limit_ratio` or add more BE nodes");
             return;
         }
     }
     channel->open(cntl, request, response, done_guard.release());
 }
 
-void LoadChannelMgr::add_chunk(brpc::Controller* cntl, const PTabletWriterAddChunkRequest& request,
-                               PTabletWriterAddBatchResult* response, google::protobuf::Closure* done) {
+void LoadChannelMgr::add_chunk(const PTabletWriterAddChunkRequest& request, PTabletWriterAddBatchResult* response) {
     VLOG(2) << "Current memory usage=" << _mem_tracker->consumption() << " limit=" << _mem_tracker->limit();
-    ClosureGuard done_guard(done);
     UniqueId load_id(request.id());
     auto channel = _find_load_channel(load_id);
     if (channel != nullptr) {
-        channel->add_chunk(cntl, request, response, done_guard.release());
+        channel->add_chunk(request, response);
     } else {
         response->mutable_status()->set_status_code(TStatusCode::INTERNAL_ERROR);
-        response->mutable_status()->add_error_msgs("no associated load channel");
+        response->mutable_status()->add_error_msgs("no associated load channel " + print_id(request.id()));
+    }
+}
+
+void LoadChannelMgr::add_chunks(const PTabletWriterAddChunksRequest& request, PTabletWriterAddBatchResult* response) {
+    VLOG(2) << "Current memory usage=" << _mem_tracker->consumption() << " limit=" << _mem_tracker->limit();
+    UniqueId load_id(request.id());
+    auto channel = _find_load_channel(load_id);
+    if (channel != nullptr) {
+        channel->add_chunks(request, response);
+    } else {
+        response->mutable_status()->set_status_code(TStatusCode::INTERNAL_ERROR);
+        response->mutable_status()->add_error_msgs("no associated load channel " + print_id(request.id()));
+    }
+}
+
+void LoadChannelMgr::add_segment(brpc::Controller* cntl, const PTabletWriterAddSegmentRequest* request,
+                                 PTabletWriterAddSegmentResult* response, google::protobuf::Closure* done) {
+    ClosureGuard closure_guard(done);
+    UniqueId load_id(request->id());
+    auto channel = _find_load_channel(load_id);
+    if (channel != nullptr) {
+        channel->add_segment(cntl, request, response, done);
+        closure_guard.release();
+    } else {
+        response->mutable_status()->set_status_code(TStatusCode::INTERNAL_ERROR);
+        response->mutable_status()->add_error_msgs("no associated load channel " + print_id(request->id()));
     }
 }
 
@@ -123,37 +188,60 @@ void LoadChannelMgr::cancel(brpc::Controller* cntl, const PTabletWriterCancelReq
                             PTabletWriterCancelResult* response, google::protobuf::Closure* done) {
     ClosureGuard done_guard(done);
     UniqueId load_id(request.id());
-    if (auto channel = remove_load_channel(load_id); channel != nullptr) {
-        channel->cancel();
+    if (request.has_tablet_id()) {
+        auto channel = _find_load_channel(load_id);
+        if (channel != nullptr) {
+            channel->abort(TabletsChannelKey(request.id(), request.sink_id(), request.index_id()),
+                           {request.tablet_id()}, request.reason());
+        }
+    } else if (request.tablet_ids_size() > 0) {
+        auto channel = _find_load_channel(load_id);
+        if (channel != nullptr) {
+            std::vector<int64_t> tablet_ids;
+            for (auto& tablet_id : request.tablet_ids()) {
+                tablet_ids.emplace_back(tablet_id);
+            }
+            channel->abort(TabletsChannelKey(request.id(), request.sink_id(), request.index_id()), tablet_ids,
+                           request.reason());
+        }
+    } else {
+        if (auto channel = remove_load_channel(load_id); channel != nullptr) {
+            channel->cancel();
+            channel->abort();
+        }
     }
 }
 
-Status LoadChannelMgr::_start_bg_worker() {
-    _load_channels_clean_thread = std::thread([this] {
-#ifdef GOOGLE_PROFILER
-        ProfilerRegisterThread();
-#endif
-
+void* LoadChannelMgr::load_channel_clean_bg_worker(void* arg) {
 #ifndef BE_TEST
-        uint32_t interval = 60;
+    uint64_t interval = 60;
 #else
-        uint32_t interval = 1;
+    uint64_t interval = 1;
 #endif
-        while (!_is_stopped.load()) {
-            _start_load_channels_clean();
-            sleep(interval);
+    auto mgr = static_cast<LoadChannelMgr*>(arg);
+    while (!bthread_stopped(bthread_self())) {
+        if (bthread_usleep(interval * 1000 * 1000) == 0) {
+            mgr->_start_load_channels_clean();
         }
-    });
-    Thread::set_thread_name(_load_channels_clean_thread, "load_chan_clean");
+    }
+    return nullptr;
+}
+
+Status LoadChannelMgr::_start_bg_worker() {
+    int r = bthread_start_background(&_load_channels_clean_thread, nullptr, load_channel_clean_bg_worker, this);
+    if (UNLIKELY(r != 0)) {
+        PLOG(ERROR) << "Fail to create bthread.";
+        return Status::InternalError("Fail to create bthread");
+    }
     return Status::OK();
 }
 
-Status LoadChannelMgr::_start_load_channels_clean() {
-    std::vector<scoped_refptr<LoadChannel>> timeout_channels;
+void LoadChannelMgr::_start_load_channels_clean() {
+    std::vector<std::shared_ptr<LoadChannel>> timeout_channels;
 
     time_t now = time(nullptr);
     {
-        std::lock_guard<std::mutex> l(_lock);
+        std::lock_guard l(_lock);
         for (auto it = _load_channels.begin(); it != _load_channels.end(); /**/) {
             if (difftime(now, it->second->last_updated_time()) >= it->second->timeout()) {
                 timeout_channels.emplace_back(std::move(it->second));
@@ -164,29 +252,38 @@ Status LoadChannelMgr::_start_load_channels_clean() {
         }
     }
 
-    // we must cancel these load channels before destroying them.
+    // we must cancel these load channels before destroying them
     // otherwise some object may be invalid before trying to visit it.
     // eg: MemTracker in load channel
     for (auto& channel : timeout_channels) {
         channel->cancel();
+    }
+    for (auto& channel : timeout_channels) {
+        channel->abort();
         LOG(INFO) << "Deleted timeout channel. load id=" << channel->load_id() << " timeout=" << channel->timeout();
     }
 
-    // this log print every 1 min, so that we could observe the mem consumption of load process
-    // on this Backend
-    LOG(INFO) << "Memory consumption(bytes) limit=" << _mem_tracker->limit()
-              << " current=" << _mem_tracker->consumption() << " peak=" << _mem_tracker->peak_consumption();
-
-    return Status::OK();
+    // clean load in writing data size
+    if (auto lake_tablet_manager = ExecEnv::GetInstance()->lake_tablet_manager(); lake_tablet_manager != nullptr) {
+        lake_tablet_manager->clean_in_writing_data_size();
+    }
 }
 
-scoped_refptr<LoadChannel> LoadChannelMgr::_find_load_channel(const UniqueId& load_id) {
+std::shared_ptr<LoadChannel> LoadChannelMgr::_find_load_channel(const UniqueId& load_id) {
     std::lock_guard l(_lock);
     auto it = _load_channels.find(load_id);
     return (it != _load_channels.end()) ? it->second : nullptr;
 }
 
-scoped_refptr<LoadChannel> LoadChannelMgr::remove_load_channel(const UniqueId& load_id) {
+std::shared_ptr<LoadChannel> LoadChannelMgr::_find_load_channel(int64_t txn_id) {
+    std::lock_guard l(_lock);
+    for (auto&& [load_id, channel] : _load_channels) {
+        if (channel->txn_id() == txn_id) return channel;
+    }
+    return nullptr;
+}
+
+std::shared_ptr<LoadChannel> LoadChannelMgr::remove_load_channel(const UniqueId& load_id) {
     std::lock_guard l(_lock);
     if (auto it = _load_channels.find(load_id); it != _load_channels.end()) {
         auto ret = it->second;
@@ -194,6 +291,16 @@ scoped_refptr<LoadChannel> LoadChannelMgr::remove_load_channel(const UniqueId& l
         return ret;
     }
     return nullptr;
+}
+
+void LoadChannelMgr::abort_txn(int64_t txn_id) {
+    auto channel = _find_load_channel(txn_id);
+    if (channel != nullptr) {
+        LOG(INFO) << "Aborting load channel because transaction was aborted. load_id=" << channel->load_id()
+                  << " txn_id=" << txn_id;
+        channel->cancel();
+        channel->abort();
+    }
 }
 
 } // namespace starrocks

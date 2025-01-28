@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/util/threadpool.h
 
@@ -21,6 +34,9 @@
 
 #pragma once
 
+#include <fmt/format.h>
+
+#include <atomic>
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/list_hook.hpp>
 #include <condition_variable>
@@ -34,6 +50,11 @@
 
 #include "common/status.h"
 #include "gutil/ref_counted.h"
+#include "util/bthreads/semaphore.h"
+// resolve `barrier` macro conflicts with boost/thread.hpp header file
+#undef barrier
+#include "cpu_util.h"
+#include "util/metrics.h"
 #include "util/monotime.h"
 #include "util/priority_queue.h"
 
@@ -47,6 +68,26 @@ class Runnable {
 public:
     virtual void run() = 0;
     virtual ~Runnable() = default;
+};
+
+// A helper class implements the `Runnable` interface together with a cleaner
+// when the instance is destroyed.
+// NOTE:
+//  The function or the runnable submit to a ThreadPool successfully, may not be running
+// at all because of threadpool shutdown. The caller who depends on the function/runnable
+// execution to signal or clean resources, needs to inject a `cleaner` to ensure the clean-
+// up work can be done under no condition.
+class AutoCleanRunnable : public Runnable {
+public:
+    AutoCleanRunnable(std::function<void()> runner, std::function<void()> cleaner)
+            : _runnable(std::move(runner)), _cleaner(std::move(cleaner)) {}
+    virtual ~AutoCleanRunnable() { _cleaner(); }
+
+    virtual void run() override { _runnable(); }
+
+protected:
+    std::function<void()> _runnable;
+    std::function<void()> _cleaner;
 };
 
 // ThreadPool takes a lot of arguments. We provide sane defaults with a builder.
@@ -104,6 +145,8 @@ public:
     ThreadPoolBuilder& set_max_threads(int max_threads);
     ThreadPoolBuilder& set_max_queue_size(int max_queue_size);
     ThreadPoolBuilder& set_idle_timeout(const MonoDelta& idle_timeout);
+    ThreadPoolBuilder& set_cpuids(const CpuUtil::CpuIds& cpuids);
+    ThreadPoolBuilder& set_borrowed_cpuids(const std::vector<CpuUtil::CpuIds>& borrowed_cpuids);
 
     // Instantiate a new ThreadPool with the existing builder arguments.
     Status build(std::unique_ptr<ThreadPool>* pool) const;
@@ -115,6 +158,8 @@ private:
     int _max_threads;
     int _max_queue_size;
     MonoDelta _idle_timeout;
+    CpuUtil::CpuIds _cpuids;
+    std::vector<CpuUtil::CpuIds> _borrowed_cpuids;
 
     ThreadPoolBuilder(const ThreadPoolBuilder&) = delete;
     const ThreadPoolBuilder& operator=(const ThreadPoolBuilder&) = delete;
@@ -163,20 +208,28 @@ public:
         NUM_PRIORITY,
     };
 
-    ~ThreadPool();
+    ~ThreadPool() noexcept;
+
+    bool is_pool_status_ok();
 
     // Wait for the running tasks to complete and then shutdown the threads.
-    // All the other pending tasks in the queue will be removed.
+    // All the other `pending tasks` in the queue will be removed without execution.
     // NOTE: That the user may implement an external abort logic for the
-    //       runnables, that must be called before Shutdown(), if the system
+    //       runnable, that must be called before Shutdown(), if the system
     //       should know about the non-execution of these tasks, or the runnable
-    //       require an explicit "abort" notification to exit from the run loop.
+    //       required an explicit "abort" notification to exit from the run loop.
+    // NOTE: Try to leverage `AutoCleanRunnable` to inject exit hook if the caller
+    //       relies on the task to be executed to free resources or send signals.
     void shutdown();
 
     // Submits a Runnable class.
+    // Be aware that the `r` may not be executed even though the submit returns OK
+    // in case a shutdown is issued right after the submission.
     Status submit(std::shared_ptr<Runnable> r, Priority pri = LOW_PRIORITY);
 
     // Submits a function bound using std::bind(&FuncName, args...).
+    // Be aware that the `r` may not be executed even though the submit returns OK
+    // in case a shutdown is issued right after the submission.
     Status submit_func(std::function<void()> f, Priority pri = LOW_PRIORITY);
 
     // Waits until all the tasks are completed.
@@ -184,7 +237,13 @@ public:
 
     // Waits for the pool to reach the idle state, or until 'delta' time elapses.
     // Returns true if the pool reached the idle state, false otherwise.
-    bool wait_for(const MonoDelta& delta);
+    [[nodiscard]] bool wait_for(const MonoDelta& delta);
+
+    // dynamic update max threads num
+    Status update_max_threads(int max_threads);
+
+    // dynamic update min threads num
+    Status update_min_threads(int max_threads);
 
     // Allocates a new token for use in token-based task submission. All tokens
     // must be destroyed before their ThreadPool is destroyed.
@@ -206,6 +265,31 @@ public:
         std::lock_guard l(_lock);
         return _num_threads + _num_threads_pending_start;
     }
+
+    int num_queued_tasks() const {
+        std::lock_guard l(_lock);
+        return _total_queued_tasks;
+    }
+
+    MonoTime last_active_timestamp() const {
+        std::lock_guard l(_lock);
+        return _last_active_timestamp;
+    }
+
+    int active_threads() const {
+        std::lock_guard l(_lock);
+        return _active_threads;
+    }
+
+    int max_threads() const { return _max_threads.load(std::memory_order_acquire); }
+
+    int64_t total_executed_tasks() const { return _total_executed_tasks.value(); }
+
+    int64_t total_pending_time_ns() const { return _total_pending_time_ns.value(); }
+
+    int64_t total_execute_time_ns() const { return _total_execute_time_ns.value(); }
+
+    void bind_cpus(const CpuUtil::CpuIds& cpuids, const std::vector<CpuUtil::CpuIds>& borrowed_cpuids);
 
 private:
     friend class ThreadPoolBuilder;
@@ -244,8 +328,8 @@ private:
     void release_token(ThreadPoolToken* t);
 
     const std::string _name;
-    const int _min_threads;
-    const int _max_threads;
+    std::atomic<int> _min_threads;
+    std::atomic<int> _max_threads;
     const int _max_queue_size;
     const MonoDelta _idle_timeout;
 
@@ -289,6 +373,9 @@ private:
     // Protected by _lock.
     int _total_queued_tasks;
 
+    // Last task executed timestamp
+    MonoTime _last_active_timestamp;
+
     // All allocated tokens.
     //
     // Protected by _lock.
@@ -328,6 +415,18 @@ private:
     // ExecutionMode::CONCURRENT token used by the pool for tokenless submission.
     std::unique_ptr<ThreadPoolToken> _tokenless;
 
+    CpuUtil::CpuIds _cpuids;
+    std::vector<CpuUtil::CpuIds> _borrowed_cpuids;
+
+    // Total number of tasks that have finished
+    CoreLocalCounter<int64_t> _total_executed_tasks{MetricUnit::NOUNIT};
+
+    // Total time in nanoseconds that tasks pending in the queue.
+    CoreLocalCounter<int64_t> _total_pending_time_ns{MetricUnit::NOUNIT};
+
+    // Total time in nanoseconds to execute tasks.
+    CoreLocalCounter<int64_t> _total_execute_time_ns{MetricUnit::NOUNIT};
+
     ThreadPool(const ThreadPool&) = delete;
     const ThreadPool& operator=(const ThreadPool&) = delete;
 };
@@ -363,7 +462,7 @@ public:
     // time elapses.
     //
     // Returns true if all submissions are complete, false otherwise.
-    bool wait_for(const MonoDelta& delta);
+    [[nodiscard]] bool wait_for(const MonoDelta& delta);
 
 private:
     // All possible token states. Legal state transitions:
@@ -440,6 +539,23 @@ private:
 
     ThreadPoolToken(const ThreadPoolToken&) = delete;
     const ThreadPoolToken& operator=(const ThreadPoolToken&) = delete;
+};
+
+// A class use to limit the number of tasks submitted to the thread pool.
+class ConcurrencyLimitedThreadPoolToken {
+public:
+    explicit ConcurrencyLimitedThreadPoolToken(ThreadPool* pool, int max_concurrency)
+            : _pool(pool), _sem(std::make_shared<bthreads::CountingSemaphore<>>(max_concurrency)) {}
+
+    DISALLOW_COPY_AND_MOVE(ConcurrencyLimitedThreadPoolToken);
+
+    Status submit(std::shared_ptr<Runnable> task, std::chrono::system_clock::time_point deadline);
+
+    Status submit_func(std::function<void()> f, std::chrono::system_clock::time_point deadline);
+
+private:
+    ThreadPool* _pool;
+    std::shared_ptr<bthreads::CountingSemaphore<>> _sem;
 };
 
 } // namespace starrocks

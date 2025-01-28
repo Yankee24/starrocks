@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/analysis/AccessTestUtil.java
 
@@ -23,7 +36,6 @@ package com.starrocks.analysis;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
-import com.starrocks.catalog.BrokerMgr;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.FakeEditLog;
@@ -33,15 +45,12 @@ import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndex.IndexState;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
+import com.starrocks.catalog.PhysicalPartition;
 import com.starrocks.catalog.RandomDistributionInfo;
 import com.starrocks.catalog.SinglePartitionInfo;
 import com.starrocks.catalog.Type;
-import com.starrocks.common.AnalysisException;
-import com.starrocks.common.DdlException;
 import com.starrocks.common.jmockit.Deencapsulation;
-import com.starrocks.load.Load;
-import com.starrocks.mysql.privilege.Auth;
-import com.starrocks.mysql.privilege.PrivPredicate;
+import com.starrocks.journal.JournalTask;
 import com.starrocks.persist.EditLog;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
@@ -51,138 +60,38 @@ import mockit.Expectations;
 
 import java.util.LinkedList;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 
 public class AccessTestUtil {
-    private static FakeEditLog fakeEditLog;
 
     public static SystemInfoService fetchSystemInfoService() {
-        SystemInfoService clusterInfo = new SystemInfoService();
-        return clusterInfo;
-    }
-
-    public static Auth fetchAdminAccess() {
-        Auth auth = new Auth();
-        try {
-            new Expectations(auth) {
-                {
-                    auth.checkGlobalPriv((ConnectContext) any, (PrivPredicate) any);
-                    minTimes = 0;
-                    result = true;
-
-                    auth.checkDbPriv((ConnectContext) any, anyString, (PrivPredicate) any);
-                    minTimes = 0;
-                    result = true;
-
-                    auth.checkTblPriv((ConnectContext) any, anyString, anyString, (PrivPredicate) any);
-                    minTimes = 0;
-                    result = true;
-
-                    auth.setPassword((SetPassVar) any);
-                    minTimes = 0;
-                }
-            };
-        } catch (DdlException e) {
-            e.printStackTrace();
-        }
-        return auth;
+        return new SystemInfoService();
     }
 
     public static GlobalStateMgr fetchAdminCatalog() {
-        try {
-            GlobalStateMgr globalStateMgr = Deencapsulation.newInstance(GlobalStateMgr.class);
+        GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
+        BlockingQueue<JournalTask> journalQueue = new ArrayBlockingQueue<JournalTask>(100);
+        EditLog editLog = new EditLog(journalQueue);
+        globalStateMgr.setEditLog(editLog);
 
-            Auth auth = fetchAdminAccess();
+        FakeEditLog fakeEditLog = new FakeEditLog();
 
-            fakeEditLog = new FakeEditLog();
-            EditLog editLog = new EditLog("name");
-            globalStateMgr.setEditLog(editLog);
-
-            Database db = new Database(50000L, "testCluster:testDb");
-            MaterializedIndex baseIndex = new MaterializedIndex(30001, IndexState.NORMAL);
-            RandomDistributionInfo distributionInfo = new RandomDistributionInfo(10);
-            Partition partition = new Partition(20000L, "testTbl", baseIndex, distributionInfo);
-            List<Column> baseSchema = new LinkedList<Column>();
-            Column column = new Column();
-            baseSchema.add(column);
-            OlapTable table = new OlapTable(30000, "testTbl", baseSchema,
-                    KeysType.AGG_KEYS, new SinglePartitionInfo(), distributionInfo, globalStateMgr.getClusterId(),
-                    null);
-            table.setIndexMeta(baseIndex.getId(), "testTbl", baseSchema, 0, 1, (short) 1,
-                    TStorageType.COLUMN, KeysType.AGG_KEYS);
-            table.addPartition(partition);
-            table.setBaseIndexId(baseIndex.getId());
-            db.createTable(table);
-
-            new Expectations(globalStateMgr) {
-                {
-                    globalStateMgr.getAuth();
-                    minTimes = 0;
-                    result = auth;
-
-                    globalStateMgr.getDb(50000L);
-                    minTimes = 0;
-                    result = db;
-
-                    globalStateMgr.getDb("testCluster:testDb");
-                    minTimes = 0;
-                    result = db;
-
-                    globalStateMgr.getDb("testCluster:emptyDb");
-                    minTimes = 0;
-                    result = null;
-
-                    globalStateMgr.getDb(anyString);
-                    minTimes = 0;
-                    result = new Database();
-
-                    globalStateMgr.getDbNames();
-                    minTimes = 0;
-                    result = Lists.newArrayList("testCluster:testDb");
-
-                    globalStateMgr.getEditLog();
-                    minTimes = 0;
-                    result = editLog;
-
-                    globalStateMgr.getLoadInstance();
-                    minTimes = 0;
-                    result = new Load();
-
-                    globalStateMgr.changeCatalogDb((ConnectContext) any, "blockDb");
-                    minTimes = 0;
-                    result = new DdlException("failed");
-
-                    globalStateMgr.changeCatalogDb((ConnectContext) any, anyString);
-                    minTimes = 0;
-
-                    globalStateMgr.getBrokerMgr();
-                    minTimes = 0;
-                    result = new BrokerMgr();
-                }
-            };
-            return globalStateMgr;
-        } catch (DdlException e) {
-            return null;
-        }
-    }
-
-    public static Auth fetchBlockAccess() {
-        Auth auth = new Auth();
-        new Expectations(auth) {
-            {
-                auth.checkGlobalPriv((ConnectContext) any, (PrivPredicate) any);
-                minTimes = 0;
-                result = false;
-
-                auth.checkDbPriv((ConnectContext) any, anyString, (PrivPredicate) any);
-                minTimes = 0;
-                result = false;
-
-                auth.checkTblPriv((ConnectContext) any, anyString, anyString, (PrivPredicate) any);
-                minTimes = 0;
-                result = false;
-            }
-        };
-        return auth;
+        Database db = new Database(50000L, "testCluster:testDb");
+        MaterializedIndex baseIndex = new MaterializedIndex(30001, IndexState.NORMAL);
+        RandomDistributionInfo distributionInfo = new RandomDistributionInfo(10);
+        Partition partition = new Partition(20000L, 20001L,"testTbl", baseIndex, distributionInfo);
+        List<Column> baseSchema = new LinkedList<Column>();
+        Column column = new Column("k1", Type.INT);
+        baseSchema.add(column);
+        OlapTable table = new OlapTable(30000, "testTbl", baseSchema,
+                KeysType.AGG_KEYS, new SinglePartitionInfo(), distributionInfo, null);
+        table.setIndexMeta(baseIndex.getId(), "testTbl", baseSchema, 0, 1, (short) 1,
+                TStorageType.COLUMN, KeysType.AGG_KEYS);
+        table.addPartition(partition);
+        table.setBaseIndexId(baseIndex.getId());
+        db.registerTableUnlocked(table);
+        return globalStateMgr;
     }
 
     public static OlapTable mockTable(String name) {
@@ -198,16 +107,25 @@ public class AccessTestUtil {
             }
         };
 
-        Partition partition = Deencapsulation.newInstance(Partition.class);
-        new Expectations(partition) {
+        PhysicalPartition physicalPartition = Deencapsulation.newInstance(PhysicalPartition.class);
+        new Expectations(physicalPartition) {
             {
-                partition.getBaseIndex();
+                physicalPartition.getBaseIndex();
                 minTimes = 0;
                 result = index;
 
-                partition.getIndex(30000L);
+                physicalPartition.getIndex(30000L);
                 minTimes = 0;
                 result = index;
+            }
+        };
+
+        Partition partition = Deencapsulation.newInstance(Partition.class);
+        new Expectations(partition) {
+            {
+                partition.getDefaultPhysicalPartition();
+                minTimes = 0;
+                result = physicalPartition;
             }
         };
 
@@ -240,19 +158,13 @@ public class AccessTestUtil {
                 minTimes = 0;
                 result = null;
 
-                db.getTableNamesWithLock();
+                db.getTableNamesViewWithLock();
                 minTimes = 0;
                 result = Sets.newHashSet("testTable");
 
                 db.getTables();
                 minTimes = 0;
                 result = Lists.newArrayList(olapTable);
-
-                db.readLock();
-                minTimes = 0;
-
-                db.readUnlock();
-                minTimes = 0;
 
                 db.getFullName();
                 minTimes = 0;
@@ -263,52 +175,36 @@ public class AccessTestUtil {
     }
 
     public static GlobalStateMgr fetchBlockCatalog() {
-        try {
-            GlobalStateMgr globalStateMgr = Deencapsulation.newInstance(GlobalStateMgr.class);
+        GlobalStateMgr globalStateMgr = Deencapsulation.newInstance(GlobalStateMgr.class);
 
-            Auth auth = fetchBlockAccess();
-            Database db = mockDb("testCluster:testDb");
+        Database db = mockDb("testDb");
 
-            new Expectations(globalStateMgr) {
-                {
-                    globalStateMgr.getAuth();
-                    minTimes = 0;
-                    result = auth;
+        /*
+        new Expectations(globalStateMgr) {
+            {
+                globalStateMgr.getLocalMetastore().getDb("testDb");
+                minTimes = 0;
+                result = db;
 
-                    globalStateMgr.changeCatalogDb((ConnectContext) any, anyString);
-                    minTimes = 0;
-                    result = new DdlException("failed");
+                globalStateMgr.getLocalMetastore().getDb("emptyDb");
+                minTimes = 0;
+                result = null;
 
-                    globalStateMgr.getDb("testCluster:testDb");
-                    minTimes = 0;
-                    result = db;
+                globalStateMgr.getLocalMetastore().getDb(anyString);
+                minTimes = 0;
+                result = new Database();
 
-                    globalStateMgr.getDb("testCluster:emptyDb");
-                    minTimes = 0;
-                    result = null;
+                globalStateMgr.getLocalMetastore().getDb("emptyCluster");
+                minTimes = 0;
+                result = null;
+            }
+        };
 
-                    globalStateMgr.getDb(anyString);
-                    minTimes = 0;
-                    result = new Database();
-
-                    globalStateMgr.getDbNames();
-                    minTimes = 0;
-                    result = Lists.newArrayList("testCluster:testDb");
-
-                    globalStateMgr.getDb("emptyCluster");
-                    minTimes = 0;
-                    result = null;
-                }
-            };
-            return globalStateMgr;
-        } catch (DdlException e) {
-            return null;
-        }
+         */
+        return globalStateMgr;
     }
 
-    public static Analyzer fetchAdminAnalyzer(boolean withCluster) {
-        final String prefix = "testCluster:";
-
+    public static Analyzer fetchAdminAnalyzer() {
         Analyzer analyzer = new Analyzer(fetchAdminCatalog(), new ConnectContext(null));
         new Expectations(analyzer) {
             {
@@ -318,15 +214,7 @@ public class AccessTestUtil {
 
                 analyzer.getDefaultDb();
                 minTimes = 0;
-                result = withCluster ? prefix + "testDb" : "testDb";
-
-                analyzer.getQualifiedUser();
-                minTimes = 0;
-                result = withCluster ? prefix + "testUser" : "testUser";
-
-                analyzer.getClusterName();
-                minTimes = 0;
-                result = "testCluster";
+                result = "testDb";
 
                 analyzer.incrementCallDepth();
                 minTimes = 0;
@@ -339,26 +227,6 @@ public class AccessTestUtil {
                 analyzer.getCallDepth();
                 minTimes = 0;
                 result = 1;
-            }
-        };
-        return analyzer;
-    }
-
-    public static Analyzer fetchBlockAnalyzer() throws AnalysisException {
-        Analyzer analyzer = new Analyzer(fetchBlockCatalog(), new ConnectContext(null));
-        new Expectations(analyzer) {
-            {
-                analyzer.getDefaultDb();
-                minTimes = 0;
-                result = "testCluster:testDb";
-
-                analyzer.getQualifiedUser();
-                minTimes = 0;
-                result = "testCluster:testUser";
-
-                analyzer.getClusterName();
-                minTimes = 0;
-                result = "testCluster";
             }
         };
         return analyzer;
@@ -379,16 +247,25 @@ public class AccessTestUtil {
             }
         };
 
-        Partition partition = Deencapsulation.newInstance(Partition.class);
-        new Expectations(partition) {
+        PhysicalPartition physicalPartition = Deencapsulation.newInstance(PhysicalPartition.class);
+        new Expectations(physicalPartition) {
             {
-                partition.getBaseIndex();
+                physicalPartition.getBaseIndex();
                 minTimes = 0;
                 result = index;
 
-                partition.getIndex(30000L);
+                physicalPartition.getIndex(30000L);
                 minTimes = 0;
                 result = index;
+            }
+        };
+
+        Partition partition = Deencapsulation.newInstance(Partition.class);
+        new Expectations(partition) {
+            {
+                partition.getDefaultPhysicalPartition();
+                minTimes = 0;
+                result = physicalPartition;
             }
         };
 
@@ -433,19 +310,13 @@ public class AccessTestUtil {
                 minTimes = 0;
                 result = null;
 
-                db.getTableNamesWithLock();
+                db.getTableNamesViewWithLock();
                 minTimes = 0;
                 result = Sets.newHashSet("t");
 
                 db.getTables();
                 minTimes = 0;
                 result = Lists.newArrayList(table);
-
-                db.readLock();
-                minTimes = 0;
-
-                db.readUnlock();
-                minTimes = 0;
 
                 db.getFullName();
                 minTimes = 0;
@@ -464,17 +335,9 @@ public class AccessTestUtil {
                 minTimes = 0;
                 result = table;
 
-                analyzer.getQualifiedUser();
-                minTimes = 0;
-                result = "testUser";
-
                 analyzer.getCatalog();
                 minTimes = 0;
                 result = globalStateMgr;
-
-                analyzer.getClusterName();
-                minTimes = 0;
-                result = "testCluster";
 
                 analyzer.incrementCallDepth();
                 minTimes = 0;

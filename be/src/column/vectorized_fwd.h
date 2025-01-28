@@ -1,9 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
 
 #include <memory>
 #include <vector>
 
-#pragma once
+#include "runtime/memory/column_allocator.h"
 
 namespace starrocks {
 
@@ -12,8 +26,6 @@ class HyperLogLog;
 class BitmapValue;
 class PercentileValue;
 class JsonValue;
-
-namespace vectorized {
 
 class DateValue;
 class TimestampValue;
@@ -26,11 +38,17 @@ class Column;
 class Schema;
 struct ProtobufChunkMeta;
 
+template <typename T>
+class ColumnAllocator;
+
 // We may change the Buffer implementation in the future.
 template <typename T>
-using Buffer = std::vector<T>;
+using Buffer = std::vector<T, ColumnAllocator<T>>;
 
 class ArrayColumn;
+class ArrayViewColumn;
+class MapColumn;
+class StructColumn;
 class NullableColumn;
 class ConstColumn;
 
@@ -75,7 +93,7 @@ using LargeBinaryColumn = BinaryColumnBase<uint64_t>;
 template <typename T>
 constexpr bool is_decimal_column = false;
 template <typename T>
-constexpr bool is_decimal_column<DecimalV3Column<T>> = true;
+inline constexpr bool is_decimal_column<DecimalV3Column<T>> = true;
 template <typename ColumnType>
 using DecimalColumnType = std::enable_if_t<is_decimal_column<ColumnType>, ColumnType>;
 
@@ -88,9 +106,19 @@ using PercentileColumn = ObjectColumn<PercentileValue>;
 using JsonColumnBase = ObjectColumn<JsonValue>;
 class JsonColumn;
 
+class MapColumn;
+class StructColumn;
+
 using ChunkPtr = std::shared_ptr<Chunk>;
 using ChunkUniquePtr = std::unique_ptr<Chunk>;
 using Chunks = std::vector<ChunkPtr>;
+
+class SegmentedColumn;
+class SegmentedChunk;
+using SegmentedColumnPtr = std::shared_ptr<SegmentedColumn>;
+using SegmentedColumns = std::vector<SegmentedColumnPtr>;
+using SegmentedChunkPtr = std::shared_ptr<SegmentedChunk>;
+using SegmentedChunkWeakPtr = std::weak_ptr<SegmentedChunk>;
 
 using SchemaPtr = std::shared_ptr<Schema>;
 
@@ -100,5 +128,4 @@ using FieldPtr = std::shared_ptr<Field>;
 using Filter = Buffer<uint8_t>;
 using FilterPtr = std::shared_ptr<Filter>;
 
-} // namespace vectorized
 } // namespace starrocks

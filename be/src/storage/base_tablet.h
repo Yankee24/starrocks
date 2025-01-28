@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/base_tablet.h
 
@@ -24,6 +37,7 @@
 #include <memory>
 
 #include "storage/olap_define.h"
+#include "storage/rowset/base_rowset.h"
 #include "storage/tablet_meta.h"
 #include "storage/utils.h"
 
@@ -69,16 +83,17 @@ public:
 
     // Property encapsulated in TabletMeta
     const TabletMetaSharedPtr tablet_meta();
+    const TabletMetaSharedPtr tablet_meta() const;
 
     void set_tablet_meta(const TabletMetaSharedPtr& tablet_meta) { _tablet_meta = tablet_meta; }
 
     TabletUid tablet_uid() const;
-    int64_t table_id() const;
+    int64_t belonged_table_id() const;
     // Returns a string can be used to uniquely identify a tablet.
     // The result string will often be printed to the log.
     const std::string full_name() const;
     int64_t partition_id() const;
-    int64_t tablet_id() const;
+    virtual int64_t tablet_id() const;
     int32_t schema_hash() const;
     int16_t shard_id();
     const int64_t creation_time() const;
@@ -86,11 +101,30 @@ public:
     bool equal(int64_t tablet_id, int32_t schema_hash);
 
     // properties encapsulated in TabletSchema
-    const TabletSchema& tablet_schema() const;
+    virtual const TabletSchema& unsafe_tablet_schema_ref() const;
+
+    virtual const TabletSchemaCSPtr tablet_schema() const;
+
+    bool set_tablet_schema_into_rowset_meta() {
+        bool flag = false;
+        for (const RowsetMetaSharedPtr& rowset_meta : _tablet_meta->all_rs_metas()) {
+            if (!rowset_meta->has_tablet_schema_pb()) {
+                rowset_meta->set_tablet_schema(tablet_schema());
+                rowset_meta->set_skip_tablet_schema(true);
+                flag = true;
+            }
+        }
+        return flag;
+    }
+
+    virtual size_t num_rows() const = 0;
+
+    virtual StatusOr<bool> has_delete_predicates(const Version& version) = 0;
 
 protected:
     virtual void on_shutdown() {}
 
+protected:
     void _gen_tablet_path();
 
     TabletState _state;
@@ -98,10 +132,6 @@ protected:
 
     DataDir* _data_dir;
     std::string _tablet_path; // TODO: remove this variable for less memory occupation
-
-private:
-    BaseTablet(const BaseTablet&) = delete;
-    const BaseTablet& operator=(const BaseTablet&) = delete;
 };
 
 inline DataDir* BaseTablet::data_dir() const {
@@ -116,11 +146,15 @@ inline const TabletMetaSharedPtr BaseTablet::tablet_meta() {
     return _tablet_meta;
 }
 
+inline const TabletMetaSharedPtr BaseTablet::tablet_meta() const {
+    return _tablet_meta;
+}
+
 inline TabletUid BaseTablet::tablet_uid() const {
     return _tablet_meta->tablet_uid();
 }
 
-inline int64_t BaseTablet::table_id() const {
+inline int64_t BaseTablet::belonged_table_id() const {
     return _tablet_meta->table_id();
 }
 
@@ -159,8 +193,12 @@ inline bool BaseTablet::equal(int64_t id, int32_t hash) {
     return tablet_id() == id && schema_hash() == hash;
 }
 
-inline const TabletSchema& BaseTablet::tablet_schema() const {
+inline const TabletSchema& BaseTablet::unsafe_tablet_schema_ref() const {
     return _tablet_meta->tablet_schema();
+}
+
+inline const TabletSchemaCSPtr BaseTablet::tablet_schema() const {
+    return _tablet_meta->tablet_schema_ptr();
 }
 
 } /* namespace starrocks */

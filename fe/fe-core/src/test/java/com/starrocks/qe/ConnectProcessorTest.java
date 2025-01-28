@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/qe/ConnectProcessorTest.java
 
@@ -21,9 +34,13 @@
 
 package com.starrocks.qe;
 
+import com.google.common.base.Strings;
+import com.google.common.collect.Sets;
 import com.starrocks.analysis.AccessTestUtil;
+import com.starrocks.authentication.AuthenticationMgr;
+import com.starrocks.authorization.PrivilegeBuiltinConstants;
 import com.starrocks.common.jmockit.Deencapsulation;
-import com.starrocks.metric.MetricRepo;
+import com.starrocks.common.util.UUIDUtil;
 import com.starrocks.mysql.MysqlCapability;
 import com.starrocks.mysql.MysqlChannel;
 import com.starrocks.mysql.MysqlCommand;
@@ -34,20 +51,30 @@ import com.starrocks.mysql.MysqlSerializer;
 import com.starrocks.plugin.AuditEvent.AuditEventBuilder;
 import com.starrocks.proto.PQueryStatistics;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.DDLTestBase;
+import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.ast.UserIdentity;
+import com.starrocks.sql.common.AuditEncryptionChecker;
 import com.starrocks.thrift.TUniqueId;
+import com.starrocks.utframe.UtFrameUtils;
 import mockit.Expectations;
+import mockit.Mock;
+import mockit.MockUp;
 import mockit.Mocked;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.mockito.Mockito;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
+import java.util.concurrent.atomic.AtomicReference;
 
-public class ConnectProcessorTest {
+public class ConnectProcessorTest extends DDLTestBase {
     private static ByteBuffer initDbPacket;
+    private static ByteBuffer initWarehousePacket;
     private static ByteBuffer changeUserPacket;
     private static ByteBuffer resetConnectionPacket;
     private static ByteBuffer pingPacket;
@@ -62,14 +89,23 @@ public class ConnectProcessorTest {
 
     private static PQueryStatistics statistics = new PQueryStatistics();
 
+
     @BeforeClass
     public static void setUpClass() {
         // Init Database packet
         {
             MysqlSerializer serializer = MysqlSerializer.newInstance();
             serializer.writeInt1(2);
-            serializer.writeEofString("testCluster:testDb");
+            serializer.writeEofString("testDb1");
             initDbPacket = serializer.toByteBuffer();
+        }
+
+        // Init Warehouse packet
+        {
+            MysqlSerializer serializer = MysqlSerializer.newInstance();
+            serializer.writeInt1(2);
+            serializer.writeEofString("'warehouse aaa'");
+            initWarehousePacket = serializer.toByteBuffer();
         }
 
         // Change user packet
@@ -127,7 +163,7 @@ public class ConnectProcessorTest {
         {
             MysqlSerializer serializer = MysqlSerializer.newInstance();
             serializer.writeInt1(4);
-            serializer.writeNulTerminateString("testTbl");
+            serializer.writeNulTerminateString("testTable1");
             serializer.writeEofString("");
             fieldListPacket = serializer.toByteBuffer();
         }
@@ -135,12 +171,14 @@ public class ConnectProcessorTest {
         statistics.scanBytes = 0L;
         statistics.scanRows = 0L;
 
-        MetricRepo.init();
+        Mockito.mockStatic(AuditEncryptionChecker.class);
     }
 
     @Before
     public void setUp() throws Exception {
+        super.setUp();
         initDbPacket.clear();
+        initWarehousePacket.clear();
         pingPacket.clear();
         quitPacket.clear();
         queryPacket.clear();
@@ -175,8 +213,6 @@ public class ConnectProcessorTest {
                     times = 1;
 
                     // Mock send
-                    // channel.sendOnePacket((ByteBuffer) any);
-                    // minTimes = 0;
                     channel.sendAndFlush((ByteBuffer) any);
                     minTimes = 0;
 
@@ -254,9 +290,9 @@ public class ConnectProcessorTest {
                 minTimes = 0;
                 result = "testCluster:user";
 
-                context.getClusterName();
+                context.getCurrentUserIdentity();
                 minTimes = 0;
-                result = "testCluster";
+                result = UserIdentity.ROOT;
 
                 context.getStartTime();
                 minTimes = 0;
@@ -288,7 +324,7 @@ public class ConnectProcessorTest {
 
     @Test
     public void testQuit() throws IOException {
-        ConnectContext ctx = initMockContext(mockChannel(quitPacket), AccessTestUtil.fetchAdminCatalog());
+        ConnectContext ctx = initMockContext(mockChannel(quitPacket), GlobalStateMgr.getCurrentState());
 
         ConnectProcessor processor = new ConnectProcessor(ctx);
         processor.processOnce();
@@ -299,8 +335,10 @@ public class ConnectProcessorTest {
 
     @Test
     public void testInitDb() throws IOException {
-        ConnectContext ctx = initMockContext(mockChannel(initDbPacket), AccessTestUtil.fetchAdminCatalog());
-
+        ConnectContext ctx = initMockContext(mockChannel(initDbPacket), GlobalStateMgr.getCurrentState());
+        ctx.setCurrentUserIdentity(UserIdentity.ROOT);
+        ctx.setCurrentRoleIds(Sets.newHashSet(PrivilegeBuiltinConstants.ROOT_ROLE_ID));
+        ctx.setQualifiedUser(AuthenticationMgr.ROOT_USER);
         ConnectProcessor processor = new ConnectProcessor(ctx);
         processor.processOnce();
         Assert.assertEquals(MysqlCommand.COM_INIT_DB, myContext.getCommand());
@@ -309,17 +347,30 @@ public class ConnectProcessorTest {
 
     @Test
     public void testInitDbFail() throws IOException {
-        ConnectContext ctx = initMockContext(mockChannel(initDbPacket), AccessTestUtil.fetchBlockCatalog());
-
+        ConnectContext ctx = initMockContext(mockChannel(initDbPacket), GlobalStateMgr.getCurrentState());
+        ctx.setCurrentUserIdentity(UserIdentity.ROOT);
+        ctx.setCurrentRoleIds(Sets.newHashSet(PrivilegeBuiltinConstants.ROOT_ROLE_ID));
+        ctx.setQualifiedUser(AuthenticationMgr.ROOT_USER);
         ConnectProcessor processor = new ConnectProcessor(ctx);
         processor.processOnce();
         Assert.assertEquals(MysqlCommand.COM_INIT_DB, myContext.getCommand());
-        Assert.assertFalse(myContext.getState().toResponsePacket() instanceof MysqlOkPacket);
+        Assert.assertFalse(myContext.getState().toResponsePacket() instanceof MysqlErrPacket);
+    }
+
+    @Test
+    public void testInitWarehouse() throws IOException {
+        ConnectContext ctx = initMockContext(mockChannel(initWarehousePacket), GlobalStateMgr.getCurrentState());
+        ctx.setCurrentUserIdentity(UserIdentity.ROOT);
+        ctx.setQualifiedUser(AuthenticationMgr.ROOT_USER);
+        ConnectProcessor processor = new ConnectProcessor(ctx);
+        processor.processOnce();
+        Assert.assertEquals(MysqlCommand.COM_INIT_DB, myContext.getCommand());
+        Assert.assertTrue(myContext.getState().toResponsePacket() instanceof MysqlOkPacket);
     }
 
     @Test
     public void testChangeUser() throws IOException {
-        ConnectContext ctx = initMockContext(mockChannel(changeUserPacket), AccessTestUtil.fetchAdminCatalog());
+        ConnectContext ctx = initMockContext(mockChannel(changeUserPacket), GlobalStateMgr.getCurrentState());
 
         ConnectProcessor processor = new ConnectProcessor(ctx);
         processor.processOnce();
@@ -330,7 +381,7 @@ public class ConnectProcessorTest {
 
     @Test
     public void testResetConnection() throws IOException {
-        ConnectContext ctx = initMockContext(mockChannel(resetConnectionPacket), AccessTestUtil.fetchAdminCatalog());
+        ConnectContext ctx = initMockContext(mockChannel(resetConnectionPacket), GlobalStateMgr.getCurrentState());
 
         ConnectProcessor processor = new ConnectProcessor(ctx);
         processor.processOnce();
@@ -341,7 +392,7 @@ public class ConnectProcessorTest {
 
     @Test
     public void testPing() throws IOException {
-        ConnectContext ctx = initMockContext(mockChannel(pingPacket), AccessTestUtil.fetchAdminCatalog());
+        ConnectContext ctx = initMockContext(mockChannel(pingPacket), GlobalStateMgr.getCurrentState());
 
         ConnectProcessor processor = new ConnectProcessor(ctx);
         processor.processOnce();
@@ -352,7 +403,7 @@ public class ConnectProcessorTest {
 
     @Test
     public void testPingLoop() throws IOException {
-        ConnectContext ctx = initMockContext(mockChannel(pingPacket), AccessTestUtil.fetchAdminCatalog());
+        ConnectContext ctx = initMockContext(mockChannel(pingPacket), GlobalStateMgr.getCurrentState());
 
         ConnectProcessor processor = new ConnectProcessor(ctx);
         processor.loop();
@@ -363,10 +414,9 @@ public class ConnectProcessorTest {
 
     @Test
     public void testQuery(@Mocked StmtExecutor executor) throws Exception {
-        ConnectContext ctx = initMockContext(mockChannel(queryPacket), AccessTestUtil.fetchAdminCatalog());
+        ConnectContext ctx = initMockContext(mockChannel(queryPacket), GlobalStateMgr.getCurrentState());
 
         ConnectProcessor processor = new ConnectProcessor(ctx);
-
         // Mock statement executor
         new Expectations() {
             {
@@ -382,7 +432,7 @@ public class ConnectProcessorTest {
 
     @Test
     public void testQueryFail(@Mocked StmtExecutor executor) throws Exception {
-        ConnectContext ctx = initMockContext(mockChannel(queryPacket), AccessTestUtil.fetchAdminCatalog());
+        ConnectContext ctx = initMockContext(mockChannel(queryPacket), GlobalStateMgr.getCurrentState());
 
         ConnectProcessor processor = new ConnectProcessor(ctx);
 
@@ -404,7 +454,7 @@ public class ConnectProcessorTest {
 
     @Test
     public void testQueryFail2(@Mocked StmtExecutor executor) throws Exception {
-        ConnectContext ctx = initMockContext(mockChannel(queryPacket), AccessTestUtil.fetchAdminCatalog());
+        ConnectContext ctx = initMockContext(mockChannel(queryPacket), GlobalStateMgr.getCurrentState());
 
         ConnectProcessor processor = new ConnectProcessor(ctx);
 
@@ -426,10 +476,38 @@ public class ConnectProcessorTest {
     }
 
     @Test
-    public void testFieldList() throws Exception {
-        ConnectContext ctx = initMockContext(mockChannel(fieldListPacket), AccessTestUtil.fetchAdminCatalog());
+    public void testQueryWithCustomQueryId(@Mocked StmtExecutor executor) throws Exception {
+        ConnectContext ctx = initMockContext(mockChannel(queryPacket), GlobalStateMgr.getCurrentState());
+        ctx.getSessionVariable().setCustomQueryId("a_custom_query_id");
 
-        myContext.setDatabase("testCluster:testDb");
+        ConnectProcessor processor = new ConnectProcessor(ctx);
+
+        AtomicReference<String> customQueryId = new AtomicReference<>();
+        new MockUp<StmtExecutor>() {
+            @Mock
+            public void execute() throws Exception {
+                customQueryId.set(ctx.getCustomQueryId());
+            }
+
+            @Mock
+            public PQueryStatistics getQueryStatisticsForAuditLog() {
+                return null;
+            }
+        };
+        processor.processOnce();
+        Assert.assertEquals(MysqlCommand.COM_QUERY, myContext.getCommand());
+        // verify customQueryId is set during query execution
+        Assert.assertEquals("a_custom_query_id", customQueryId.get());
+        // customQueryId is cleared after query finished
+        Assert.assertEquals("", ctx.getCustomQueryId());
+        Assert.assertEquals("", ctx.getSessionVariable().getCustomQueryId());
+    }
+
+    @Test
+    public void testFieldList() throws Exception {
+        ConnectContext ctx = initMockContext(mockChannel(fieldListPacket), GlobalStateMgr.getCurrentState());
+
+        myContext.setDatabase("testDb1");
         ConnectProcessor processor = new ConnectProcessor(ctx);
         processor.processOnce();
         Assert.assertEquals(MysqlCommand.COM_FIELD_LIST, myContext.getCommand());
@@ -444,7 +522,7 @@ public class ConnectProcessorTest {
         serializer.writeEofString("");
 
         ConnectContext ctx = initMockContext(mockChannel(serializer.toByteBuffer()),
-                AccessTestUtil.fetchAdminCatalog());
+                GlobalStateMgr.getCurrentState());
 
         ConnectProcessor processor = new ConnectProcessor(ctx);
         processor.processOnce();
@@ -478,9 +556,9 @@ public class ConnectProcessorTest {
         serializer.writeNulTerminateString("emptyTable");
         serializer.writeEofString("");
 
-        myContext.setDatabase("testCluster:testDb");
+        myContext.setDatabase("testDb1");
         ConnectContext ctx = initMockContext(mockChannel(serializer.toByteBuffer()),
-                AccessTestUtil.fetchAdminCatalog());
+                GlobalStateMgr.getCurrentState());
 
         ConnectProcessor processor = new ConnectProcessor(ctx);
         processor.processOnce();
@@ -494,7 +572,7 @@ public class ConnectProcessorTest {
         MysqlSerializer serializer = MysqlSerializer.newInstance();
         serializer.writeInt1(5);
         ByteBuffer packet = serializer.toByteBuffer();
-        ConnectContext ctx = initMockContext(mockChannel(packet), AccessTestUtil.fetchAdminCatalog());
+        ConnectContext ctx = initMockContext(mockChannel(packet), GlobalStateMgr.getCurrentState());
 
         ConnectProcessor processor = new ConnectProcessor(ctx);
         processor.processOnce();
@@ -508,7 +586,7 @@ public class ConnectProcessorTest {
         MysqlSerializer serializer = MysqlSerializer.newInstance();
         serializer.writeInt1(101);
         ByteBuffer packet = serializer.toByteBuffer();
-        ConnectContext ctx = initMockContext(mockChannel(packet), AccessTestUtil.fetchAdminCatalog());
+        ConnectContext ctx = initMockContext(mockChannel(packet), GlobalStateMgr.getCurrentState());
 
         ConnectProcessor processor = new ConnectProcessor(ctx);
         processor.processOnce();
@@ -519,10 +597,34 @@ public class ConnectProcessorTest {
 
     @Test
     public void testNullPacket() throws Exception {
-        ConnectContext ctx = initMockContext(mockChannel(null), AccessTestUtil.fetchAdminCatalog());
+        ConnectContext ctx = initMockContext(mockChannel(null), GlobalStateMgr.getCurrentState());
 
         ConnectProcessor processor = new ConnectProcessor(ctx);
         processor.loop();
         Assert.assertTrue(myContext.isKilled());
     }
+
+    @Test
+    public void testAddRunningQueryDetail() throws Exception {
+        com.starrocks.common.Config.enable_collect_query_detail_info = true;
+        ConnectContext ctx = UtFrameUtils.initCtxForNewPrivilege(UserIdentity.ROOT);
+        ctx.setQueryId(UUIDUtil.genUUID());
+        ConnectProcessor processor = new ConnectProcessor(ctx);
+        String sql = "CREATE ROUTINE LOAD example_db.example_tbl2_ordertest1 ON example_tbl2\n" +
+                "COLUMNS TERMINATED BY \",\",\n" +
+                "COLUMNS (order_id, pay_dt, customer_name, nationality, temp_gender, price)\n" +
+                "FROM KAFKA\n" +
+                "(\n" +
+                "    \"kafka_broker_list\" =\"127.0.0.1:9000\",\n" +
+                "    \"kafka_topic\" = \"ordertest1\"\n" +
+                ");";
+        StatementBase statementBase = UtFrameUtils.parseStmtWithNewParser(sql, ctx);
+
+        processor.executor = new StmtExecutor(ctx, statementBase);
+        processor.executor.addRunningQueryDetail(statementBase);
+
+        Assert.assertFalse(Strings.isNullOrEmpty(QueryDetailQueue.getQueryDetailsAfterTime(0).get(0).getSql()));
+    }
+
+
 }

@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -101,25 +113,7 @@ inline int clz128(unsigned __int128 v) {
 }
 
 inline bool int128_mul_overflow(int128_t a, int128_t b, int128_t* c) {
-    if (a == 0 || b == 0) {
-        *c = 0;
-        return false;
-    }
-
-    // sgn(x)
-    auto sa = a >> 127;
-    // sgn(y)
-    auto sb = b >> 127;
-    // abx(x), abs(y)
-    a = (a ^ sa) - sa;
-    b = (b ^ sb) - sb;
-    // sgn(x * y)
-    sa ^= sb;
-    *c = a * b;
-    // sgn(x * y) and abs(x) * abs(y) produces x * y;
-    *c = (*c ^ sa) - sa;
-    static constexpr auto int128_max = get_max<int128_t>();
-    return clz128(a) + clz128(b) < sizeof(int128_t) || int128_max / a < b;
+    return __builtin_mul_overflow(a, b, c);
 }
 
 template <>

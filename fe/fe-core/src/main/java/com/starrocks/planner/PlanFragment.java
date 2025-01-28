@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/planner/PlanFragment.java
 
@@ -25,29 +38,41 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.Expr;
+import com.starrocks.common.Config;
+import com.starrocks.common.FeConstants;
 import com.starrocks.common.Pair;
 import com.starrocks.common.TreeNode;
-import com.starrocks.common.UserException;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.SessionVariable;
+import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.statistics.ColumnDict;
-import com.starrocks.system.BackendCoreStat;
+import com.starrocks.thrift.TCacheParam;
+import com.starrocks.thrift.TDataSink;
 import com.starrocks.thrift.TExplainLevel;
+import com.starrocks.thrift.TExpr;
 import com.starrocks.thrift.TGlobalDict;
+import com.starrocks.thrift.TGroupExecutionParam;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TPartitionType;
 import com.starrocks.thrift.TPlanFragment;
 import com.starrocks.thrift.TResultSinkType;
 import org.apache.commons.collections.CollectionUtils;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import org.apache.commons.collections4.MapUtils;
+import org.roaringbitmap.RoaringBitmap;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Deque;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * PlanFragments form a tree structure via their ExchangeNodes. A tree of fragments
@@ -83,12 +108,7 @@ import java.util.stream.Collectors;
  * it impossible search for things within a fragment (using TreeNode functions);
  * fix that
  */
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
 public class PlanFragment extends TreeNode<PlanFragment> {
-    private static final Logger LOG = LogManager.getLogger(PlanFragment.class);
-
     // id for this plan fragment
     protected final PlanFragmentId fragmentId;
 
@@ -129,25 +149,51 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     protected int pipelineDop = 1;
     protected boolean dopEstimated = false;
 
-    protected final Map<Integer, RuntimeFilterDescription> buildRuntimeFilters = Maps.newTreeMap();
-    protected final Map<Integer, RuntimeFilterDescription> probeRuntimeFilters = Maps.newTreeMap();
+    // Whether to assign scan ranges to each driver sequence of pipeline,
+    // for the normal backend assignment (not colocate, bucket, and replicated join).
+    protected boolean assignScanRangesPerDriverSeq = false;
+    protected boolean withLocalShuffle = false;
+
+    protected double fragmentCost;
+
+    protected Map<Integer, RuntimeFilterDescription> buildRuntimeFilters = Maps.newHashMap();
+    protected Map<Integer, RuntimeFilterDescription> probeRuntimeFilters = Maps.newHashMap();
 
     protected List<Pair<Integer, ColumnDict>> queryGlobalDicts = Lists.newArrayList();
+    protected Map<Integer, Expr> queryGlobalDictExprs;
     protected List<Pair<Integer, ColumnDict>> loadGlobalDicts = Lists.newArrayList();
 
-    private Set<Integer> runtimeFilterBuildNodeIds = Sets.newHashSet();
+    private final Set<Integer> runtimeFilterBuildNodeIds = Sets.newHashSet();
+
+    private TCacheParam cacheParam = null;
+    private boolean hasOlapTableSink = false;
+    private boolean hasIcebergTableSink = false;
+    private boolean hasHiveTableSink = false;
+    private boolean hasTableFunctionTableSink = false;
+
+    private boolean forceSetTableSinkDop = false;
+    private boolean forceAssignScanRangesPerDriverSeq = false;
+
+    private boolean useRuntimeAdaptiveDop = false;
+
+    private boolean isShortCircuit = false;
+
+    // Controls whether group execution is used for plan fragment execution.
+    private List<ExecGroup> colocateExecGroups = Lists.newArrayList();
+
+    private List<Integer> collectExecStatsIds;
 
     /**
      * C'tor for fragment with specific partition; the output is by default broadcast.
      */
     public PlanFragment(PlanFragmentId id, PlanNode root, DataPartition partition) {
         this.fragmentId = id;
-        this.planRoot = root;
         this.dataPartition = partition;
         this.outputPartition = DataPartition.UNPARTITIONED;
         this.transferQueryStatisticsWithEveryBatch = false;
         // when dop adaptation is enabled, parallelExecNum and pipelineDop set to degreeOfParallelism and 1 respectively
         // in default. these values just a hint to help determine numInstances and pipelineDop of a PlanFragment.
+        setPlanRoot(root);
         setParallelExecNumIfExists();
         setFragmentInPlanTree(planRoot);
     }
@@ -170,8 +216,36 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         }
     }
 
+    public double getFragmentCost() {
+        return fragmentCost;
+    }
+
+    public void setFragmentCost(double fragmentCost) {
+        this.fragmentCost = fragmentCost;
+    }
+
     public boolean canUsePipeline() {
         return getPlanRoot().canUsePipeLine() && getSink().canUsePipeLine();
+    }
+
+    public boolean canUseRuntimeAdaptiveDop() {
+        return getPlanRoot().canUseRuntimeAdaptiveDop() && getSink().canUseRuntimeAdaptiveDop();
+    }
+
+    public void enableAdaptiveDop() {
+        useRuntimeAdaptiveDop = true;
+        // Constrict DOP as the power of two to make the strategy of decrement DOP easy.
+        // After decreasing DOP from old_dop to new_dop, chunks from the i-th input driver is passed
+        // to the j-th output driver, where j=i%new_dop.
+        pipelineDop = Utils.computeMaxLEPower2(pipelineDop);
+    }
+
+    public void disableRuntimeAdaptiveDop() {
+        useRuntimeAdaptiveDop = false;
+    }
+
+    public boolean isUseRuntimeAdaptiveDop() {
+        return useRuntimeAdaptiveDop;
     }
 
     /**
@@ -180,53 +254,27 @@ public class PlanFragment extends TreeNode<PlanFragment> {
      */
     private void setParallelExecNumIfExists() {
         if (ConnectContext.get() != null) {
-            int instanceNum = ConnectContext.get().getSessionVariable().getParallelExecInstanceNum();
-
             if (ConnectContext.get().getSessionVariable().isEnablePipelineEngine()) {
-                // In pipeline engine, we prefer inter-pipeline parallelism to inter-fragment parallelism
-                // So in default case, instanceNum should be 1, and DOP should be cores/2
-                int pipelineDop = ConnectContext.get().getSessionVariable().getPipelineDop();
-                if (pipelineDop > 0) {
-                    this.parallelExecNum = instanceNum;
-                    this.pipelineDop = pipelineDop;
-                } else {
-                    this.parallelExecNum = 1;
-                    this.pipelineDop = BackendCoreStat.getDefaultDOP();
-                }
+                this.parallelExecNum = 1;
+                this.pipelineDop = ConnectContext.get().getSessionVariable().getDegreeOfParallelism();
             } else {
-                this.parallelExecNum = instanceNum;
+                this.parallelExecNum = ConnectContext.get().getSessionVariable().getParallelExecInstanceNum();
                 this.pipelineDop = 1;
             }
         }
     }
 
-    /**
-     * Several cases we could prefer the instance-parallel:
-     * 1. One-phase aggregation: avoid local exchange
-     * 2. Colocate join
-     * 3. Bucket join
-     */
-    public void preferInstanceParallel() {
-        this.parallelExecNum = BackendCoreStat.getDefaultDOP();
-        this.pipelineDop = 1;
-        this.dopEstimated = true;
-    }
-
-    /**
-     * In most cases we prefer the pipeline-parallel
-     */
-    public void preferPipelineParallel() {
-        this.parallelExecNum = 1;
-        this.pipelineDop = BackendCoreStat.getDefaultDOP();
-        this.dopEstimated = true;
+    public void limitMaxPipelineDop(int maxPipelineDop) {
+        if (pipelineDop > maxPipelineDop) {
+            pipelineDop = maxPipelineDop;
+            if (useRuntimeAdaptiveDop) {
+                pipelineDop = Utils.computeMaxLEPower2(pipelineDop);
+            }
+        }
     }
 
     public ExchangeNode getDestNode() {
         return destNode;
-    }
-
-    public ArrayList<Expr> getOutputExprs() {
-        return outputExprs;
     }
 
     public DataPartition getOutputPartition() {
@@ -244,9 +292,86 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         return pipelineDop;
     }
 
+    public void setPipelineDop(int dop) {
+        this.pipelineDop = dop;
+    }
+
+    public boolean hasTableSink() {
+        return hasIcebergTableSink() || hasOlapTableSink() || hasHiveTableSink() || hasTableFunctionTableSink();
+    }
+
+    public boolean hasOlapTableSink() {
+        return this.hasOlapTableSink;
+    }
+
+    public void setHasOlapTableSink() {
+        this.hasOlapTableSink = true;
+    }
+
+    public boolean hasIcebergTableSink() {
+        return this.hasIcebergTableSink;
+    }
+
+    public void setHasIcebergTableSink() {
+        this.hasIcebergTableSink = true;
+    }
+
+    public boolean hasHiveTableSink() {
+        return this.hasHiveTableSink;
+    }
+
+    public void setHasHiveTableSink() {
+        this.hasHiveTableSink = true;
+    }
+
+    public boolean hasTableFunctionTableSink() {
+        return this.hasTableFunctionTableSink;
+    }
+
+    public void setHasTableFunctionTableSink() {
+        this.hasTableFunctionTableSink = true;
+    }
+
+    public boolean forceSetTableSinkDop() {
+        return this.forceSetTableSinkDop;
+    }
+
+    public void setForceSetTableSinkDop() {
+        this.forceSetTableSinkDop = true;
+    }
+
+    public boolean isWithLocalShuffle() {
+        return withLocalShuffle;
+    }
+
+    public void setWithLocalShuffleIfTrue(boolean withLocalShuffle) {
+        this.withLocalShuffle |= withLocalShuffle;
+    }
+
+    public boolean isUseGroupExecution() {
+        return !colocateExecGroups.isEmpty();
+    }
+
+    public boolean isAssignScanRangesPerDriverSeq() {
+        return assignScanRangesPerDriverSeq;
+    }
+
+    public void setAssignScanRangesPerDriverSeq(boolean assignScanRangesPerDriverSeq) {
+        this.assignScanRangesPerDriverSeq |= assignScanRangesPerDriverSeq;
+    }
+
+    public boolean isForceAssignScanRangesPerDriverSeq() {
+        return forceAssignScanRangesPerDriverSeq;
+    }
+
+    public void setForceAssignScanRangesPerDriverSeq() {
+        this.forceAssignScanRangesPerDriverSeq = true;
+    }
+
     public void computeLocalRfWaitingSet(PlanNode root, boolean clearGlobalRuntimeFilter) {
         root.fillLocalRfWaitingSet(runtimeFilterBuildNodeIds);
-        if (root instanceof RuntimeFilterBuildNode) {
+        // TopN Filter should't wait
+        if (root instanceof RuntimeFilterBuildNode && !(root instanceof SortNode)) {
             runtimeFilterBuildNodeIds.add(root.getId().asInt());
         }
         if (clearGlobalRuntimeFilter) {
@@ -262,6 +387,27 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         }
     }
 
+    public void assignColocateExecGroups(PlanNode root, List<ExecGroup> groups) {
+        for (ExecGroup group : groups) {
+            if (group.contains(root)) {
+                colocateExecGroups.add(group);
+                groups.remove(group);
+                break;
+            }
+        }
+        if (!groups.isEmpty()) {
+            for (PlanNode child : root.getChildren()) {
+                if (child.getFragment() == this) {
+                    assignColocateExecGroups(child, groups);
+                }
+            }
+        }
+    }
+
+    public boolean isColocateGroupFragment() {
+        return colocateExecGroups.size() > 0;
+    }
+
     public boolean isDopEstimated() {
         return dopEstimated;
     }
@@ -273,8 +419,7 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     /**
      * Finalize plan tree and create stream sink, if needed.
      */
-    public void finalize(Analyzer analyzer, boolean validateFileFormats)
-            throws UserException {
+    public void createDataSink(TResultSinkType resultSinkType) {
         if (sink != null) {
             return;
         }
@@ -293,47 +438,20 @@ public class PlanFragment extends TreeNode<PlanFragment> {
             }
             // add ResultSink
             // we're streaming to an result sink
-            sink = new ResultSink(planRoot.getId(), TResultSinkType.MYSQL_PROTOCAL);
+            sink = new ResultSink(planRoot.getId(), resultSinkType);
         }
-    }
-
-    public void finalizeForStatistic(boolean isStatistic) {
-        if (sink != null) {
-            return;
-        }
-        if (destNode != null) {
-            // we're streaming to an exchange node
-            DataStreamSink streamSink = new DataStreamSink(destNode.getId());
-            streamSink.setPartition(outputPartition);
-            streamSink.setMerge(destNode.isMerge());
-            streamSink.setFragment(this);
-            sink = streamSink;
-        } else {
-            if (planRoot == null) {
-                // only output expr, no FROM clause
-                // "select 1 + 2"
-                return;
-            }
-            // add ResultSink
-            // we're streaming to an result sink
-            if (isStatistic) {
-                sink = new ResultSink(planRoot.getId(), TResultSinkType.STATISTIC);
-            } else {
-                sink = new ResultSink(planRoot.getId(), TResultSinkType.MYSQL_PROTOCAL);
-            }
-        }
-    }
-
-    /**
-     * Return the number of nodes on which the plan fragment will execute.
-     * invalid: -1
-     */
-    public int getNumNodes() {
-        return dataPartition == DataPartition.UNPARTITIONED ? 1 : planRoot.getNumNodes();
     }
 
     public int getParallelExecNum() {
         return parallelExecNum;
+    }
+
+    public List<Integer> getCollectExecStatsIds() {
+        return collectExecStatsIds;
+    }
+
+    public void setCollectExecStatsIds(List<Integer> collectExecStatsIds) {
+        this.collectExecStatsIds = collectExecStatsIds;
     }
 
     public TPlanFragment toThrift() {
@@ -352,25 +470,87 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         if (!queryGlobalDicts.isEmpty()) {
             result.setQuery_global_dicts(dictToThrift(queryGlobalDicts));
         }
+        if (MapUtils.isNotEmpty(queryGlobalDictExprs)) {
+            Preconditions.checkState(!queryGlobalDicts.isEmpty(), "Global dict expression error!");
+            Map<Integer, TExpr> exprs = Maps.newHashMap();
+            queryGlobalDictExprs.forEach((k, v) -> exprs.put(k, v.treeToThrift()));
+            result.setQuery_global_dict_exprs(exprs);
+        }
         if (!loadGlobalDicts.isEmpty()) {
             result.setLoad_global_dicts(dictToThrift(loadGlobalDicts));
+        }
+        if (cacheParam != null) {
+            if (ConnectContext.get() != null) {
+                SessionVariable sessionVariable = ConnectContext.get().getSessionVariable();
+                cacheParam.setForce_populate(sessionVariable.isQueryCacheForcePopulate());
+                cacheParam.setEntry_max_bytes(sessionVariable.getQueryCacheEntryMaxBytes());
+                cacheParam.setEntry_max_rows(sessionVariable.getQueryCacheEntryMaxRows());
+            }
+            result.setCache_param(cacheParam);
+        }
+
+        if (!colocateExecGroups.isEmpty()) {
+            TGroupExecutionParam tGroupExecutionParam = new TGroupExecutionParam();
+            tGroupExecutionParam.setEnable_group_execution(true);
+            for (ExecGroup colocateExecGroup : colocateExecGroups) {
+                tGroupExecutionParam.addToExec_groups(colocateExecGroup.toThrift());
+            }
+            result.setGroup_execution_param(tGroupExecutionParam);
         }
         return result;
     }
 
-    private List<TGlobalDict> dictToThrift(List<Pair<Integer, ColumnDict>> dicts) {
+    /**
+     * Create thrift fragment with the unique fields, including
+     * - output_sink (only for MultiCastDataStreamSink and ExportSink).
+     *
+     * @return The thrift fragment with the unique fields.
+     */
+    public TPlanFragment toThriftForUniqueFields() {
+        TPlanFragment result = new TPlanFragment();
+        // Fill the required field.
+        result.setPartition(dataPartition.toThrift());
+
+        if (sink != null && (this instanceof MultiCastPlanFragment || sink instanceof ExportSink)) {
+            result.setOutput_sink(sink.toThrift());
+        }
+
+        return result;
+    }
+
+    public List<TGlobalDict> dictToThrift(List<Pair<Integer, ColumnDict>> dicts) {
         List<TGlobalDict> result = Lists.newArrayList();
         for (Pair<Integer, ColumnDict> dictPair : dicts) {
             TGlobalDict globalDict = new TGlobalDict();
             globalDict.setColumnId(dictPair.first);
-            List<String> strings = Lists.newArrayList();
+            List<ByteBuffer> strings = Lists.newArrayList();
             List<Integer> integers = Lists.newArrayList();
-            for (Map.Entry<String, Integer> kv : dictPair.second.getDict().entrySet()) {
+            for (Map.Entry<ByteBuffer, Integer> kv : dictPair.second.getDict().entrySet()) {
                 strings.add(kv.getKey());
                 integers.add(kv.getValue());
             }
+            globalDict.setVersion(dictPair.second.getCollectedVersion());
             globalDict.setStrings(strings);
             globalDict.setIds(integers);
+            result.add(globalDict);
+        }
+        return result;
+    }
+
+    // normalize dicts of the fragment, it is different from dictToThrift in three points:
+    // 1. SlotIds must be replaced by remapped SlotIds;
+    // 2. dict should be sorted according to its corresponding remapped SlotIds;
+    public List<TGlobalDict> normalizeDicts(List<Pair<Integer, ColumnDict>> dicts, FragmentNormalizer normalizer) {
+        List<TGlobalDict> result = Lists.newArrayList();
+        // replace slot id with the remapped slot id, sort dicts according to remapped slot ids.
+        List<Pair<Integer, ColumnDict>> sortedDicts =
+                dicts.stream().map(p -> Pair.create(normalizer.remapSlotId(p.first), p.second))
+                        .sorted(Comparator.comparingInt(p -> p.first)).collect(Collectors.toList());
+
+        for (Pair<Integer, ColumnDict> dictPair : sortedDicts) {
+            TGlobalDict globalDict = new TGlobalDict();
+            globalDict.setColumnId(dictPair.first);
+            globalDict.setVersion(dictPair.second.getCollectedVersion());
             result.add(globalDict);
         }
         return result;
@@ -387,9 +567,15 @@ public class PlanFragment extends TreeNode<PlanFragment> {
                     .collect(Collectors.joining(" | ")));
 
         }
-
-        str.append(outputBuilder.toString());
+        str.append(outputBuilder);
         str.append("\n");
+        if (!colocateExecGroups.isEmpty() && Config.show_execution_groups) {
+            str.append("  colocate exec groups: ");
+            for (ExecGroup group : colocateExecGroups) {
+                str.append(group);
+            }
+            str.append("\n");
+        }
         str.append("  PARTITION: ").append(dataPartition.getExplainString(explainLevel)).append("\n");
         if (sink != null) {
             str.append(sink.getExplainString("  ", explainLevel)).append("\n");
@@ -403,17 +589,31 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     public String getVerboseExplain() {
         StringBuilder str = new StringBuilder();
         Preconditions.checkState(dataPartition != null);
-        StringBuilder outputBuilder = new StringBuilder();
+        if (FeConstants.showFragmentCost) {
+            str.append("  Fragment Cost: ").append(fragmentCost).append("\n");
+        }
+        if (!colocateExecGroups.isEmpty() && Config.show_execution_groups) {
+            str.append("  colocate exec groups: ");
+            for (ExecGroup group : colocateExecGroups) {
+                str.append(group);
+            }
+            str.append("\n");
+        }
         if (CollectionUtils.isNotEmpty(outputExprs)) {
             str.append("  Output Exprs:");
-            outputBuilder.append(outputExprs.stream().map(Expr::toSql)
+            str.append(outputExprs.stream().map(Expr::toSql)
                     .collect(Collectors.joining(" | ")));
         }
-        str.append(outputBuilder.toString());
         str.append("\n");
         str.append("  Input Partition: ").append(dataPartition.getExplainString(TExplainLevel.NORMAL));
         if (sink != null) {
             str.append(sink.getVerboseExplain("  ")).append("\n");
+        }
+        if (MapUtils.isNotEmpty(queryGlobalDictExprs)) {
+            str.append("  Global Dict Exprs:\n");
+            queryGlobalDictExprs.entrySet().stream()
+                    .map(p -> "    " + p.getKey() + ": " + p.getValue().toMySql() + "\n").forEach(str::append);
+            str.append("\n");
         }
         if (planRoot != null) {
             str.append(planRoot.getVerboseExplain("  ", "  "));
@@ -449,10 +649,6 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         return (dataPartition.getType() != TPartitionType.UNPARTITIONED);
     }
 
-    public boolean isHashPartitioned() {
-        return (dataPartition.getType() == TPartitionType.HASH_PARTITIONED);
-    }
-
     public PlanFragment getDestFragment() {
         if (destNode == null) {
             return null;
@@ -467,12 +663,24 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         dest.addChild(this);
     }
 
+    public void clearDestination() {
+        this.destNode = null;
+    }
+
     public DataPartition getDataPartition() {
         return dataPartition;
     }
 
+    public boolean isGatherFragment() {
+        return getDataPartition() == DataPartition.UNPARTITIONED;
+    }
+
     public void setOutputPartition(DataPartition outputPartition) {
         this.outputPartition = outputPartition;
+    }
+
+    public void clearOutputPartition() {
+        this.outputPartition = DataPartition.UNPARTITIONED;
     }
 
     public PlanNode getPlanRoot() {
@@ -482,17 +690,6 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     public void setPlanRoot(PlanNode root) {
         planRoot = root;
         setFragmentInPlanTree(planRoot);
-    }
-
-    /**
-     * Adds a node as the new root to the plan tree. Connects the existing
-     * root as the child of newRoot.
-     */
-    public void addPlanRoot(PlanNode newRoot) {
-        Preconditions.checkState(newRoot.getChildren().size() == 1);
-        newRoot.setChild(0, planRoot);
-        planRoot = newRoot;
-        planRoot.setFragment(this);
     }
 
     public DataSink getSink() {
@@ -505,46 +702,45 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         this.sink = sink;
     }
 
-    public PlanFragmentId getFragmentId() {
-        return fragmentId;
+    public TDataSink sinkToThrift() {
+        return sink != null ? sink.toThrift() : null;
     }
 
-    public void setTransferQueryStatisticsWithEveryBatch(boolean value) {
-        transferQueryStatisticsWithEveryBatch = value;
+    public PlanFragmentId getFragmentId() {
+        return fragmentId;
     }
 
     public boolean isTransferQueryStatisticsWithEveryBatch() {
         return transferQueryStatisticsWithEveryBatch;
     }
 
-    public void collectBuildRuntimeFilters(PlanNode root) {
-        if (root instanceof ExchangeNode) {
-            return;
-        }
-
-        if (root instanceof RuntimeFilterBuildNode) {
-            RuntimeFilterBuildNode rfBuildNode = (RuntimeFilterBuildNode) root;
-            for (RuntimeFilterDescription description : rfBuildNode.getBuildRuntimeFilters()) {
-                buildRuntimeFilters.put(description.getFilterId(), description);
-            }
-        }
-
-        for (PlanNode node : root.getChildren()) {
-            collectBuildRuntimeFilters(node);
-        }
+    public void collectBuildRuntimeFilters() {
+        Map<Integer, RuntimeFilterDescription> filters = Maps.newHashMap();
+        collectNodes().stream()
+                .filter(node -> node instanceof RuntimeFilterBuildNode)
+                .flatMap(node -> ((RuntimeFilterBuildNode) node).getBuildRuntimeFilters().stream())
+                .forEach(desc -> filters.put(desc.getFilterId(), desc));
+        buildRuntimeFilters = filters;
     }
 
-    public void collectProbeRuntimeFilters(PlanNode root) {
-        if (root instanceof ExchangeNode) {
-            return;
-        }
+    public void collectProbeRuntimeFilters() {
+        Map<Integer, RuntimeFilterDescription> filters = Maps.newHashMap();
+        collectNodes().stream()
+                .flatMap(node -> node.getProbeRuntimeFilters().stream())
+                .forEach(desc -> filters.put(desc.getFilterId(), desc));
+        probeRuntimeFilters = filters;
+    }
 
-        for (RuntimeFilterDescription description : root.getProbeRuntimeFilters()) {
-            probeRuntimeFilters.put(description.getFilterId(), description);
-        }
+    public List<PlanNode> collectNodes() {
+        List<PlanNode> nodes = Lists.newArrayList();
+        collectNodesImpl(getPlanRoot(), nodes);
+        return nodes;
+    }
 
-        for (PlanNode node : root.getChildren()) {
-            collectProbeRuntimeFilters(node);
+    private void collectNodesImpl(PlanNode root, List<PlanNode> nodes) {
+        nodes.add(root);
+        if (!(root instanceof ExchangeNode)) {
+            root.getChildren().forEach(child -> collectNodesImpl(child, nodes));
         }
     }
 
@@ -577,6 +773,10 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         return this.queryGlobalDicts;
     }
 
+    public Map<Integer, Expr> getQueryGlobalDictExprs() {
+        return queryGlobalDictExprs;
+    }
+
     public List<Pair<Integer, ColumnDict>> getLoadGlobalDicts() {
         return this.loadGlobalDicts;
     }
@@ -587,7 +787,22 @@ public class PlanFragment extends TreeNode<PlanFragment> {
 
     // For plan fragment has join
     public void mergeQueryGlobalDicts(List<Pair<Integer, ColumnDict>> dicts) {
-        this.queryGlobalDicts.addAll(dicts);
+        if (this.queryGlobalDicts != dicts) {
+            this.queryGlobalDicts = Stream.concat(this.queryGlobalDicts.stream(), dicts.stream()).distinct()
+                    .collect(Collectors.toList());
+        }
+    }
+
+    public void mergeQueryDictExprs(Map<Integer, Expr> queryGlobalDictExprs) {
+        if (this.queryGlobalDictExprs != queryGlobalDictExprs) {
+            Map<Integer, Expr> n = Maps.newHashMap(MapUtils.emptyIfNull(this.queryGlobalDictExprs));
+            n.putAll(MapUtils.emptyIfNull(queryGlobalDictExprs));
+            this.queryGlobalDictExprs = n;
+        }
+    }
+
+    public void setQueryGlobalDictExprs(Map<Integer, Expr> queryGlobalDictExprs) {
+        this.queryGlobalDictExprs = queryGlobalDictExprs;
     }
 
     public void setLoadGlobalDicts(
@@ -609,6 +824,179 @@ public class PlanFragment extends TreeNode<PlanFragment> {
             }
         }
         return false;
+    }
+
+    public TCacheParam getCacheParam() {
+        return cacheParam;
+    }
+
+    public void setCacheParam(TCacheParam cacheParam) {
+        this.cacheParam = cacheParam;
+    }
+
+    public Map<PlanNodeId, ScanNode> collectScanNodes() {
+        Map<PlanNodeId, ScanNode> scanNodes = Maps.newHashMap();
+        Queue<PlanNode> queue = Lists.newLinkedList();
+        queue.add(planRoot);
+        while (!queue.isEmpty()) {
+            PlanNode node = queue.poll();
+
+            if (node instanceof ExchangeNode) {
+                continue;
+            }
+            if (node instanceof ScanNode) {
+                scanNodes.put(node.getId(), (ScanNode) node);
+            }
+
+            queue.addAll(node.getChildren());
+        }
+
+        return scanNodes;
+    }
+
+    public boolean isUnionFragment() {
+        Deque<PlanNode> dq = new LinkedList<>();
+        dq.offer(planRoot);
+
+        while (!dq.isEmpty()) {
+            PlanNode nd = dq.poll();
+
+            if (nd instanceof UnionNode) {
+                return true;
+            }
+            if (!(nd instanceof ExchangeNode)) {
+                dq.addAll(nd.getChildren());
+            }
+        }
+        return false;
+    }
+
+    public ArrayList<Expr> getOutputExprs() {
+        return outputExprs;
+    }
+
+    public boolean isShortCircuit() {
+        return isShortCircuit;
+    }
+
+    public void setShortCircuit(boolean shortCircuit) {
+        isShortCircuit = shortCircuit;
+    }
+
+    /**
+     * Returns the leftmost node of the fragment.
+     */
+    public PlanNode getLeftMostNode() {
+        PlanNode node = planRoot;
+        while (!node.getChildren().isEmpty() && !(node instanceof ExchangeNode)) {
+            node = node.getChild(0);
+        }
+        return node;
+    }
+
+    public void reset() {
+        // Do nothing.
+    }
+
+    public void disablePhysicalPropertyOptimize() {
+        colocateExecGroups.clear();
+        forEachNode(planRoot, PlanNode::disablePhysicalPropertyOptimize);
+    }
+
+    private void forEachNode(PlanNode root, Consumer<PlanNode> consumer) {
+        consumer.accept(root);
+        for (PlanNode child : root.getChildren()) {
+            forEachNode(child, consumer);
+        }
+    }
+
+    private RoaringBitmap collectNonBroadcastRfIds(PlanNode root) {
+        RoaringBitmap filterIds = root.getChildren().stream()
+                .filter(child -> child.getFragmentId().equals(root.getFragmentId()))
+                .map(this::collectNonBroadcastRfIds)
+                .reduce(RoaringBitmap.bitmapOf(), (a, b) -> RoaringBitmap.or(a, b));
+        if (root instanceof HashJoinNode) {
+            HashJoinNode joinNode = (HashJoinNode) root;
+            if (!joinNode.isBroadcast()) {
+                joinNode.getBuildRuntimeFilters().forEach(rf -> filterIds.add(rf.getFilterId()));
+            }
+        }
+        return filterIds;
+    }
+
+    /**
+     * In the same fragment, collect all nodes of the right subtree of BroadcastJoinNode that will build global RFs
+     * For example, the following plan will add 3 and 4 to {@code localRightOffsprings}.
+     * <pre>{@code
+     *       Broadcast Join#1
+     *        /        \
+     *      Node#2  ProjectNode#3
+     *                 |
+     *          ExchangeSourceNode#4
+     * }</pre>
+     */
+    private RoaringBitmap collectLocalRightOffspringsOfBroadcastJoin(PlanNode root,
+                                                                     RoaringBitmap localRightOffsprings) {
+        List<RoaringBitmap> localOffspringsPerChild = root.getChildren().stream()
+                .filter(child -> child.getFragmentId().equals(root.getFragmentId()))
+                .map(child -> collectLocalRightOffspringsOfBroadcastJoin(child, localRightOffsprings))
+                .collect(Collectors.toList());
+        RoaringBitmap localOffsprings =
+                localOffspringsPerChild.stream().reduce(RoaringBitmap.bitmapOf(), (a, b) -> RoaringBitmap.or(a, b));
+        localOffsprings.add(root.getId().asInt());
+        if (root instanceof HashJoinNode) {
+            HashJoinNode hashJoinNode = (HashJoinNode) root;
+            boolean hasGlobalRuntimeFilter = hashJoinNode.getBuildRuntimeFilters()
+                    .stream().anyMatch(RuntimeFilterDescription::isHasRemoteTargets);
+            if (hashJoinNode.isBroadcast() && hasGlobalRuntimeFilter) {
+                localRightOffsprings.or(localOffspringsPerChild.get(1));
+            }
+        }
+        return localOffsprings;
+    }
+
+    private void removeRfOfRightOffspring(PlanNode root, RoaringBitmap targetRightOffsprings, RoaringBitmap filterIds) {
+        if (targetRightOffsprings.contains(root.getId().asInt())) {
+            List<RuntimeFilterDescription> reservedRuntimeFilters = root.getProbeRuntimeFilters()
+                    .stream()
+                    .filter(rf -> !filterIds.contains(rf.getFilterId()))
+                    .collect(Collectors.toList());
+            root.setProbeRuntimeFilters(reservedRuntimeFilters);
+        }
+
+        root.getChildren()
+                .stream()
+                .filter(child -> child.getFragmentId().equals(root.getFragmentId()))
+                .forEach(child -> removeRfOfRightOffspring(child, targetRightOffsprings, filterIds));
+    }
+
+    public void removeRfOnRightOffspringsOfBroadcastJoin() {
+        RoaringBitmap localRightOffsprings = RoaringBitmap.bitmapOf();
+        collectLocalRightOffspringsOfBroadcastJoin(getPlanRoot(), localRightOffsprings);
+
+        RoaringBitmap filterIds = collectNonBroadcastRfIds(getPlanRoot());
+        if (localRightOffsprings.isEmpty() || filterIds.isEmpty()) {
+            return;
+        }
+
+        removeRfOfRightOffspring(getPlanRoot(), localRightOffsprings, filterIds);
+    }
+
+    public void removeDictMappingProbeRuntimeFilters() {
+        removeDictMappingProbeRuntimeFilters(getPlanRoot());
+    }
+
+    private void removeDictMappingProbeRuntimeFilters(PlanNode root) {
+        root.getProbeRuntimeFilters().removeIf(filter -> {
+            Expr probExpr = filter.getNodeIdToProbeExpr().get(root.getId().asInt());
+            return probExpr.containsDictMappingExpr();
+        });
+
+        for (PlanNode child : root.getChildren()) {
+            if (child.getFragmentId().equals(root.getFragmentId())) {
+                removeDictMappingProbeRuntimeFilters(child);
+            }
+        }
     }
 
 }

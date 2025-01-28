@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/service/internal_service.h
 
@@ -22,7 +35,6 @@
 #pragma once
 
 #include "common/status.h"
-#include "gen_cpp/doris_internal_service.pb.h"
 #include "gen_cpp/internal_service.pb.h"
 #include "service/internal_service.h"
 
@@ -50,8 +62,40 @@ public:
                                  const PTabletWriterAddChunkRequest* request, PTabletWriterAddBatchResult* response,
                                  google::protobuf::Closure* done) override;
 
+    void tablet_writer_add_chunks(google::protobuf::RpcController* controller,
+                                  const PTabletWriterAddChunksRequest* request, PTabletWriterAddBatchResult* response,
+                                  google::protobuf::Closure* done) override;
+
+    void tablet_writer_add_chunk_via_http(google::protobuf::RpcController* controller, const PHttpRequest* request,
+                                          PTabletWriterAddBatchResult* response,
+                                          google::protobuf::Closure* done) override;
+
+    void tablet_writer_add_chunks_via_http(google::protobuf::RpcController* controller, const PHttpRequest* request,
+                                           PTabletWriterAddBatchResult* response,
+                                           google::protobuf::Closure* done) override;
+
+    void tablet_writer_add_segment(google::protobuf::RpcController* controller,
+                                   const PTabletWriterAddSegmentRequest* request,
+                                   PTabletWriterAddSegmentResult* response, google::protobuf::Closure* done) override;
+
     void tablet_writer_cancel(google::protobuf::RpcController* controller, const PTabletWriterCancelRequest* request,
                               PTabletWriterCancelResult* response, google::protobuf::Closure* done) override;
+
+    void local_tablet_reader_open(google::protobuf::RpcController* controller, const PTabletReaderOpenRequest* request,
+                                  PTabletReaderOpenResult* response, google::protobuf::Closure* done) override;
+    void local_tablet_reader_close(google::protobuf::RpcController* controller,
+                                   const PTabletReaderCloseRequest* request, PTabletReaderCloseResult* response,
+                                   google::protobuf::Closure* done) override;
+    void local_tablet_reader_multi_get(google::protobuf::RpcController* controller,
+                                       const PTabletReaderMultiGetRequest* request,
+                                       PTabletReaderMultiGetResult* response, google::protobuf::Closure* done) override;
+    void local_tablet_reader_scan_open(google::protobuf::RpcController* controller,
+                                       const PTabletReaderScanOpenRequest* request,
+                                       PTabletReaderScanOpenResult* response, google::protobuf::Closure* done) override;
+    void local_tablet_reader_scan_get_next(google::protobuf::RpcController* controller,
+                                           const PTabletReaderScanGetNextRequest* request,
+                                           PTabletReaderScanGetNextResult* response,
+                                           google::protobuf::Closure* done) override;
 };
 
 } // namespace starrocks

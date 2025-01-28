@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/AggregateType.java
 
@@ -37,7 +50,8 @@ public enum AggregateType {
     HLL_UNION("HLL_UNION"),
     NONE("NONE"),
     BITMAP_UNION("BITMAP_UNION"),
-    PERCENTILE_UNION("PERCENTILE_UNION");
+    PERCENTILE_UNION("PERCENTILE_UNION"),
+    AGG_STATE_UNION("AGG_STATE_UNION");
 
     private static EnumMap<AggregateType, EnumSet<PrimitiveType>> compatibilityMap;
 
@@ -45,15 +59,12 @@ public enum AggregateType {
         compatibilityMap = new EnumMap<>(AggregateType.class);
         List<PrimitiveType> primitiveTypeList = Lists.newArrayList();
 
-        primitiveTypeList.add(PrimitiveType.TINYINT);
-        primitiveTypeList.add(PrimitiveType.SMALLINT);
         primitiveTypeList.add(PrimitiveType.INT);
         primitiveTypeList.add(PrimitiveType.BIGINT);
         primitiveTypeList.add(PrimitiveType.LARGEINT);
         primitiveTypeList.add(PrimitiveType.FLOAT);
         primitiveTypeList.add(PrimitiveType.DOUBLE);
         primitiveTypeList.add(PrimitiveType.DECIMALV2);
-        primitiveTypeList.add(PrimitiveType.DECIMAL32);
         primitiveTypeList.add(PrimitiveType.DECIMAL64);
         primitiveTypeList.add(PrimitiveType.DECIMAL128);
         compatibilityMap.put(SUM, EnumSet.copyOf(primitiveTypeList));
@@ -102,11 +113,9 @@ public enum AggregateType {
 
         // all types except bitmap, hll, percentile and complex types.
         EnumSet<PrimitiveType> excObject = EnumSet.allOf(PrimitiveType.class);
-        excObject.remove(PrimitiveType.BITMAP);
         excObject.remove(PrimitiveType.HLL);
         excObject.remove(PrimitiveType.PERCENTILE);
         excObject.remove(PrimitiveType.INVALID_TYPE);
-
         compatibilityMap.put(REPLACE_IF_NOT_NULL, EnumSet.copyOf(excObject));
 
         primitiveTypeList.clear();
@@ -117,10 +126,12 @@ public enum AggregateType {
         primitiveTypeList.add(PrimitiveType.BITMAP);
         compatibilityMap.put(BITMAP_UNION, EnumSet.copyOf(primitiveTypeList));
 
+        // percentile
         primitiveTypeList.clear();
         primitiveTypeList.add(PrimitiveType.PERCENTILE);
         compatibilityMap.put(PERCENTILE_UNION, EnumSet.copyOf(primitiveTypeList));
 
+        // none
         compatibilityMap.put(NONE, EnumSet.copyOf(excObject));
     }
 
@@ -131,6 +142,10 @@ public enum AggregateType {
     }
 
     public static boolean checkPrimitiveTypeCompatibility(AggregateType aggType, PrimitiveType priType) {
+        // AGG_STATE_UNION can accept all types, we cannot use compatibilityMap to check it.
+        if (aggType == AGG_STATE_UNION) {
+            return true;
+        }
         return compatibilityMap.get(aggType).contains(priType);
     }
 
@@ -143,9 +158,27 @@ public enum AggregateType {
         return toSql();
     }
 
+    /**
+     * NONE is particular, which is equals to null to make some buggy code compatible
+     */
+    public static boolean isNullOrNone(AggregateType type) {
+        return type == null || type == NONE;
+    }
+
     public boolean checkCompatibility(Type type) {
         return checkPrimitiveTypeCompatibility(this, type.getPrimitiveType()) ||
-                (this.isReplaceFamily() && type.isArrayType());
+                (this.isReplaceFamily() && type.isComplexType());
+    }
+
+    public static Type extendedPrecision(Type type, boolean legacyCompatible) {
+        if (legacyCompatible) {
+            return type;
+        }
+
+        if (type.isDecimalV3()) {
+            return ScalarType.createDecimalV3Type(PrimitiveType.DECIMAL128, 38, ((ScalarType) type).getScalarScale());
+        }
+        return type;
     }
 
     public boolean isReplaceFamily() {
@@ -178,6 +211,8 @@ public enum AggregateType {
                 return TAggregationType.BITMAP_UNION;
             case PERCENTILE_UNION:
                 return TAggregationType.PERCENTILE_UNION;
+            case AGG_STATE_UNION:
+                return TAggregationType.AGG_STATE_UNION;
             default:
                 return null;
         }

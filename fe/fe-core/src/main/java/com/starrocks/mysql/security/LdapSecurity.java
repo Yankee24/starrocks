@@ -1,8 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.mysql.security;
 
+import com.google.common.base.Strings;
 import com.starrocks.common.Config;
+import com.starrocks.common.util.NetUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -19,8 +34,13 @@ public class LdapSecurity {
 
     //bind to ldap server to check password
     public static boolean checkPassword(String dn, String password) {
-        String url = "ldap://" + Config.authentication_ldap_simple_server_host + ":" +
-                Config.authentication_ldap_simple_server_port;
+        if (Strings.isNullOrEmpty(password)) {
+            LOG.warn("empty password is not allowed for simple authentication");
+            return false;
+        }
+
+        String url = "ldap://" + NetUtils.getHostPortInAccessibleFormat(Config.authentication_ldap_simple_server_host,
+                Config.authentication_ldap_simple_server_port);
         Hashtable<String, String> env = new Hashtable<>();
         env.put(Context.SECURITY_AUTHENTICATION, "simple");
         env.put(Context.SECURITY_CREDENTIALS, password);
@@ -34,7 +54,7 @@ public class LdapSecurity {
             ctx = new InitialDirContext(env);
             return true;
         } catch (Exception e) {
-            LOG.warn("check ldap password failed, dn = {}, password = {}", dn, password, e);
+            LOG.warn("check ldap password failed, dn = {}", dn, e);
         } finally {
             if (ctx != null) {
                 try {
@@ -51,8 +71,13 @@ public class LdapSecurity {
     //2. search user
     //3. if match exactly one, check password
     public static boolean checkPasswordByRoot(String user, String password) {
-        String url = "ldap://" + Config.authentication_ldap_simple_server_host + ":" +
-                Config.authentication_ldap_simple_server_port;
+        if (Strings.isNullOrEmpty(Config.authentication_ldap_simple_bind_root_pwd)) {
+            LOG.warn("empty password is not allowed for simple authentication");
+            return false;
+        }
+
+        String url = "ldap://" + NetUtils.getHostPortInAccessibleFormat(Config.authentication_ldap_simple_server_host,
+                Config.authentication_ldap_simple_server_port);
         Hashtable<String, String> env = new Hashtable<>();
         //dn contains '=', so we should use ' or " to wrap the value in config file
         String rootDN = Config.authentication_ldap_simple_bind_root_dn;
@@ -112,7 +137,7 @@ public class LdapSecurity {
         return false;
     }
 
-    //trim prefix and suffix of target from src
+    // trim prefix and suffix of target from src
     private static String trim(String src, String target) {
         if (src != null && target != null) {
             if (src.startsWith(target)) {

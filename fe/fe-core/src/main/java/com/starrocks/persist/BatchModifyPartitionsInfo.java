@@ -17,13 +17,13 @@
 
 package com.starrocks.persist;
 
+import com.google.common.base.Objects;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.persist.gson.GsonUtils;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.List;
 
@@ -39,10 +39,7 @@ public class BatchModifyPartitionsInfo implements Writable {
         this.infos = infos;
     }
 
-    @Override
-    public void write(DataOutput out) throws IOException {
-        Text.writeString(out, GsonUtils.GSON.toJson(this));
-    }
+
 
     public static BatchModifyPartitionsInfo read(DataInput in) throws IOException {
         String json = Text.readString(in);
@@ -51,6 +48,11 @@ public class BatchModifyPartitionsInfo implements Writable {
 
     public List<ModifyPartitionInfo> getModifyPartitionInfos() {
         return infos;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(infos);
     }
 
     @Override

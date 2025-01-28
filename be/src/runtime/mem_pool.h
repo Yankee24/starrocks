@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/mem_pool.h
 
@@ -33,7 +46,7 @@
 #include "common/logging.h"
 #include "common/status.h"
 #include "gutil/dynamic_annotations.h"
-#include "runtime/memory/chunk.h"
+#include "runtime/memory/mem_chunk.h"
 #include "storage/olap_define.h"
 #include "util/bit_util.h"
 
@@ -93,12 +106,7 @@ class MemTracker;
 ///    delete p;
 class MemPool {
 public:
-    MemPool()
-            : current_chunk_idx_(-1),
-              next_chunk_size_(INITIAL_CHUNK_SIZE),
-              total_allocated_bytes_(0),
-              total_reserved_bytes_(0),
-              peak_allocated_bytes_(0) {}
+    MemPool() : next_chunk_size_(INITIAL_CHUNK_SIZE) {}
 
     /// Frees all chunks of memory and subtracts the total allocated bytes
     /// from the registered limits.
@@ -107,7 +115,11 @@ public:
     /// Allocates a section of memory of 'size' bytes with DEFAULT_ALIGNMENT at the end
     /// of the the current chunk. Creates a new chunk if there aren't any chunks
     /// with enough capacity.
-    uint8_t* allocate(int64_t size) { return allocate<false>(size, DEFAULT_ALIGNMENT); }
+    uint8_t* allocate(int64_t size) { return allocate<false>(size, DEFAULT_ALIGNMENT, 0); }
+
+    uint8_t* allocate_with_reserve(int64_t size, int reserve) {
+        return allocate<false>(size, DEFAULT_ALIGNMENT, reserve);
+    }
 
     // Don't check memory limit
     uint8_t* allocate_aligned(int64_t size, int alignment) {
@@ -115,7 +127,7 @@ public:
         DCHECK_LE(alignment, config::memory_max_alignment);
         // alignment should be a power of 2
         DCHECK((alignment & (alignment - 1)) == 0);
-        return allocate<false>(size, alignment);
+        return allocate<false>(size, alignment, 0);
     }
 
     /// Makes all allocated chunks available for re-use, but doesn't delete any chunks.
@@ -153,11 +165,11 @@ private:
     static const int MAX_CHUNK_SIZE = 512 * 1024;
 
     struct ChunkInfo {
-        Chunk chunk;
+        MemChunk chunk;
         /// bytes allocated via Allocate() in this chunk
         int64_t allocated_bytes{0};
-        explicit ChunkInfo(const Chunk& chunk);
-        ChunkInfo() {}
+        explicit ChunkInfo(const MemChunk& chunk);
+        ChunkInfo() = default;
     };
 
     /// A static field used as non-NULL pointer for zero length allocations. NULL is
@@ -185,14 +197,14 @@ private:
     }
 
     template <bool CHECK_LIMIT_FIRST>
-    uint8_t* ALWAYS_INLINE allocate(int64_t size, int alignment) {
+    uint8_t* ALWAYS_INLINE allocate(int64_t size, int alignment, int reserve) {
         DCHECK_GE(size, 0);
         if (UNLIKELY(size == 0)) return reinterpret_cast<uint8_t*>(&k_zero_length_region_);
 
         if (current_chunk_idx_ != -1) {
             ChunkInfo& info = chunks_[current_chunk_idx_];
             int64_t aligned_allocated_bytes = BitUtil::RoundUpToPowerOf2(info.allocated_bytes, alignment);
-            if (aligned_allocated_bytes + size <= info.chunk.size) {
+            if (aligned_allocated_bytes + size + reserve <= info.chunk.size) {
                 // Ensure the requested alignment is respected.
                 int64_t padding = aligned_allocated_bytes - info.allocated_bytes;
                 uint8_t* result = info.chunk.data + aligned_allocated_bytes;
@@ -210,7 +222,7 @@ private:
         // guarantee alignment.
         //static_assert(
         //INITIAL_CHUNK_SIZE >= config::FLAGS_MEMORY_MAX_ALIGNMENT, "Min chunk size too low");
-        if (UNLIKELY(!find_chunk(size, CHECK_LIMIT_FIRST))) return nullptr;
+        if (UNLIKELY(!find_chunk(size + reserve, CHECK_LIMIT_FIRST))) return nullptr;
 
         ChunkInfo& info = chunks_[current_chunk_idx_];
         uint8_t* result = info.chunk.data + info.allocated_bytes;
@@ -229,24 +241,24 @@ private:
     /// (chunks_[i].allocated_bytes > 0 for i: 0..current_chunk_idx_ - 1);
     /// chunks after 'current_chunk_idx_' are "free chunks" that contain no data.
     /// -1 if no chunks present
-    int current_chunk_idx_;
+    int current_chunk_idx_{-1};
 
     /// The size of the next chunk to allocate.
     int next_chunk_size_;
 
     /// sum of allocated_bytes_
-    int64_t total_allocated_bytes_;
+    int64_t total_allocated_bytes_{0};
 
     /// sum of all bytes allocated in chunks_
-    int64_t total_reserved_bytes_;
+    int64_t total_reserved_bytes_{0};
 
     /// Maximum number of bytes allocated from this pool at one time.
-    int64_t peak_allocated_bytes_;
+    int64_t peak_allocated_bytes_{0};
 
     std::vector<ChunkInfo> chunks_;
 };
 
 // Stamp out templated implementations here so they're included in IR module
-template uint8_t* MemPool::allocate<false>(int64_t size, int alignment);
-template uint8_t* MemPool::allocate<true>(int64_t size, int alignment);
+template uint8_t* MemPool::allocate<false>(int64_t size, int alignment, int reserve);
+template uint8_t* MemPool::allocate<true>(int64_t size, int alignment, int reserve);
 } // namespace starrocks

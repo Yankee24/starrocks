@@ -25,6 +25,7 @@ import com.starrocks.alter.AlterJobV2;
 import com.starrocks.alter.SchemaChangeHandler;
 import com.starrocks.alter.SchemaChangeJobV2;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.DateLiteral;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.LimitElement;
@@ -34,6 +35,7 @@ import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.util.ListComparator;
 import com.starrocks.common.util.OrderByPair;
+import com.starrocks.server.RunMode;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -43,11 +45,17 @@ import java.util.HashMap;
 import java.util.List;
 
 public class SchemaChangeProcDir implements ProcDirInterface {
-    public static final ImmutableList<String> TITLE_NAMES = new ImmutableList.Builder<String>()
-            .add("JobId").add("TableName").add("CreateTime").add("FinishTime")
-            .add("IndexName").add("IndexId").add("OriginIndexId").add("SchemaVersion")
-            .add("TransactionId").add("State").add("Msg").add("Progress").add("Timeout")
-            .build();
+    public static final ImmutableList<String> TITLE_NAMES;
+    static {
+        ImmutableList.Builder<String> builder = new ImmutableList.Builder<String>()
+                .add("JobId").add("TableName").add("CreateTime").add("FinishTime")
+                .add("IndexName").add("IndexId").add("OriginIndexId").add("SchemaVersion")
+                .add("TransactionId").add("State").add("Msg").add("Progress").add("Timeout");
+        if (RunMode.getCurrentRunMode() == RunMode.SHARED_DATA) {
+            builder.add("Warehouse");
+        }
+        TITLE_NAMES = builder.build();
+    }
 
     private static final Logger LOG = LogManager.getLogger(SchemaChangeProcDir.class);
 
@@ -68,7 +76,7 @@ public class SchemaChangeProcDir implements ProcDirInterface {
             return true;
         }
         BinaryPredicate binaryPredicate = (BinaryPredicate) subExpr;
-        if (subExpr.getChild(1) instanceof StringLiteral && binaryPredicate.getOp() == BinaryPredicate.Operator.EQ) {
+        if (subExpr.getChild(1) instanceof StringLiteral && binaryPredicate.getOp() == BinaryType.EQ) {
             return ((StringLiteral) subExpr.getChild(1)).getValue().equals(element);
         }
         if (subExpr.getChild(1) instanceof DateLiteral) {

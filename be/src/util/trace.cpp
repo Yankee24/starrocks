@@ -43,15 +43,6 @@ namespace starrocks {
 
 __thread Trace* Trace::threadlocal_trace_;
 
-Trace::Trace()
-
-{
-    // We expect small allocations from our Arena so no need to have
-    // a large arena component. Small allocations are more likely to
-    // come out of thread cache and be fast.
-    // arena_->SetMaxBufferSize(4096);
-}
-
 // Struct which precedes each entry in the trace.
 struct TraceEntry {
     MicrosecondsInt64 timestamp_micros;
@@ -102,8 +93,8 @@ void Trace::SubstituteAndTrace(const char* file_path, int line_number, StringPie
 TraceEntry* Trace::NewEntry(int msg_len, const char* file_path, int line_number) {
     int size = sizeof(TraceEntry) + msg_len;
     //uint8_t* dst = reinterpret_cast<uint8_t*>(arena_->AllocateBytes(size));
-    uint8_t* dst = reinterpret_cast<uint8_t*>(malloc(size));
-    TraceEntry* entry = reinterpret_cast<TraceEntry*>(dst);
+    auto* dst = reinterpret_cast<uint8_t*>(malloc(size));
+    auto* entry = reinterpret_cast<TraceEntry*>(dst);
     entry->timestamp_micros = GetCurrentTimeMicros();
     entry->message_len = msg_len;
     entry->file_path = file_path;

@@ -1,6 +1,20 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.optimizer.transformer;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
@@ -12,8 +26,9 @@ import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.LimitElement;
 import com.starrocks.analysis.OrderByElement;
 import com.starrocks.analysis.SlotRef;
-import com.starrocks.catalog.FunctionSet;
+import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.Type;
+import com.starrocks.common.Pair;
 import com.starrocks.common.TreeNode;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.sql.analyzer.RelationFields;
@@ -21,6 +36,7 @@ import com.starrocks.sql.analyzer.RelationId;
 import com.starrocks.sql.analyzer.Scope;
 import com.starrocks.sql.ast.Relation;
 import com.starrocks.sql.ast.SelectRelation;
+import com.starrocks.sql.optimizer.SubqueryUtils;
 import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
 import com.starrocks.sql.optimizer.base.Ordering;
@@ -35,6 +51,7 @@ import com.starrocks.sql.optimizer.operator.logical.LogicalWindowOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
+import com.starrocks.sql.optimizer.operator.scalar.SubqueryOperator;
 
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -45,119 +62,196 @@ import java.util.stream.Collectors;
 
 import static com.starrocks.sql.optimizer.transformer.SqlToScalarOperatorTranslator.findOrCreateColumnRefForExpr;
 
-class QueryTransformer {
+public class QueryTransformer {
     private final ColumnRefFactory columnRefFactory;
     private final ConnectContext session;
     private final List<ColumnRefOperator> correlation = new ArrayList<>();
-    private final Map<Integer, ExpressionMapping> cteContext;
+    private final CTETransformerContext cteContext;
+    private final boolean inlineView;
+    private final MVTransformerContext mvTransformerContext;
+    public static final String GROUPING_ID = "GROUPING_ID";
+    public static final String GROUPING = "GROUPING";
 
     public QueryTransformer(ColumnRefFactory columnRefFactory, ConnectContext session,
-                            Map<Integer, ExpressionMapping> cteContext) {
+                            CTETransformerContext cteContext, boolean inlineView,
+                            MVTransformerContext mvTransformerContext) {
         this.columnRefFactory = columnRefFactory;
         this.session = session;
         this.cteContext = cteContext;
+        this.inlineView = inlineView;
+        this.mvTransformerContext = mvTransformerContext;
     }
 
     public LogicalPlan plan(SelectRelation queryBlock, ExpressionMapping outer) {
         OptExprBuilder builder = planFrom(queryBlock.getRelation(), cteContext);
-        builder.setExpressionMapping(new ExpressionMapping(builder.getScope(), builder.getFieldMappings(), outer));
+        builder.setExpressionMapping(new ExpressionMapping(builder.getScope(), builder.getFieldMappings(), outer,
+                builder.getColumnRefToConstOperators()));
+
+        Map<Expr, SlotRef> generatedExprToColumnRef = queryBlock.getGeneratedExprToColumnRef();
+        Map<ScalarOperator, ColumnRefOperator> generatedColumnExprOpToColumnRef = new HashMap<>();
+        for (Map.Entry<Expr, SlotRef> m : generatedExprToColumnRef.entrySet()) {
+            ScalarOperator scalarOperator = SqlToScalarOperatorTranslator.translate(m.getKey(),
+                    builder.getExpressionMapping(), columnRefFactory);
+            ColumnRefOperator columnRefOp = (ColumnRefOperator) SqlToScalarOperatorTranslator.translate(m.getValue(),
+                    builder.getExpressionMapping(), columnRefFactory);
+            generatedColumnExprOpToColumnRef.put(scalarOperator, columnRefOp);
+        }
+        builder.getExpressionMapping().addGeneratedColumnExprOpToColumnRef(generatedColumnExprOpToColumnRef);
 
         builder = filter(builder, queryBlock.getPredicate());
         builder = aggregate(builder, queryBlock.getGroupBy(), queryBlock.getAggregate(),
                 queryBlock.getGroupingSetsList(), queryBlock.getGroupingFunctionCallExprs());
         builder = filter(builder, queryBlock.getHaving());
-        builder = window(builder, queryBlock.getOutputAnalytic());
+
+        List<AnalyticExpr> analyticExprList = new ArrayList<>(queryBlock.getOutputAnalytic());
+        analyticExprList.addAll(queryBlock.getOrderByAnalytic());
+        builder = window(builder, analyticExprList);
 
         if (queryBlock.hasOrderByClause()) {
-            if (!queryBlock.hasAggregation()) {
-                //requires both output and source fields to be visible if there are no aggregations
-                builder = projectForOrderWithoutAggregation(
-                        builder, queryBlock.getOutputExpr(), builder.getFieldMappings(), queryBlock.getOrderScope());
-            } else {
-                //requires output fields, groups and translated aggregations to be visible for queries with aggregation
-                builder = projectForOrderWithAggregation(builder,
-                        Iterables.concat(queryBlock.getOutputExpr(), queryBlock.getOrderSourceExpressions()),
-                        queryBlock.getOrderScope());
-            }
+            if (!queryBlock.getGroupBy().isEmpty() || !queryBlock.getAggregate().isEmpty()) {
+                // requires output fields, groups and translated aggregations to be visible for queries with aggregation
+                List<String> outputNames = new ArrayList<>(queryBlock.getColumnOutputNames());
+                for (int i = 0; i < queryBlock.getOrderSourceExpressions().size(); ++i) {
+                    outputNames.add(queryBlock.getOrderSourceExpressions().get(i).toString());
+                }
 
-            builder = window(builder, queryBlock.getOrderByAnalytic());
+                builder = projectForOrder(builder,
+                        Iterables.concat(queryBlock.getOutputExpression(),
+                                queryBlock.getOrderSourceExpressions(),
+                                queryBlock.getOrderByAnalytic()),
+                        queryBlock,
+                        outputNames,
+                        builder.getFieldMappings(),
+                        true);
+
+            } else {
+                // requires both output and source fields to be visible if there is no aggregation or distinct
+                // if there is a distinct, we still no need to project the orderSourceExpressions because it must
+                // in the outputExpression.
+                builder = projectForOrder(builder,
+                        Iterables.concat(queryBlock.getOutputExpression(), queryBlock.getOrderByAnalytic()),
+                        queryBlock,
+                        queryBlock.getColumnOutputNames(),
+                        builder.getFieldMappings(),
+                        queryBlock.isDistinct());
+            }
         }
 
-        builder = distinct(builder, queryBlock.isDistinct(), queryBlock.getOutputExpr());
+        builder = distinct(builder, queryBlock.isDistinct(), queryBlock.getOutputExpression());
         // add project to express order by expression
-        builder = project(builder, Iterables.concat(queryBlock.getOrderByExpressions(), queryBlock.getOutputExpr()));
+        builder = project(builder, Iterables.concat(queryBlock.getOrderByExpressions(), queryBlock.getOutputExpression()));
         List<ColumnRefOperator> orderByColumns = Lists.newArrayList();
         builder = sort(builder, queryBlock.getOrderBy(), orderByColumns);
         builder = limit(builder, queryBlock.getLimit());
 
-        List<ColumnRefOperator> outputColumns = computeOutputs(builder, queryBlock.getOutputExpr());
+        List<ColumnRefOperator> outputColumns = computeOutputs(builder, queryBlock.getOutputExpression(), columnRefFactory);
 
         // Add project operator to prune order by columns
         if (!orderByColumns.isEmpty() && !outputColumns.containsAll(orderByColumns)) {
             long limit = queryBlock.hasLimit() ? queryBlock.getLimit().getLimit() : -1;
-            builder = project(builder, queryBlock.getOutputExpr(), limit);
+            builder = project(builder, queryBlock.getOutputExpression(), limit);
         }
 
         return new LogicalPlan(builder, outputColumns, correlation);
     }
 
-    private static List<ColumnRefOperator> computeOutputs(OptExprBuilder builder, List<Expr> outputExpressions) {
+    private static List<ColumnRefOperator> computeOutputs(OptExprBuilder builder, List<Expr> outputExpressions,
+                                                          ColumnRefFactory columnRefFactory) {
         List<ColumnRefOperator> outputs = new ArrayList<>();
         for (Expr expression : outputExpressions) {
             outputs.add((ColumnRefOperator) SqlToScalarOperatorTranslator
-                    .translate(expression, builder.getExpressionMapping()));
+                    .translate(expression, builder.getExpressionMapping(), columnRefFactory));
         }
         return outputs;
     }
 
-    private OptExprBuilder planFrom(Relation node, Map<Integer, ExpressionMapping> cteContext) {
-        // This must be a copy of the context, because the new Relation may contain cte with the same name,
-        // and the internal cte with the same name will overwrite the original mapping
-        Map<Integer, ExpressionMapping> newCTEContext = Maps.newHashMap(cteContext);
-        return new RelationTransformer(columnRefFactory, session,
-                new ExpressionMapping(new Scope(RelationId.anonymous(), new RelationFields())), newCTEContext).visit(
-                node).getRootBuilder();
+    private OptExprBuilder planFrom(Relation node, CTETransformerContext cteContext) {
+        TransformerContext transformerContext = new TransformerContext(
+                columnRefFactory, session, new ExpressionMapping(new Scope(RelationId.anonymous(), new RelationFields())),
+                cteContext, inlineView, mvTransformerContext);
+        return new RelationTransformer(transformerContext).visit(node).getRootBuilder();
     }
 
-    private OptExprBuilder projectForOrderWithoutAggregation(OptExprBuilder subOpt, Iterable<Expr> outputExpression,
-                                                             List<ColumnRefOperator> sourceExpression, Scope scope) {
+    private OptExprBuilder projectForOrder(OptExprBuilder subOpt,
+                                           Iterable<Expr> outputExpression,
+                                           SelectRelation queryBlock,
+                                           List<String> outputNames,
+                                           List<ColumnRefOperator> sourceExpression,
+                                           boolean withAggregation) {
+        List<Integer> outputExprInOrderByScope = queryBlock.getOutputExprInOrderByScope();
+        Scope scope = queryBlock.getOrderScope();
         ExpressionMapping outputTranslations = new ExpressionMapping(scope);
-
-        List<ColumnRefOperator> fieldMappings = new ArrayList<>();
         Map<ColumnRefOperator, ScalarOperator> projections = Maps.newHashMap();
 
+        int outputExprIdx = 0;
         for (Expr expression : outputExpression) {
-            ColumnRefOperator columnRef = findOrCreateColumnRefForExpr(expression,
-                    subOpt.getExpressionMapping(), projections, columnRefFactory);
-            fieldMappings.add(columnRef);
-            outputTranslations.put(expression, columnRef);
+            Map<ScalarOperator, SubqueryOperator> subqueryPlaceholders = Maps.newHashMap();
+            ScalarOperator scalarOperator = SqlToScalarOperatorTranslator.translate(expression,
+                    subOpt.getExpressionMapping(), columnRefFactory,
+                    session, cteContext, subOpt, subqueryPlaceholders, false);
+            Pair<ScalarOperator, OptExprBuilder> pair =
+                    SubqueryUtils.rewriteScalarOperator(scalarOperator, subOpt, subqueryPlaceholders);
+            scalarOperator = pair.first;
+            subOpt = pair.second;
+            ColumnRefOperator columnRefOperator = getOrCreateColumnRefOperator(expression, scalarOperator, projections);
+            projections.put(columnRefOperator, scalarOperator);
+
+            if (outputExprInOrderByScope.contains(outputExprIdx)) {
+                outputTranslations.put(expression, columnRefOperator);
+                TableName resolveTableName = queryBlock.getResolveTableName();
+                if (expression instanceof SlotRef) {
+                    resolveTableName = queryBlock.getRelation().getResolveTableName();
+                }
+                SlotRef alias = new SlotRef(resolveTableName, outputNames.get(outputExprIdx));
+                // order by expr may reference the alias. We need put the alias into the fieldMappings or the
+                // expressionToColumns.
+                // if the alias not be used in the order by expr like:
+                // select v1 cc, v2 cc from tbl order by v3. We just add the slotRef(cc) to columnRefOperator in the
+                // expressionToColumns to ensure this projection can output v1 with alias cc, v2 with alias cc and v3.
+                // We don't need to ensure the uniqueness of the alias in the fieldMappings.
+                // if the alias used in the order by expr like:
+                // select v1 v3, v2 cc from (select abs(v1) v1, abs(v2) v2, v3 from t0) t1 order by t1.v3.
+                // order by expr t1.v3 referenced the v1 with alias v3, we need set the fieldMappings to ensure order by
+                // expr can be resolved.
+                if (scope.getRelationFields().resolveFields(alias).size() > 1) {
+                    outputTranslations.getExpressionToColumns()
+                            .put(new SlotRef(resolveTableName, outputNames.get(outputExprIdx)), columnRefOperator);
+                } else {
+                    outputTranslations.put(alias, columnRefOperator);
+                }
+
+            } else {
+                outputTranslations.put(expression, columnRefOperator);
+            }
+            outputExprIdx++;
         }
 
-        for (ColumnRefOperator expression : sourceExpression) {
-            projections.put(expression, expression);
-            fieldMappings.add(expression);
+        //1. If there is no aggregation, there are two namespaces in orderByScope.
+        //   The first layer is outputScope and the second layer is sourceScope.
+        //   Here, directly set the parsed sourceExpression to the corresponding offset position
+        //
+        //2. If there is aggregation, other expressions (agg in orderBy and grouping key not in output)
+        //   will be put into orderSourceExpressions, and they will be used as outputExpression for parsing processing.
+
+        if (!withAggregation) {
+            List<ColumnRefOperator> fieldMappings = new ArrayList<>(outputTranslations.getFieldMappings());
+            for (int i = 0; i < sourceExpression.size(); ++i) {
+                ColumnRefOperator columnRefOperator = sourceExpression.get(i);
+                projections.put(columnRefOperator, columnRefOperator);
+                // Why not use outputExprIdx, but scope.getRelationFields().size()?
+                // Because the length of outputExpression and the first layer of orderByScope are not equal.
+                // The specific logic is in computeAndAssignOrderScope
+                fieldMappings.set(scope.getRelationFields().size() + i, columnRefOperator);
+            }
+
+            outputTranslations.setFieldMappings(fieldMappings);
         }
+
+        outputTranslations.addExpressionToColumns(subOpt.getExpressionMapping().getExpressionToColumns());
+        outputTranslations.addColumnRefToConstOperators(subOpt.getColumnRefToConstOperators());
+        outputTranslations.addGeneratedColumnExprOpToColumnRef(subOpt.getGeneratedColumnExprOpToColumnRef());
 
         LogicalProjectOperator projectOperator = new LogicalProjectOperator(projections);
-        outputTranslations.setFieldMappings(fieldMappings);
-        return new OptExprBuilder(projectOperator, Lists.newArrayList(subOpt), outputTranslations);
-    }
-
-    private OptExprBuilder projectForOrderWithAggregation(OptExprBuilder subOpt, Iterable<Expr> expressions,
-                                                          Scope scope) {
-        ExpressionMapping outputTranslations = new ExpressionMapping(scope);
-
-        List<ColumnRefOperator> fieldMappings = new ArrayList<>();
-        Map<ColumnRefOperator, ScalarOperator> projections = Maps.newHashMap();
-        for (Expr expression : expressions) {
-            ColumnRefOperator columnRef = findOrCreateColumnRefForExpr(expression,
-                    subOpt.getExpressionMapping(), projections, columnRefFactory);
-            fieldMappings.add(columnRef);
-            outputTranslations.put(expression, columnRef);
-        }
-
-        LogicalProjectOperator projectOperator = new LogicalProjectOperator(projections);
-        outputTranslations.setFieldMappings(fieldMappings);
         return new OptExprBuilder(projectOperator, Lists.newArrayList(subOpt), outputTranslations);
     }
 
@@ -166,17 +260,30 @@ class QueryTransformer {
     }
 
     private OptExprBuilder project(OptExprBuilder subOpt, Iterable<Expr> expressions, long limit) {
-        ExpressionMapping outputTranslations = new ExpressionMapping(subOpt.getScope(), subOpt.getFieldMappings());
+        ExpressionMapping outputTranslations = new ExpressionMapping(subOpt.getScope(), subOpt.getFieldMappings(),
+                subOpt.getColumnRefToConstOperators());
 
         Map<ColumnRefOperator, ScalarOperator> projections = Maps.newHashMap();
-        SubqueryTransformer subqueryTransformer = new SubqueryTransformer(session);
-
         for (Expr expression : expressions) {
-            subOpt = subqueryTransformer.handleScalarSubqueries(columnRefFactory, subOpt, expression, cteContext);
-            ColumnRefOperator columnRef = findOrCreateColumnRefForExpr(expression,
-                    subOpt.getExpressionMapping(), projections, columnRefFactory);
-            outputTranslations.put(expression, columnRef);
+            Map<ScalarOperator, SubqueryOperator> subqueryPlaceholders = Maps.newHashMap();
+            ScalarOperator scalarOperator = SqlToScalarOperatorTranslator.translate(expression,
+                    subOpt.getExpressionMapping(), columnRefFactory,
+                    session, cteContext, subOpt, subqueryPlaceholders, false);
+            Pair<ScalarOperator, OptExprBuilder> pair =
+                    SubqueryUtils.rewriteScalarOperator(scalarOperator, subOpt, subqueryPlaceholders);
+            scalarOperator = pair.first;
+            subOpt = pair.second;
+            ColumnRefOperator columnRefOperator = getOrCreateColumnRefOperator(expression, scalarOperator, projections);
+            projections.put(columnRefOperator, scalarOperator);
+            outputTranslations.put(expression, columnRefOperator);
+            if (scalarOperator.isConstant()) {
+                outputTranslations.putConstOperator(columnRefOperator, scalarOperator);
+            }
         }
+
+        outputTranslations.addExpressionToColumns(subOpt.getExpressionMapping().getExpressionToColumns());
+        outputTranslations.addColumnRefToConstOperators(subOpt.getColumnRefToConstOperators());
+        outputTranslations.addGeneratedColumnExprOpToColumnRef(subOpt.getGeneratedColumnExprOpToColumnRef());
 
         LogicalProjectOperator projectOperator = new LogicalProjectOperator(projections, limit);
         return new OptExprBuilder(projectOperator, Lists.newArrayList(subOpt), outputTranslations);
@@ -187,18 +294,22 @@ class QueryTransformer {
             return subOpt;
         }
 
-        SubqueryTransformer subqueryTransformer = new SubqueryTransformer(session);
-        subOpt = subqueryTransformer.handleSubqueries(columnRefFactory, subOpt, predicate, cteContext);
+        Map<ScalarOperator, SubqueryOperator> subqueryPlaceholders = Maps.newHashMap();
+        ScalarOperator scalarPredicate = SqlToScalarOperatorTranslator.translate(predicate,
+                subOpt.getExpressionMapping(), correlation, columnRefFactory,
+                session, cteContext, subOpt, subqueryPlaceholders, true);
 
-        ScalarOperator scalarPredicate =
-                subqueryTransformer.rewriteSubqueryScalarOperator(predicate, subOpt, correlation);
+        Pair<ScalarOperator, OptExprBuilder> pair =
+                SubqueryUtils.rewriteScalarOperator(scalarPredicate, subOpt, subqueryPlaceholders);
+        scalarPredicate = pair.first;
+        subOpt = pair.second;
 
-        if (scalarPredicate != null) {
-            LogicalFilterOperator filterOperator = new LogicalFilterOperator(scalarPredicate);
-            return subOpt.withNewRoot(filterOperator);
-        } else {
+        if (scalarPredicate == null) {
             return subOpt;
         }
+
+        LogicalFilterOperator filterOperator = new LogicalFilterOperator(scalarPredicate);
+        return subOpt.withNewRoot(filterOperator);
     }
 
     private OptExprBuilder window(OptExprBuilder subOpt, List<AnalyticExpr> window) {
@@ -217,9 +328,22 @@ class QueryTransformer {
         }
 
         final ExpressionMapping expressionMapping = subOpt.getExpressionMapping();
-        boolean allColumnRef = projectExpressions.stream()
-                .map(expression -> SqlToScalarOperatorTranslator.translate(expression, expressionMapping))
-                .allMatch(ScalarOperator::isColumnRef);
+        boolean allColumnRef = true;
+        Map<Expr, ColumnRefOperator> tempMapping = new HashMap<>();
+        for (Expr expression : projectExpressions) {
+            ScalarOperator operator = SqlToScalarOperatorTranslator.translate(expression, expressionMapping,
+                    columnRefFactory);
+            if (!operator.isColumnRef()) {
+                allColumnRef = false;
+                tempMapping.clear();
+                break;
+            } else {
+                tempMapping.put(expression, (ColumnRefOperator) operator);
+            }
+        }
+        if (allColumnRef) {
+            expressionMapping.getExpressionToColumns().putAll(tempMapping);
+        }
 
         /*
          * If there is no expression calculate in partition and order by,
@@ -229,31 +353,30 @@ class QueryTransformer {
             ExpressionMapping outputTranslations = new ExpressionMapping(subOpt.getScope());
             List<ColumnRefOperator> fieldMappings = new ArrayList<>();
             Map<ColumnRefOperator, ScalarOperator> projections = Maps.newHashMap();
+
             for (ColumnRefOperator expression : subOpt.getFieldMappings()) {
                 ColumnRefOperator variable =
                         columnRefFactory.create(expression, expression.getType(), expression.isNullable());
                 projections.put(variable, expression);
                 fieldMappings.add(variable);
             }
+            outputTranslations.setFieldMappings(fieldMappings);
 
             // child output expressions
             for (Expr expression : subOpt.getExpressionMapping().getAllExpressions()) {
                 ColumnRefOperator columnRef = findOrCreateColumnRefForExpr(expression,
                         subOpt.getExpressionMapping(), projections, columnRefFactory);
-                fieldMappings.add(columnRef);
                 outputTranslations.put(expression, columnRef);
             }
 
             for (Expr expression : projectExpressions) {
                 ColumnRefOperator columnRef = findOrCreateColumnRefForExpr(expression,
                         subOpt.getExpressionMapping(), projections, columnRefFactory);
-                fieldMappings.add(columnRef);
                 outputTranslations.put(expression, columnRef);
             }
 
             LogicalProjectOperator projectOperator = new LogicalProjectOperator(projections);
             subOpt.setExpressionMapping(outputTranslations);
-            subOpt.getExpressionMapping().setFieldMappings(fieldMappings);
             subOpt = subOpt.withNewRoot(projectOperator);
         }
 
@@ -265,41 +388,21 @@ class QueryTransformer {
         for (AnalyticExpr analyticExpr : window) {
             WindowTransformer.WindowOperator rewriteOperator = WindowTransformer.standardize(analyticExpr);
             if (windowOperators.contains(rewriteOperator)) {
-                windowOperators.get(windowOperators.indexOf(rewriteOperator)).addFunction(analyticExpr);
+                WindowTransformer.WindowOperator windowOperator =
+                        windowOperators.get(windowOperators.indexOf(rewriteOperator));
+                if (rewriteOperator.isSkewed()) {
+                    windowOperator.setSkewed();
+                }
+                windowOperator.addFunction(analyticExpr);
             } else {
                 windowOperators.add(rewriteOperator);
             }
         }
 
-        List<WindowTransformer.PartitionGroup> partitionGroups =
+        List<LogicalWindowOperator> logicalWindowOperators =
                 WindowTransformer.reorderWindowOperator(windowOperators, columnRefFactory, subOpt);
-        for (WindowTransformer.PartitionGroup partitionGroup : partitionGroups) {
-            for (WindowTransformer.SortGroup sortGroup : partitionGroup.getSortGroups()) {
-                // Put rank classic window functions of same sort group to the end
-                sortGroup.getWindowOperators().sort((w1, w2) -> {
-                    List<CallOperator> leftCallOperators = Lists.newArrayList(w1.getWindowCall().values());
-                    List<CallOperator> rightCallOperators = Lists.newArrayList(w2.getWindowCall().values());
-                    boolean isLeftRank = leftCallOperators.size() == 1 &&
-                            FunctionSet.ROW_NUMBER.equalsIgnoreCase(leftCallOperators.get(0).getFnName());
-                    boolean isRightRank = rightCallOperators.size() == 1 &&
-                            FunctionSet.ROW_NUMBER.equalsIgnoreCase(rightCallOperators.get(0).getFnName());
-                    if (isLeftRank && isRightRank) {
-                        return 0;
-                    } else if (isLeftRank) {
-                        return 1;
-                    } else if (isRightRank) {
-                        return -1;
-                    } else {
-                        return 0;
-                    }
-                });
-                for (LogicalWindowOperator logicalWindowOperator : sortGroup.getWindowOperators()) {
-                    LogicalWindowOperator newLogicalWindowOperator =
-                            new LogicalWindowOperator.Builder().withOperator(logicalWindowOperator)
-                                    .setEnforceSortColumns(sortGroup.getEnforceSortColumns()).build();
-                    subOpt = subOpt.withNewRoot(newLogicalWindowOperator);
-                }
-            }
+        for (LogicalWindowOperator logicalWindowOperator : logicalWindowOperators) {
+            subOpt = subOpt.withNewRoot(logicalWindowOperator);
         }
 
         return subOpt;
@@ -313,10 +416,10 @@ class QueryTransformer {
         return subOpt.withNewRoot(limitOperator);
     }
 
-    private OptExprBuilder aggregate(OptExprBuilder subOpt,
+    public OptExprBuilder aggregate(OptExprBuilder subOpt,
                                      List<Expr> groupByExpressions, List<FunctionCallExpr> aggregates,
                                      List<List<Expr>> groupingSetsList, List<Expr> groupingFunctionCallExprs) {
-        if (aggregates.size() == 0 && groupByExpressions.size() == 0) {
+        if (aggregates.isEmpty() && groupByExpressions.isEmpty()) {
             return subOpt;
         }
 
@@ -324,15 +427,20 @@ class QueryTransformer {
         // e.g:
         // before: select sum(a) from xx group by rollup(a);
         // after: select sum(clone(a)) from xx group by rollup(a);
+        List<FunctionCallExpr> copyAggregates;
         if (groupingSetsList != null) {
+            copyAggregates = aggregates.stream().map(e -> (FunctionCallExpr) e.clone())
+                    .collect(Collectors.toList());
             for (Expr groupBy : groupByExpressions) {
-                aggregates.replaceAll(
+                copyAggregates.replaceAll(
                         root -> (FunctionCallExpr) replaceExprBottomUp(root, groupBy, new CloneExpr(groupBy)));
             }
+        } else {
+            copyAggregates = aggregates;
         }
 
         ImmutableList.Builder<Expr> arguments = ImmutableList.builder();
-        aggregates.stream().filter(f -> !f.getParams().isStar())
+        copyAggregates.stream().filter(f -> !f.getParams().isStar())
                 .map(TreeNode::getChildren).flatMap(List::stream)
                 .filter(e -> !(e.isConstant())).forEach(arguments::add);
 
@@ -341,7 +449,9 @@ class QueryTransformer {
         if (!Iterables.isEmpty(inputs)) {
             subOpt = project(subOpt, inputs);
         }
-        ExpressionMapping groupingTranslations = new ExpressionMapping(subOpt.getScope(), subOpt.getFieldMappings());
+        ExpressionMapping groupingTranslations =
+                new ExpressionMapping(subOpt.getScope(), subOpt.getFieldMappings(),
+                        subOpt.getColumnRefToConstOperators());
 
         List<ColumnRefOperator> groupByColumnRefs = new ArrayList<>();
 
@@ -356,7 +466,8 @@ class QueryTransformer {
             }
 
             ScalarOperator groupingKey =
-                    SqlToScalarOperatorTranslator.translate(groupingItem, subOpt.getExpressionMapping());
+                    SqlToScalarOperatorTranslator.translate(groupingItem, subOpt.getExpressionMapping(),
+                            columnRefFactory);
             ColumnRefOperator colRef = (ColumnRefOperator) groupingKey;
 
             //remove repeated grouping expr, such as group by v1, v1
@@ -368,15 +479,19 @@ class QueryTransformer {
         }
 
         Map<ColumnRefOperator, CallOperator> aggregationsMap = Maps.newHashMap();
-        for (FunctionCallExpr aggregate : aggregates) {
+        for (int i = 0; i < aggregates.size(); i++) {
+            FunctionCallExpr copyAggregate = copyAggregates.get(i);
             ScalarOperator aggCallOperator =
-                    SqlToScalarOperatorTranslator.translate(aggregate, subOpt.getExpressionMapping());
+                    SqlToScalarOperatorTranslator.translate(copyAggregate, subOpt.getExpressionMapping(), columnRefFactory);
             CallOperator aggOperator = (CallOperator) aggCallOperator;
 
             ColumnRefOperator colRef =
-                    columnRefFactory.create(aggOperator.getFnName(), aggregate.getType(), aggregate.isNullable());
+                    columnRefFactory.create(aggOperator.getFnName(), copyAggregate.getType(), copyAggregate.isNullable());
             aggregationsMap.put(colRef, aggOperator);
-            groupingTranslations.put(aggregate, colRef);
+
+            // the output key -> value pair must use the original aggregate expr as key, because
+            // the top node may ref the original aggregate expr
+            groupingTranslations.put(aggregates.get(i), colRef);
         }
 
         //Add repeatOperator to support grouping sets
@@ -409,7 +524,7 @@ class QueryTransformer {
 
                 for (Expr groupingField : grouping) {
                     ColumnRefOperator groupingKey = (ColumnRefOperator) SqlToScalarOperatorTranslator.translate(
-                            groupingField, subOpt.getExpressionMapping());
+                            groupingField, subOpt.getExpressionMapping(), columnRefFactory);
                     repeatColumnRef.add(groupingKey);
                     if (groupByColumnRefs.contains(groupingKey)) {
                         groupingIdBitSet.set(groupByColumnRefs.indexOf(groupingKey), false);
@@ -421,7 +536,7 @@ class QueryTransformer {
             }
 
             //Build grouping_id(all grouping columns)
-            ColumnRefOperator grouping = columnRefFactory.create("GROUPING_ID", Type.BIGINT, false);
+            ColumnRefOperator grouping = columnRefFactory.create(GROUPING_ID, Type.BIGINT, false);
             List<Long> groupingID = new ArrayList<>();
             for (BitSet bitSet : groupingIdsBitSets) {
                 long gid = Utils.convertBitSetToLong(bitSet, groupByColumnRefs.size());
@@ -432,7 +547,7 @@ class QueryTransformer {
                 // causing the data to be aggregated in advance.
                 // So add pow here to ensure that the grouping_id is not repeated, to ensure that the data will not be aggregated in advance
                 while (groupingID.contains(gid)) {
-                    gid += Math.pow(2, groupByColumnRefs.size());
+                    gid += (1L << groupByColumnRefs.size());
                 }
                 groupingID.add(gid);
             }
@@ -442,7 +557,7 @@ class QueryTransformer {
 
             //Build grouping function in select item
             for (Expr groupingFunction : groupingFunctionCallExprs) {
-                grouping = columnRefFactory.create("GROUPING", Type.BIGINT, false);
+                grouping = columnRefFactory.create(GROUPING, Type.BIGINT, false);
 
                 ArrayList<BitSet> tempGroupingIdsBitSets = new ArrayList<>();
                 for (int i = 0; i < repeatColumnRefList.size(); ++i) {
@@ -450,10 +565,10 @@ class QueryTransformer {
                 }
 
                 for (int childIdx = 0; childIdx < groupingFunction.getChildren().size(); ++childIdx) {
-                    SlotRef slotRef = (SlotRef) groupingFunction.getChild(childIdx);
+                    Expr expr = groupingFunction.getChild(childIdx);
 
                     ColumnRefOperator groupingKey = (ColumnRefOperator) SqlToScalarOperatorTranslator
-                            .translate(slotRef, subOpt.getExpressionMapping());
+                            .translate(expr, subOpt.getExpressionMapping(), columnRefFactory);
                     for (List<ColumnRefOperator> repeatColumns : repeatColumnRefList) {
                         if (repeatColumns.contains(groupingKey)) {
                             for (int repeatColIdx = 0; repeatColIdx < repeatColumnRefList.size(); ++repeatColIdx) {
@@ -478,7 +593,8 @@ class QueryTransformer {
             subOpt = new OptExprBuilder(repeatOperator, Lists.newArrayList(subOpt), groupingTranslations);
         }
 
-        return new OptExprBuilder(new LogicalAggregationOperator(AggType.GLOBAL, groupByColumnRefs, aggregationsMap),
+        return new OptExprBuilder(
+                new LogicalAggregationOperator(AggType.GLOBAL, groupByColumnRefs, aggregationsMap),
                 Lists.newArrayList(subOpt), groupingTranslations);
     }
 
@@ -504,9 +620,12 @@ class QueryTransformer {
 
         List<Ordering> orderings = new ArrayList<>();
         for (OrderByElement item : orderByExpressions) {
+            if (item.getExpr().isLiteral()) {
+                continue;
+            }
             ColumnRefOperator column =
                     (ColumnRefOperator) SqlToScalarOperatorTranslator.translate(item.getExpr(),
-                            subOpt.getExpressionMapping());
+                            subOpt.getExpressionMapping(), columnRefFactory);
             Ordering ordering = new Ordering(column, item.getIsAsc(),
                     OrderByElement.nullsFirst(item.getNullsFirstParam()));
             if (!orderByColumns.contains(column)) {
@@ -514,6 +633,11 @@ class QueryTransformer {
                 orderByColumns.add(column);
             }
         }
+
+        if (orderByColumns.isEmpty()) {
+            return subOpt;
+        }
+
         LogicalTopNOperator sortOperator = new LogicalTopNOperator(orderings);
 
         return subOpt.withNewRoot(sortOperator);
@@ -526,14 +650,33 @@ class QueryTransformer {
             List<ColumnRefOperator> groupByColumns = Lists.newArrayList();
             for (Expr expr : outputExpressions) {
                 ColumnRefOperator column = (ColumnRefOperator) SqlToScalarOperatorTranslator
-                        .translate(expr, subOpt.getExpressionMapping());
+                        .translate(expr, subOpt.getExpressionMapping(), columnRefFactory);
                 if (!groupByColumns.contains(column)) {
                     groupByColumns.add(column);
                 }
             }
-            return subOpt.withNewRoot(new LogicalAggregationOperator(AggType.GLOBAL, groupByColumns, new HashMap<>()));
+            return subOpt.withNewRoot(
+                    new LogicalAggregationOperator(AggType.GLOBAL, groupByColumns, new HashMap<>()));
         } else {
             return subOpt;
         }
+    }
+
+    private ColumnRefOperator getOrCreateColumnRefOperator(Expr expression, ScalarOperator scalarOperator,
+                                                           Map<ColumnRefOperator, ScalarOperator> projections) {
+        ColumnRefOperator columnRefOperator;
+        if (scalarOperator.isColumnRef()) {
+            columnRefOperator = (ColumnRefOperator) scalarOperator;
+        } else if (scalarOperator.isVariable() && projections.containsValue(scalarOperator)) {
+            columnRefOperator = projections.entrySet().stream()
+                    .filter(e -> scalarOperator.equals(e.getValue()))
+                    .findAny()
+                    .map(Map.Entry::getKey)
+                    .orElse(null);
+            Preconditions.checkNotNull(columnRefOperator);
+        } else {
+            columnRefOperator = columnRefFactory.create(expression, expression.getType(), scalarOperator.isNullable());
+        }
+        return columnRefOperator;
     }
 }

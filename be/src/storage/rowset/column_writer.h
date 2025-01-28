@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/rowset/segment_v2/column_writer.h
 
@@ -28,6 +41,7 @@
 #include "gen_cpp/segment.pb.h" // for EncodingTypePB
 #include "gutil/strings/substitute.h"
 #include "runtime/global_dict/types.h"
+#include "storage/index/inverted/inverted_writer.h"
 #include "storage/rowset/binary_dict_page.h"
 #include "storage/rowset/common.h"
 #include "storage/rowset/page_pointer.h" // for PagePointer
@@ -41,16 +55,16 @@ class TypeInfo;
 class BlockCompressionCodec;
 class WritableFile;
 
-namespace vectorized {
 class Column;
-} // namespace vectorized
+
+static const size_t dictionary_min_rowcount = 256;
 
 struct ColumnWriterOptions {
     // input and output parameter:
     // - input: column_id/unique_id/type/length/encoding/compression/is_nullable members
     // - output: encoding/indexes/dict_page members
     ColumnMetaPB* meta;
-    size_t data_page_size = OLAP_PAGE_SIZE;
+    uint32_t data_page_size = config::data_page_size;
     uint32_t page_format = 2;
     // store compressed page only when space saving is above the threshold.
     // space saving = 1 - compressed_size / uncompressed_size
@@ -58,14 +72,23 @@ struct ColumnWriterOptions {
     bool need_zone_map = false;
     bool need_bitmap_index = false;
     bool need_bloom_filter = false;
-    bool adaptive_page_format = false;
+    bool need_vector_index = false;
+    bool need_inverted_index = false;
+    std::unordered_map<IndexType, std::string> standalone_index_file_paths;
+    std::unordered_map<IndexType, TabletIndex> tablet_index;
+
     // for char/varchar will speculate encoding in append
     // for others will decide encoding in init method
     bool need_speculate_encoding = false;
 
     // when column data is encoding by dict
     // if global_dict is not nullptr, will checkout whether global_dict can cover all data
-    vectorized::GlobalDictMap* global_dict = nullptr;
+    GlobalDictMap* global_dict = nullptr;
+
+    bool need_flat = false;
+    bool is_compaction = false;
+
+    std::string field_name;
 };
 
 class BitmapIndexWriter;
@@ -82,16 +105,14 @@ public:
     static StatusOr<std::unique_ptr<ColumnWriter>> create(const ColumnWriterOptions& opts, const TabletColumn* column,
                                                           WritableFile* wfile);
 
-    explicit ColumnWriter(std::unique_ptr<Field> field, bool is_nullable)
-            : _field(std::move(field)), _is_nullable(is_nullable) {}
+    explicit ColumnWriter(TypeInfoPtr type_info, int length, bool is_nullable)
+            : _type_info(std::move(type_info)), _length(length), _is_nullable(is_nullable) {}
 
     virtual ~ColumnWriter() = default;
 
     virtual Status init() = 0;
 
-    virtual Status append(const vectorized::Column& column) = 0;
-
-    virtual Status append(const uint8_t* data, const uint8_t* null_map, size_t count, bool has_null) = 0;
+    virtual Status append(const Column& column) = 0;
 
     virtual Status finish_current_page() = 0;
 
@@ -111,21 +132,28 @@ public:
 
     virtual Status write_bloom_filter_index() = 0;
 
+    virtual Status write_inverted_index() { return Status::OK(); }
+
+    virtual Status write_vector_index(uint64_t* index_size) { return Status::OK(); }
+
     virtual ordinal_t get_next_rowid() const = 0;
 
     // only invalid in the case of global_dict is not nullptr
     // column is not encoding by dict or append new words that
     // not in global_dict, it will return false
-    virtual bool is_global_dict_valid() { return true; }
+    // return false if type is not string column
+    virtual bool is_global_dict_valid() { return false; }
 
+    TypeInfo* type_info() const { return _type_info.get(); }
+    int length() const { return _length; }
     bool is_nullable() const { return _is_nullable; }
-
-    Field* get_field() const { return _field.get(); }
 
     virtual uint64_t total_mem_footprint() const = 0;
 
-private:
-    std::unique_ptr<Field> _field;
+protected:
+    TypeInfoPtr _type_info;
+    // NOTE: only used for CHAR/VARCHAR type.
+    int _length;
     bool _is_nullable;
 };
 
@@ -135,21 +163,16 @@ private:
 // to file
 class ScalarColumnWriter final : public ColumnWriter {
 public:
-    ScalarColumnWriter(const ColumnWriterOptions& opts, std::unique_ptr<Field> field, WritableFile* output_file);
+    ScalarColumnWriter(const ColumnWriterOptions& opts, TypeInfoPtr type_info, WritableFile* output_file);
 
     ~ScalarColumnWriter() override;
 
     Status init() override;
 
-    Status append(const vectorized::Column& column) override;
-
-    Status append(const uint8_t* data, const uint8_t* null_flags, size_t count, bool has_null) override;
-
-    // Write offset data, it's only used in ArrayColumn
-    Status append_array_offsets(const uint8_t* data, const uint8_t* null_flags, size_t count, bool has_null);
+    Status append(const Column& column) override;
 
     // Write offset column, it's only used in ArrayColumn
-    Status append_array_offsets(const vectorized::Column& column);
+    Status append_array_offsets(const Column& column);
 
     // rebuild char/varchar encoding when _page_builder is empty
     Status set_encoding(const EncodingTypePB& encoding);
@@ -166,6 +189,8 @@ public:
     Status write_zone_map() override;
     Status write_bitmap_index() override;
     Status write_bloom_filter_index() override;
+    Status write_inverted_index() override;
+
     ordinal_t get_next_rowid() const override { return _next_rowid; }
 
     bool is_global_dict_valid() override { return _is_global_dict_valid; }
@@ -206,6 +231,8 @@ private:
         _data_size += 20;
     }
 
+    Status append(const uint8_t* data, const uint8_t* null_flags, size_t count, bool has_null);
+
     Status _write_data_page(Page* page);
 
     ColumnWriterOptions _opts;
@@ -235,56 +262,17 @@ private:
     std::unique_ptr<ZoneMapIndexWriter> _zone_map_index_builder;
     std::unique_ptr<BitmapIndexWriter> _bitmap_index_builder;
     std::unique_ptr<BloomFilterIndexWriter> _bloom_filter_index_builder;
+    std::unique_ptr<InvertedWriter> _inverted_index_builder;
+
     // _zone_map_index_builder != NULL || _bitmap_index_builder != NULL || _bloom_filter_index_builder != NULL
     bool _has_index_builder = false;
+    bool _has_inverted_builder = false;
     int64_t _element_ordinal = 0;
     int64_t _previous_ordinal = 0;
 
     bool _is_global_dict_valid = true;
 
     uint64_t _total_mem_footprint = 0;
-};
-
-class ArrayColumnWriter final : public ColumnWriter {
-public:
-    explicit ArrayColumnWriter(const ColumnWriterOptions& opts, std::unique_ptr<Field> field,
-                               std::unique_ptr<ScalarColumnWriter> null_writer,
-                               std::unique_ptr<ScalarColumnWriter> offset_writer,
-                               std::unique_ptr<ColumnWriter> element_writer);
-    ~ArrayColumnWriter() override = default;
-
-    Status init() override;
-
-    Status append(const vectorized::Column& column) override;
-
-    Status append(const uint8_t* data, const uint8_t* null_map, size_t count, bool has_null) override;
-
-    uint64_t estimate_buffer_size() override;
-
-    Status finish() override;
-    Status write_data() override;
-    Status write_ordinal_index() override;
-
-    Status finish_current_page() override;
-
-    Status write_zone_map() override { return Status::OK(); }
-
-    Status write_bitmap_index() override { return Status::OK(); }
-
-    Status write_bloom_filter_index() override { return Status::OK(); }
-
-    ordinal_t get_next_rowid() const override { return _array_size_writer->get_next_rowid(); }
-
-    uint64_t total_mem_footprint() const override;
-
-private:
-    Status _append(const vectorized::Column& column);
-
-    ColumnWriterOptions _opts;
-
-    std::unique_ptr<ScalarColumnWriter> _null_writer;
-    std::unique_ptr<ScalarColumnWriter> _array_size_writer;
-    std::unique_ptr<ColumnWriter> _element_writer;
 };
 
 } // namespace starrocks

@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "io/s3_output_stream.h"
 
@@ -10,6 +22,9 @@
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "io/io_profiler.h"
+#include "io/s3_zero_copy_iostream.h"
+#include "util/stopwatch.hpp"
 
 namespace starrocks::io {
 
@@ -27,6 +42,8 @@ S3OutputStream::S3OutputStream(std::shared_ptr<Aws::S3::S3Client> client, std::s
 }
 
 Status S3OutputStream::write(const void* data, int64_t size) {
+    MonotonicStopWatch watch;
+    watch.start();
     _buffer.append(static_cast<const char*>(data), size);
     if (_upload_id.empty() && _buffer.size() > _max_single_part_size) {
         RETURN_IF_ERROR(create_multipart_upload());
@@ -36,6 +53,7 @@ Status S3OutputStream::write(const void* data, int64_t size) {
         RETURN_IF_ERROR(multipart_upload());
         _buffer.clear();
     }
+    IOProfiler::add_write(size, watch.elapsed_time());
     return Status::OK();
 }
 
@@ -64,12 +82,15 @@ Status S3OutputStream::close() {
         return Status::OK();
     }
 
+    MonotonicStopWatch watch;
+    watch.start();
     if (_upload_id.empty()) {
         RETURN_IF_ERROR(singlepart_upload());
     } else {
         RETURN_IF_ERROR(multipart_upload());
         RETURN_IF_ERROR(complete_multipart_upload());
     }
+    IOProfiler::add_sync(watch.elapsed_time());
     _client = nullptr;
     return Status::OK();
 }
@@ -90,18 +111,17 @@ Status S3OutputStream::create_multipart_upload() {
 Status S3OutputStream::singlepart_upload() {
     VLOG(12) << "Uploading s3://" << _bucket << "/" << _object << " via singlepart upload";
     DCHECK(_upload_id.empty());
-    if (_buffer.empty()) {
-        return Status::OK();
-    }
     Aws::S3::Model::PutObjectRequest req;
     req.SetBucket(_bucket);
     req.SetKey(_object);
     req.SetContentLength(static_cast<int64_t>(_buffer.size()));
-    req.SetBody(std::make_shared<Aws::StringStream>(_buffer));
+    req.SetBody(Aws::MakeShared<S3ZeroCopyIOStream>(AWS_ALLOCATE_TAG, _buffer.data(), _buffer.size()));
     Aws::S3::Model::PutObjectOutcome outcome = _client->PutObject(req);
     if (!outcome.IsSuccess()) {
-        return Status::IOError(
-                fmt::format("S3: Fail to put object {}/{}: {}", _bucket, _object, outcome.GetError().GetMessage()));
+        std::string error_msg =
+                fmt::format("S3: Fail to put object {}/{}, msg: {}", _bucket, _object, outcome.GetError().GetMessage());
+        LOG(WARNING) << error_msg;
+        return Status::IOError(error_msg);
     }
     return Status::OK();
 }
@@ -117,7 +137,7 @@ Status S3OutputStream::multipart_upload() {
     req.SetPartNumber(static_cast<int>(_etags.size() + 1));
     req.SetUploadId(_upload_id);
     req.SetContentLength(static_cast<int64_t>(_buffer.size()));
-    req.SetBody(std::make_shared<Aws::StringStream>(_buffer));
+    req.SetBody(Aws::MakeShared<S3ZeroCopyIOStream>(AWS_ALLOCATE_TAG, _buffer.data(), _buffer.size()));
     auto outcome = _client->UploadPart(req);
     if (outcome.IsSuccess()) {
         _etags.push_back(outcome.GetResult().GetETag());
@@ -148,8 +168,10 @@ Status S3OutputStream::complete_multipart_upload() {
     if (outcome.IsSuccess()) {
         return Status::OK();
     }
-    return Status::IOError(fmt::format("S3: Fail to complete multipart upload for object {}/{}: {}", _bucket, _object,
-                                       outcome.GetError().GetMessage()));
+    std::string error_msg = fmt::format("S3: Fail to complete multipart upload for object {}/{}, msg: {}", _bucket,
+                                        _object, outcome.GetError().GetMessage());
+    LOG(WARNING) << error_msg;
+    return Status::IOError(error_msg);
 }
 
 } // namespace starrocks::io

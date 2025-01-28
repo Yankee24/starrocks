@@ -1,10 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.utframe;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
-import com.starrocks.common.GenericPool;
+import com.starrocks.rpc.ThriftConnectionPool;
 import com.starrocks.thrift.BackendService;
 import com.starrocks.thrift.HeartbeatService;
 import com.starrocks.thrift.TNetworkAddress;
@@ -12,7 +25,7 @@ import org.apache.commons.pool2.impl.GenericKeyedObjectPoolConfig;
 
 import java.util.Map;
 
-public class MockGenericPool<VALUE extends org.apache.thrift.TServiceClient> extends GenericPool<VALUE> {
+public class MockGenericPool<VALUE extends org.apache.thrift.TServiceClient> extends ThriftConnectionPool<VALUE> {
     protected Map<TNetworkAddress, MockedBackend> backendMap = Maps.newConcurrentMap();
 
     public MockGenericPool(String name) {
@@ -24,11 +37,6 @@ public class MockGenericPool<VALUE extends org.apache.thrift.TServiceClient> ext
 
     @Override
     public boolean reopen(VALUE object, int timeoutMs) {
-        return true;
-    }
-
-    @Override
-    public boolean reopen(VALUE object) {
         return true;
     }
 

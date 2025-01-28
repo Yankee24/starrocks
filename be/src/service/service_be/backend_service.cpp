@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/service/backend_service.cpp
 
@@ -10,6 +23,7 @@
 // "License"); you may not use this file except in compliance
 // with the License.  You may obtain a copy of the License at
 //
+
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
@@ -21,54 +35,48 @@
 
 #include "backend_service.h"
 
-#include <arrow/record_batch.h>
-#include <thrift/concurrency/ThreadFactory.h>
-#include <thrift/processor/TMultiplexedProcessor.h>
-
-#include <memory>
-
-#include "common/config.h"
-#include "common/logging.h"
-#include "common/status.h"
-#include "gen_cpp/TStarrocksExternalService.h"
-#include "runtime/data_stream_mgr.h"
-#include "runtime/exec_env.h"
-#include "runtime/external_scan_context_mgr.h"
-#include "runtime/fragment_mgr.h"
-#include "runtime/result_buffer_mgr.h"
-#include "runtime/result_queue_mgr.h"
-#include "runtime/routine_load/routine_load_task_executor.h"
+#include "agent/agent_server.h"
+#include "agent/task_worker_pool.h"
 #include "storage/storage_engine.h"
 #include "storage/tablet_manager.h"
-#include "util/blocking_queue.hpp"
-#include "util/thrift_server.h"
 
 namespace starrocks {
 
-using apache::thrift::TProcessor;
-using apache::thrift::concurrency::ThreadFactory;
-
 BackendService::BackendService(ExecEnv* exec_env)
-        : BackendServiceBase(exec_env), _agent_server(new AgentServer(exec_env, *exec_env->master_info())) {}
+        : BackendServiceBase(exec_env), _agent_server(exec_env->agent_server()) {}
 
-Status BackendService::create_service(ExecEnv* exec_env, int port, ThriftServer** server) {
-    std::shared_ptr<BackendService> handler(new BackendService(exec_env));
-    // TODO: do we want a BoostThreadFactory?
-    // TODO: we want separate thread factories here, so that fe requests can't starve
-    // be requests
-    std::shared_ptr<ThreadFactory> thread_factory(new ThreadFactory());
-
-    std::shared_ptr<TProcessor> be_processor(new BackendServiceProcessor(handler));
-
-    *server = new ThriftServer("backend", be_processor, port, exec_env->metrics(), config::be_service_threads);
-
-    LOG(INFO) << "StarRocksInternalService listening on " << port;
-
-    return Status::OK();
-}
+BackendService::~BackendService() = default;
 
 void BackendService::get_tablet_stat(TTabletStatResult& result) {
     StorageEngine::instance()->tablet_manager()->get_tablet_stat(&result);
+}
+
+void BackendService::submit_tasks(TAgentResult& return_value, const std::vector<TAgentTaskRequest>& tasks) {
+    _agent_server->submit_tasks(return_value, tasks);
+}
+
+void BackendService::make_snapshot(TAgentResult& return_value, const TSnapshotRequest& snapshot_request) {
+    _agent_server->make_snapshot(return_value, snapshot_request);
+}
+
+void BackendService::release_snapshot(TAgentResult& return_value, const std::string& snapshot_path) {
+    _agent_server->release_snapshot(return_value, snapshot_path);
+}
+
+void BackendService::publish_cluster_state(TAgentResult& result, const TAgentPublishRequest& request) {
+    _agent_server->publish_cluster_state(result, request);
+}
+
+void BackendService::get_tablets_info(TGetTabletsInfoResult& result_, const TGetTabletsInfoRequest& request) {
+    result_.__set_report_version(curr_report_version());
+    result_.__isset.tablets = true;
+    TStatus t_status;
+    Status st_report = StorageEngine::instance()->tablet_manager()->report_all_tablets_info(&result_.tablets);
+    if (!st_report.ok()) {
+        LOG(WARNING) << "Fail to get all tablets info, err=" << st_report.to_string();
+    }
+    st_report.to_thrift(&t_status);
+    result_.status = t_status;
 }
 
 } // namespace starrocks

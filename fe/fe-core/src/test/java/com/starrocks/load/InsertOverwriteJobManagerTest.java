@@ -1,9 +1,21 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.load;
 
 import com.google.common.collect.Lists;
-import com.starrocks.analysis.InsertStmt;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.persist.CreateInsertOverwriteJobLog;
@@ -12,6 +24,7 @@ import com.starrocks.persist.InsertOverwriteStateChangeInfo;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.StmtExecutor;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.InsertStmt;
 import mockit.Expectations;
 import mockit.Mocked;
 import org.junit.Assert;
@@ -51,18 +64,18 @@ public class InsertOverwriteJobManagerTest {
     @Mocked
     private InsertOverwriteJobRunner runner;
 
-    private InsertOverwriteJobManager insertOverwriteJobManager;
+    private InsertOverwriteJobMgr insertOverwriteJobManager;
     private List<Long> targetPartitionIds;
 
     @Before
     public void setUp() {
-        insertOverwriteJobManager = new InsertOverwriteJobManager();
+        insertOverwriteJobManager = new InsertOverwriteJobMgr();
         targetPartitionIds = Lists.newArrayList(10L, 20L, 30L, 40L);
     }
 
     @Test
     public void testBasic() throws Exception {
-        InsertOverwriteJob insertOverwriteJob = new InsertOverwriteJob(1100L, 100L, 110L, targetPartitionIds);
+        InsertOverwriteJob insertOverwriteJob = new InsertOverwriteJob(1100L, 100L, 110L, targetPartitionIds, false);
 
         insertOverwriteJobManager.registerOverwriteJob(insertOverwriteJob);
         Assert.assertEquals(1, insertOverwriteJobManager.getJobNum());
@@ -101,7 +114,7 @@ public class InsertOverwriteJobManagerTest {
         };
 
         CreateInsertOverwriteJobLog jobInfo = new CreateInsertOverwriteJobLog(
-                1100L, 100L, 110L, targetPartitionIds);
+                1100L, 100L, 110L, targetPartitionIds, false);
         Assert.assertEquals(1100L, jobInfo.getJobId());
         Assert.assertEquals(100L, jobInfo.getDbId());
         Assert.assertEquals(110L, jobInfo.getTableId());
@@ -119,18 +132,18 @@ public class InsertOverwriteJobManagerTest {
         List<Long> newPartitionNames = Lists.newArrayList(10001L);
         InsertOverwriteStateChangeInfo stateChangeInfo = new InsertOverwriteStateChangeInfo(1100L,
                 InsertOverwriteJobState.OVERWRITE_PENDING, InsertOverwriteJobState.OVERWRITE_RUNNING,
-                sourcePartitionNames, newPartitionNames);
+                sourcePartitionNames, null, newPartitionNames);
         insertOverwriteJobManager.replayInsertOverwriteStateChange(stateChangeInfo);
 
         InsertOverwriteStateChangeInfo stateChangeInfo2 = new InsertOverwriteStateChangeInfo(1100L,
                 InsertOverwriteJobState.OVERWRITE_RUNNING, InsertOverwriteJobState.OVERWRITE_SUCCESS,
-                sourcePartitionNames, newPartitionNames);
+                sourcePartitionNames, null, newPartitionNames);
         insertOverwriteJobManager.replayInsertOverwriteStateChange(stateChangeInfo2);
     }
 
     @Test
     public void testSerialization() throws IOException {
-        InsertOverwriteJob insertOverwriteJob1 = new InsertOverwriteJob(1000L, 100L, 110L, targetPartitionIds);
+        InsertOverwriteJob insertOverwriteJob1 = new InsertOverwriteJob(1000L, 100L, 110L, targetPartitionIds, false);
         insertOverwriteJobManager.registerOverwriteJob(insertOverwriteJob1);
         Assert.assertEquals(1, insertOverwriteJobManager.getJobNum());
 
@@ -140,7 +153,7 @@ public class InsertOverwriteJobManagerTest {
 
         ByteArrayInputStream inputStream = new ByteArrayInputStream(outputStream.toByteArray());
         DataInputStream dataInputStream = new DataInputStream(inputStream);
-        InsertOverwriteJobManager newInsertOverwriteJobManager = InsertOverwriteJobManager.read(dataInputStream);
+        InsertOverwriteJobMgr newInsertOverwriteJobManager = InsertOverwriteJobMgr.read(dataInputStream);
         Assert.assertEquals(1, newInsertOverwriteJobManager.getJobNum());
         InsertOverwriteJob newJob = insertOverwriteJobManager.getInsertOverwriteJob(1000L);
         Assert.assertEquals(insertOverwriteJob1, newJob);

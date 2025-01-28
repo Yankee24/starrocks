@@ -1,14 +1,31 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.scheduler;
 
 import com.google.gson.annotations.SerializedName;
+import com.starrocks.authentication.AuthenticationMgr;
+import com.starrocks.cluster.ClusterNamespace;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.common.util.PropertyAnalyzer;
 import com.starrocks.persist.gson.GsonUtils;
+import com.starrocks.scheduler.persist.TaskSchedule;
+import com.starrocks.sql.ast.UserIdentity;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.Map;
 
@@ -20,14 +37,31 @@ public class Task implements Writable {
     @SerializedName("name")
     private String name;
 
+    // set default to MANUAL is for compatibility
+    @SerializedName("type")
+    private Constants.TaskType type = Constants.TaskType.MANUAL;
+
+    // set default to UNKNOWN is for compatibility
+    @SerializedName("state")
+    private Constants.TaskState state = Constants.TaskState.UNKNOWN;
+
+    @SerializedName("schedule")
+    private TaskSchedule schedule;
+
     @SerializedName("createTime")
     private long createTime;
+
+    @SerializedName("catalogName")
+    private String catalogName;
 
     @SerializedName("dbName")
     private String dbName;
 
     @SerializedName("definition")
     private String definition;
+
+    @SerializedName("postRun")
+    private String postRun;
 
     @SerializedName("properties")
     private Map<String, String> properties;
@@ -37,6 +71,21 @@ public class Task implements Writable {
 
     @SerializedName("source")
     private Constants.TaskSource source = Constants.TaskSource.CTAS;
+
+    // set default to ROOT is for compatibility
+    @SerializedName("createUser")
+    @Deprecated
+    private String createUser = AuthenticationMgr.ROOT_USER;
+
+    @SerializedName("createUserIdentity")
+    private UserIdentity userIdentity;
+
+    public Task() {}
+
+    public Task(String name) {
+        this.name = name;
+        this.createTime = System.currentTimeMillis();
+    }
 
     public long getId() {
         return id;
@@ -54,6 +103,34 @@ public class Task implements Writable {
         this.name = name;
     }
 
+    public Constants.TaskType getType() {
+        return type;
+    }
+
+    public void setType(Constants.TaskType type) {
+        this.type = type;
+    }
+
+    public Constants.TaskState getState() {
+        return state;
+    }
+
+    public void setState(Constants.TaskState state) {
+        this.state = state;
+    }
+
+    public TaskSchedule getSchedule() {
+        return schedule;
+    }
+
+    public void setSchedule(TaskSchedule schedule) {
+        this.schedule = schedule;
+    }
+
+    public void setExpireTime(long expireTime) {
+        this.expireTime = expireTime;
+    }
+
     public long getCreateTime() {
         return createTime;
     }
@@ -62,12 +139,21 @@ public class Task implements Writable {
         this.createTime = createTime;
     }
 
+    public String getCatalogName() {
+        return catalogName;
+    }
+
+    public void setCatalogName(String catalogName) {
+        this.catalogName = catalogName;
+    }
+
     public String getDbName() {
-        return dbName;
+        return ClusterNamespace.getNameFromFullName(dbName);
     }
 
     public void setDbName(String dbName) {
-        this.dbName = dbName;
+        // compatible with old version
+        this.dbName = ClusterNamespace.getFullName(dbName);
     }
 
     public String getDefinition() {
@@ -80,6 +166,10 @@ public class Task implements Writable {
 
     public Map<String, String> getProperties() {
         return properties;
+    }
+
+    public String getPropertiesString() {
+        return PropertyAnalyzer.stringifyProperties(properties);
     }
 
     public void setProperties(Map<String, String> properties) {
@@ -102,15 +192,51 @@ public class Task implements Writable {
         this.source = source;
     }
 
+    public String getCreateUser() {
+        return createUser;
+    }
+
+    public void setCreateUser(String createUser) {
+        this.createUser = createUser;
+    }
+
+    public UserIdentity getUserIdentity() {
+        return userIdentity;
+    }
+
+    public void setUserIdentity(UserIdentity userIdentity) {
+        this.userIdentity = userIdentity;
+    }
+
+    public String getPostRun() {
+        return postRun;
+    }
+
+    public void setPostRun(String postRun) {
+        this.postRun = postRun;
+    }
+
     public static Task read(DataInput in) throws IOException {
         String json = Text.readString(in);
         return GsonUtils.GSON.fromJson(json, Task.class);
     }
 
     @Override
-    public void write(DataOutput out) throws IOException {
-        String json = GsonUtils.GSON.toJson(this);
-        Text.writeString(out, json);
+    public String toString() {
+        return "Task{" +
+                "id=" + id +
+                ", name='" + name + '\'' +
+                ", type=" + type +
+                ", state=" + state +
+                ", schedule=" + schedule +
+                ", createTime=" + createTime +
+                ", dbName='" + dbName + '\'' +
+                ", definition='" + definition + '\'' +
+                ", postRun='" + postRun + '\'' +
+                ", properties=" + properties +
+                ", expireTime=" + expireTime +
+                ", source=" + source +
+                ", createUser='" + createUser + '\'' +
+                '}';
     }
-
 }

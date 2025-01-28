@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -11,7 +23,6 @@
 #include "util/slice.h"
 
 namespace starrocks {
-namespace vectorized {
 class TimestampValue;
 
 /**
@@ -32,6 +43,8 @@ public:
     void from_date(int year, int month, int day);
 
     int32_t to_date_literal() const;
+
+    int64_t to_unixtime() const;
 
     void from_date_literal(int64_t date_literal);
 
@@ -66,6 +79,10 @@ public:
     void trunc_to_year();
     void trunc_to_week();
     void trunc_to_quarter();
+
+    void set_end_of_month();
+    void set_end_of_quarter();
+    void set_end_of_year();
 
     bool is_valid() const;
 
@@ -133,12 +150,11 @@ inline std::ostream& operator<<(std::ostream& os, const DateValue& value) {
     os << value.to_string();
     return os;
 }
-} // namespace vectorized
 } // namespace starrocks
 
 namespace std {
 template <>
-struct hash<starrocks::vectorized::DateValue> {
-    size_t operator()(const starrocks::vectorized::DateValue& v) const { return std::hash<int32_t>()(v._julian); }
+struct hash<starrocks::DateValue> {
+    size_t operator()(const starrocks::DateValue& v) const { return std::hash<int32_t>()(v._julian); }
 };
 } // namespace std

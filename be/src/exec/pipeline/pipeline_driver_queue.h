@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -8,8 +20,7 @@
 #include "exec/workgroup/work_group_fwd.h"
 #include "util/factory_method.h"
 
-namespace starrocks {
-namespace pipeline {
+namespace starrocks::pipeline {
 
 class DriverQueue;
 using DriverQueuePtr = std::unique_ptr<DriverQueue>;
@@ -23,9 +34,8 @@ public:
     virtual void put_back(const std::vector<DriverRawPtr>& drivers) = 0;
     // *from_executor* means that the executor thread puts the driver back to the queue.
     virtual void put_back_from_executor(const DriverRawPtr driver) = 0;
-    virtual void put_back_from_executor(const std::vector<DriverRawPtr>& drivers) = 0;
 
-    virtual StatusOr<DriverRawPtr> take(int worker_id) = 0;
+    virtual StatusOr<DriverRawPtr> take(const bool block) = 0;
     virtual void cancel(DriverRawPtr driver) = 0;
 
     // Update statistics of the driver's workgroup,
@@ -33,13 +43,9 @@ public:
     virtual void update_statistics(const DriverRawPtr driver) = 0;
 
     virtual size_t size() const = 0;
-    bool empty() { return size() == 0; }
+    bool empty() const { return size() == 0; }
 
-protected:
-    // The time slice of the i-th level is (i+1)*LEVEL_TIME_SLICE_BASE ns,
-    // so when a driver's execution time exceeds 0.2s, 0.6s, 1.2s, 2s, 3s, 4.2s, 5.6s, and 7.2s,
-    // it will move to next level.
-    static constexpr int64_t LEVEL_TIME_SLICE_BASE_NS = 200'000'000L;
+    virtual bool should_yield(const DriverRawPtr driver, int64_t unaccounted_runtime_ns) const = 0;
 };
 
 // SubQuerySharedDriverQueue is used to store the driver waiting to be executed.
@@ -72,15 +78,15 @@ public:
 
     void put(const DriverRawPtr driver);
     void cancel(const DriverRawPtr driver);
-    DriverRawPtr take();
-    inline bool empty() const { return driver_number == 0; }
+    DriverRawPtr take(const bool block);
+    inline bool empty() const { return num_drivers == 0; }
 
-    inline size_t size() const { return driver_number; }
+    inline size_t size() const { return num_drivers; }
 
     std::deque<DriverRawPtr> queue;
     std::queue<DriverRawPtr> pending_cancel_queue;
     std::unordered_set<DriverRawPtr> cancelled_set;
-    size_t driver_number = 0;
+    size_t num_drivers = 0;
 
     // factor for normalization
     double factor_for_normal = 0;
@@ -99,19 +105,20 @@ public:
     void put_back(const DriverRawPtr driver) override;
     void put_back(const std::vector<DriverRawPtr>& drivers) override;
     void put_back_from_executor(const DriverRawPtr driver) override;
-    void put_back_from_executor(const std::vector<DriverRawPtr>& drivers) override;
 
     void update_statistics(const DriverRawPtr driver) override;
 
     // Return cancelled status, if the queue is closed.
-    StatusOr<DriverRawPtr> take(int worker_id) override;
+    StatusOr<DriverRawPtr> take(const bool block) override;
 
     void cancel(DriverRawPtr driver) override;
 
     size_t size() const override;
 
+    bool should_yield(const DriverRawPtr driver, int64_t unaccounted_runtime_ns) const override { return false; }
+
+    static double ratio_of_adjacent_queue() { return config::pipeline_driver_queue_ratio_of_adjacent_queue; }
     static constexpr size_t QUEUE_SIZE = 8;
-    static constexpr double RATIO_OF_ADJACENT_QUEUE = 1.2;
 
 private:
     // When the driver at the i-th level costs _level_time_slices[i],
@@ -119,77 +126,44 @@ private:
     int _compute_driver_level(const DriverRawPtr driver) const;
 
 private:
+    // The time slice of the i-th level is (i+1)*LEVEL_TIME_SLICE_BASE ns,
+    // so when a driver's execution time exceeds 0.2s, 0.6s, 1.2s, 2.0s, 3.0s, 4.2s, 5.6s, 7.4s.
+    // it will move to next level.
+    const int64_t LEVEL_TIME_SLICE_BASE_NS = config::pipeline_driver_queue_level_time_slice_base_ns;
+    const double RATIO_OF_ADJACENT_QUEUE = ratio_of_adjacent_queue();
+
     SubQuerySharedDriverQueue _queues[QUEUE_SIZE];
     // The time slice of the i-th level is (i+1)*LEVEL_TIME_SLICE_BASE ns.
     int64_t _level_time_slices[QUEUE_SIZE];
+
+    size_t _num_drivers = 0;
 
     mutable std::mutex _global_mutex;
     std::condition_variable _cv;
     bool _is_closed = false;
 };
 
-// All the QuerySharedDriverQueueWithoutLock's methods MUST be guarded by the outside lock.
-class QuerySharedDriverQueueWithoutLock : public FactoryMethod<DriverQueue, QuerySharedDriverQueueWithoutLock> {
-    friend class FactoryMethod<DriverQueue, QuerySharedDriverQueueWithoutLock>;
-
-public:
-    QuerySharedDriverQueueWithoutLock();
-    ~QuerySharedDriverQueueWithoutLock() override = default;
-    void close() override {}
-
-    void put_back(const DriverRawPtr driver) override;
-    void put_back(const std::vector<DriverRawPtr>& drivers) override;
-    void put_back_from_executor(const DriverRawPtr driver) override;
-    void put_back_from_executor(const std::vector<DriverRawPtr>& drivers) override;
-
-    // Always return non-nullable value.
-    StatusOr<DriverRawPtr> take(int worker_id) override;
-
-    void cancel(DriverRawPtr driver) override;
-
-    void update_statistics(const DriverRawPtr driver) override;
-
-    size_t size() const override { return _size; }
-
-private:
-    void _put_back(const DriverRawPtr driver);
-    // When the driver at the i-th level costs _level_time_slices[i],
-    // it will move to (i+1)-th level.
-    int _compute_driver_level(const DriverRawPtr driver) const;
-
-private:
-    static constexpr size_t QUEUE_SIZE = 8;
-    static constexpr double RATIO_OF_ADJACENT_QUEUE = 1.2;
-
-    SubQuerySharedDriverQueue _queues[QUEUE_SIZE];
-    // The time slice of the i-th level is (i+1)*LEVEL_TIME_SLICE_BASE ns.
-    int64_t _level_time_slices[QUEUE_SIZE];
-
-    size_t _size = 0;
-};
-
-// DriverQueueWithWorkGroup contains two levels of queues.
+// WorkGroupDriverQueue contains two levels of queues.
 // The first level is the work group queue, and the second level is the driver queue in a work group.
-class DriverQueueWithWorkGroup : public FactoryMethod<DriverQueue, DriverQueueWithWorkGroup> {
-    friend class FactoryMethod<DriverQueue, DriverQueueWithWorkGroup>;
+class WorkGroupDriverQueue : public FactoryMethod<DriverQueue, WorkGroupDriverQueue> {
+    friend class FactoryMethod<DriverQueue, WorkGroupDriverQueue>;
 
 public:
-    ~DriverQueueWithWorkGroup() override = default;
+    ~WorkGroupDriverQueue() override = default;
     void close() override;
 
     void put_back(const DriverRawPtr driver) override;
     void put_back(const std::vector<DriverRawPtr>& drivers) override;
     // When the driver's workgroup is not in the workgroup queue
-    // and the driver isn't from a executor thread (that is, from the poller or new driver),
+    // and the driver isn't from an executor thread (that is, from the poller or new driver),
     // the workgroup's vruntime is adjusted to workgroup_queue.min_vruntime-ideal_runtime/2,
     // to avoid sloping too much time to this workgroup.
     void put_back_from_executor(const DriverRawPtr driver) override;
-    void put_back_from_executor(const std::vector<DriverRawPtr>& drivers) override;
 
     // Return cancelled status, if the queue is closed.
     // Firstly, select the work group with the minimum vruntime.
     // Secondly, select the proper driver from the driver queue of this work group.
-    StatusOr<DriverRawPtr> take(int worker_id) override;
+    StatusOr<DriverRawPtr> take(const bool block) override;
 
     void cancel(DriverRawPtr driver) override;
 
@@ -197,27 +171,48 @@ public:
 
     size_t size() const override;
 
-private:
-    // The schedule period is equal to SCHEDULE_PERIOD_PER_WG_NS * num_workgroups.
-    static constexpr int64_t SCHEDULE_PERIOD_PER_WG_NS = 200'1000'1000;
+    bool should_yield(const DriverRawPtr driver, int64_t unaccounted_runtime_ns) const override;
 
-    // This method should be guarded by the outside _global_mutex.
+private:
+    /// These methods should be guarded by the outside _global_mutex.
     template <bool from_executor>
     void _put_back(const DriverRawPtr driver);
-    // This method should be guarded by the outside _global_mutex.
-    workgroup::WorkGroup* _find_min_owner_wg(int worker_id);
-    workgroup::WorkGroup* _find_min_wg();
+    workgroup::WorkGroupDriverSchedEntity* _pick_next_wg() const;
+    // _update_min_wg is invoked when an entity is enqueued or dequeued from _wg_entities.
+    void _update_min_wg();
+    template <bool from_executor>
+    void _enqueue_workgroup(workgroup::WorkGroupDriverSchedEntity* wg_entity);
+    void _dequeue_workgroup(workgroup::WorkGroupDriverSchedEntity* wg_entity);
+
     // The ideal runtime of a work group is the weighted average of the schedule period.
-    int64_t _ideal_runtime_ns(workgroup::WorkGroup* wg);
+    int64_t _ideal_runtime_ns(workgroup::WorkGroupDriverSchedEntity* wg_entity) const;
+
+private:
+    static constexpr int64_t SCHEDULE_PERIOD_PER_WG_NS = 100'000'000;
+
+    struct WorkGroupDriverSchedEntityComparator {
+        using WorkGroupDriverSchedEntityPtr = workgroup::WorkGroupDriverSchedEntity*;
+        bool operator()(const WorkGroupDriverSchedEntityPtr& lhs_ptr,
+                        const WorkGroupDriverSchedEntityPtr& rhs_ptr) const;
+    };
+    using WorkgroupSet = std::set<workgroup::WorkGroupDriverSchedEntity*, WorkGroupDriverSchedEntityComparator>;
 
     mutable std::mutex _global_mutex;
     std::condition_variable _cv;
-    // _ready_wgs contains the workgroups which include the drivers need to be run.
-    std::unordered_set<workgroup::WorkGroup*> _ready_wgs;
-    size_t _sum_cpu_limit = 0;
-
+    std::condition_variable _cv_for_borrowed_cpus;
     bool _is_closed = false;
+
+    // Contains the workgroups which include the drivers ready to be run.
+    // Entities are sorted by vruntime in set.
+    // MUST guarantee the entity is not in set, when updating its vruntime.
+    WorkgroupSet _wg_entities;
+
+    size_t _sum_cpu_weight = 0;
+
+    size_t _num_drivers = 0;
+
+    // Cache the minimum entity, used to check should_yield() without lock.
+    std::atomic<workgroup::WorkGroupDriverSchedEntity*> _min_wg_entity = nullptr;
 };
 
-} // namespace pipeline
-} // namespace starrocks
+} // namespace starrocks::pipeline

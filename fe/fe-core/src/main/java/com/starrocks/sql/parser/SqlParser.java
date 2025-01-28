@@ -1,50 +1,204 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.parser;
 
-import com.clearspring.analytics.util.Lists;
+import com.google.common.collect.Lists;
 import com.starrocks.analysis.Expr;
-import com.starrocks.analysis.QueryStmt;
-import com.starrocks.analysis.SqlScanner;
-import com.starrocks.analysis.StatementBase;
-import com.starrocks.common.AnalysisException;
-import com.starrocks.common.util.SqlParserUtils;
+import com.starrocks.common.Config;
+import com.starrocks.common.Pair;
+import com.starrocks.connector.parser.trino.TrinoParserUtils;
+import com.starrocks.connector.trino.TrinoParserUnsupportedException;
+import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.OriginStatement;
-import com.starrocks.sql.StatementPlanner;
+import com.starrocks.qe.SessionVariable;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.ImportColumnsStmt;
+import com.starrocks.sql.ast.PrepareStmt;
+import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.common.ErrorType;
+import com.starrocks.sql.common.StarRocksPlannerException;
+import com.starrocks.sql.common.UnsupportedException;
+import io.trino.sql.parser.StatementSplitter;
 import org.antlr.v4.runtime.CharStreams;
 import org.antlr.v4.runtime.CommonTokenStream;
+import org.antlr.v4.runtime.ParserRuleContext;
+import org.antlr.v4.runtime.Token;
+import org.antlr.v4.runtime.atn.ParserATNSimulator;
+import org.antlr.v4.runtime.atn.PredictionContextCache;
+import org.antlr.v4.runtime.atn.PredictionMode;
+import org.antlr.v4.runtime.dfa.DFA;
+import org.antlr.v4.runtime.misc.ParseCancellationException;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
-import java.io.StringReader;
 import java.util.List;
+import java.util.Objects;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import static com.starrocks.sql.common.UnsupportedException.unsupportedException;
 
 public class SqlParser {
-    public static List<StatementBase> parse(String originSql, long sqlMode) {
-        List<String> splitSql = splitSQL(originSql);
-        List<StatementBase> statements = Lists.newArrayList();
+    private static final Logger LOG = LogManager.getLogger(SqlParser.class);
+    private static final String EOF = "<EOF>";
+    private static final int MIN_TOKEN_LIMIT = 100;
+    private final AstBuilder.AstBuilderFactory astBuilderFactory;
 
-        for (int idx = 0; idx < splitSql.size(); ++idx) {
-            String sql = splitSql.get(idx);
-            try {
-                StarRocksLexer lexer = new StarRocksLexer(new CaseInsensitiveStream(CharStreams.fromString(sql)));
-                CommonTokenStream tokenStream = new CommonTokenStream(lexer);
-                StarRocksParser parser = new StarRocksParser(tokenStream);
-                StarRocksParser.sqlMode = sqlMode;
-                parser.removeErrorListeners();
-                parser.addErrorListener(new ErrorHandler());
-                StarRocksParser.SqlStatementsContext sqlStatements = parser.sqlStatements();
-                StatementBase statement = (StatementBase) new AstBuilder(sqlMode)
-                        .visitSingleStatement(sqlStatements.singleStatement(0));
-                statement.setOrigStmt(new OriginStatement(sql, idx));
-                statements.add(statement);
-            } catch (ParsingException parsingException) {
-                StatementBase statement = parseWithOldParser(sql, sqlMode, 0);
-                if (StatementPlanner.supportedByNewPlanner(statement) || statement instanceof QueryStmt) {
-                    throw parsingException;
-                }
+    public SqlParser(AstBuilder.AstBuilderFactory astBuilderFactory) {
+        this.astBuilderFactory = astBuilderFactory;
+    }
+
+    public static List<StatementBase> parse(String sql, SessionVariable sessionVariable) {
+        try {
+            if (sessionVariable.getSqlDialect().equalsIgnoreCase("trino")) {
+                return parseWithTrinoDialect(sql, sessionVariable);
+            } else {
+                return parseWithStarRocksDialect(sql, sessionVariable);
+            }
+        } catch (OutOfMemoryError e) {
+            LOG.warn("parser out of memory, sql is:" + sql);
+            throw e;
+        }
+    }
+
+    private static List<StatementBase> parseWithTrinoDialect(String sql, SessionVariable sessionVariable) {
+        List<StatementBase> statements = Lists.newArrayList();
+        try {
+            StatementSplitter splitter = new StatementSplitter(sql);
+            for (int idx = 0; idx < splitter.getCompleteStatements().size(); ++idx) {
+                StatementSplitter.Statement statement = splitter.getCompleteStatements().get(idx);
+                StatementBase statementBase = TrinoParserUtils.toStatement(statement.statement(),
+                        sessionVariable.getSqlMode());
+                statementBase.setOrigStmt(new OriginStatement(sql, idx));
+                statements.add(statementBase);
+            }
+            if (!splitter.getPartialStatement().isEmpty()) {
+                StatementBase statement = TrinoParserUtils.toStatement(splitter.getPartialStatement(),
+                        sessionVariable.getSqlMode());
+                statement.setOrigStmt(new OriginStatement(sql, splitter.getCompleteStatements().size()));
                 statements.add(statement);
             }
+            if (ConnectContext.get() != null) {
+                ConnectContext.get().setRelationAliasCaseInSensitive(true);
+            }
+        } catch (ParsingException e) {
+            // In Trino parser AstBuilder, it could throw ParsingException for unexpected exception,
+            // use StarRocks parser to parse now.
+            LOG.warn("Trino parse sql [{}] error, cause by {}", sql, e);
+            if (sessionVariable.isEnableDialectDowngrade()) {
+                return tryParseWithStarRocksDialect(sql, sessionVariable, e);
+            }
+            throw e;
+        } catch (io.trino.sql.parser.ParsingException e) {
+            // This sql does not use Trino syntax，use StarRocks parser to parse now.
+            if (sql.toLowerCase().contains("select")) {
+                LOG.warn("Trino parse sql [{}] error, cause by {}", sql, e);
+            }
+            if (sessionVariable.isEnableDialectDowngrade()) {
+                return tryParseWithStarRocksDialect(sql, sessionVariable, e);
+            }
+            throw e;
+        } catch (TrinoParserUnsupportedException e) {
+            // We only support Trino partial syntax now, and for Trino parser unsupported statement,
+            // try to use StarRocks parser to parse
+            if (sessionVariable.isEnableDialectDowngrade()) {
+                return tryParseWithStarRocksDialect(sql, sessionVariable, e);
+            }
+            throw e;
+        } catch (UnsupportedException e) {
+            // For unsupported statement, it can not be parsed by trino or StarRocks parser, both parser
+            // can not support it now, we just throw the exception here to give user more information
+            LOG.warn("Sql [{}] are not supported by trino parser, cause by {}", sql, e);
+            throw e;
         }
-
+        if (statements.isEmpty() || statements.stream().anyMatch(Objects::isNull)) {
+            return parseWithStarRocksDialect(sql, sessionVariable);
+        }
         return statements;
+    }
+
+    private static List<StatementBase> tryParseWithStarRocksDialect(String sql, SessionVariable sessionVariable,
+                                                                    Exception trinoException) {
+        try {
+            return parseWithStarRocksDialect(sql, sessionVariable);
+        } catch (Exception starRocksException) {
+            LOG.warn("StarRocks parse sql [{}] error, cause by {}", sql, starRocksException);
+            if (trinoException instanceof UnsupportedException) {
+                throw unsupportedException(String.format("Trino parser parse sql error: [%s], " +
+                                "and StarRocks parser also can not parse: [%s]", trinoException, starRocksException));
+            } else {
+                throw new StarRocksPlannerException(ErrorType.USER_ERROR,
+                        String.format("Trino parser parse sql error: [%s], and StarRocks parser also can not parse: [%s]",
+                        trinoException, starRocksException));
+            }
+        }
+    }
+
+    private static List<StatementBase> parseWithStarRocksDialect(String sql, SessionVariable sessionVariable) {
+        List<StatementBase> statements = Lists.newArrayList();
+        Pair<ParserRuleContext, StarRocksParser> pair = invokeParser(sql, sessionVariable, StarRocksParser::sqlStatements);
+        StarRocksParser.SqlStatementsContext sqlStatementsContext = (StarRocksParser.SqlStatementsContext) pair.first;
+        List<StarRocksParser.SingleStatementContext> singleStatementContexts = sqlStatementsContext.singleStatement();
+        for (int idx = 0; idx < singleStatementContexts.size(); ++idx) {
+            // collect hint info
+            HintCollector collector = new HintCollector((CommonTokenStream) pair.second.getTokenStream(), sessionVariable);
+            collector.collect(singleStatementContexts.get(idx));
+            AstBuilder astBuilder = GlobalStateMgr.getCurrentState().getSqlParser().astBuilderFactory
+                    .create(sessionVariable.getSqlMode(), collector.getContextWithHintMap());
+            StatementBase statement = (StatementBase) astBuilder.visitSingleStatement(singleStatementContexts.get(idx));
+            if (astBuilder.getParameters() != null && astBuilder.getParameters().size() != 0
+                    && !(statement instanceof PrepareStmt)) {
+                // for prepare stm1 from  '', here statement is inner statement
+                statement = new PrepareStmt("", statement, astBuilder.getParameters());
+            } else {
+                statement.setOrigStmt(new OriginStatement(sql, idx));
+            }
+            statements.add(statement);
+        }
+        return statements;
+    }
+
+    /**
+     * We need not only sqlMode but also other parameters to define the property of parser.
+     * Please consider use {@link #parse(String, SessionVariable)}
+     */
+    @Deprecated
+    public static List<StatementBase> parse(String originSql, long sqlMode) {
+        SessionVariable sessionVariable = new SessionVariable();
+        sessionVariable.setSqlMode(sqlMode);
+        return parse(originSql, sessionVariable);
+    }
+
+    /**
+     * Please use {@link #parse(String, SessionVariable)}
+     */
+    @Deprecated
+    public static StatementBase parseFirstStatement(String originSql, long sqlMode) {
+        return parse(originSql, sqlMode).get(0);
+    }
+
+    public static StatementBase parseSingleStatement(String originSql, long sqlMode) {
+        List<StatementBase> statements = parse(originSql, sqlMode);
+        if (statements.size() > 1) {
+            throw new ParsingException("only single statement is supported");
+        }
+        return statements.get(0);
+    }
+
+    public static StatementBase parseOneWithStarRocksDialect(String originSql, SessionVariable sessionVariable) {
+        return parseWithStarRocksDialect(originSql, sessionVariable).get(0);
     }
 
     /**
@@ -55,126 +209,84 @@ public class SqlParser {
      * @return Expr
      */
     public static Expr parseSqlToExpr(String expressionSql, long sqlMode) {
-        StarRocksLexer lexer = new StarRocksLexer(new CaseInsensitiveStream(CharStreams.fromString(expressionSql)));
+        SessionVariable sessionVariable = new SessionVariable();
+        sessionVariable.setSqlMode(sqlMode);
+        ParserRuleContext expressionContext = invokeParser(expressionSql, sessionVariable,
+                StarRocksParser::expressionSingleton).first;
+        return (Expr) GlobalStateMgr.getCurrentState().getSqlParser().astBuilderFactory
+                .create(sqlMode).visit(expressionContext);
+    }
+
+    public static List<Expr> parseSqlToExprs(String expressions, SessionVariable sessionVariable) {
+        StarRocksParser.ExpressionListContext expressionListContext = (StarRocksParser.ExpressionListContext)
+                invokeParser(expressions, sessionVariable, StarRocksParser::expressionList).first;
+        AstBuilder astBuilder = GlobalStateMgr.getCurrentState().getSqlParser().astBuilderFactory
+                .create(sessionVariable.getSqlMode());
+        return expressionListContext.expression().stream()
+                .map(e -> (Expr) astBuilder.visit(e))
+                .collect(Collectors.toList());
+    }
+
+    public static ImportColumnsStmt parseImportColumns(String expressionSql, long sqlMode) {
+        SessionVariable sessionVariable = new SessionVariable();
+        sessionVariable.setSqlMode(sqlMode);
+        ParserRuleContext importColumnsContext = invokeParser(expressionSql, sessionVariable,
+                StarRocksParser::importColumns).first;
+        return (ImportColumnsStmt) GlobalStateMgr.getCurrentState().getSqlParser().astBuilderFactory
+                .create(sqlMode).visit(importColumnsContext);
+    }
+
+    private static Pair<ParserRuleContext, StarRocksParser> invokeParser(
+            String sql, SessionVariable sessionVariable,
+            Function<StarRocksParser, ParserRuleContext> parseFunction) {
+        StarRocksLexer lexer = new StarRocksLexer(new CaseInsensitiveStream(CharStreams.fromString(sql)));
+        lexer.setSqlMode(sessionVariable.getSqlMode());
         CommonTokenStream tokenStream = new CommonTokenStream(lexer);
+        int exprLimit = Math.max(Config.expr_children_limit, sessionVariable.getExprChildrenLimit());
+        int tokenLimit = Math.max(MIN_TOKEN_LIMIT, sessionVariable.getParseTokensLimit());
         StarRocksParser parser = new StarRocksParser(tokenStream);
-        StarRocksParser.sqlMode = sqlMode;
         parser.removeErrorListeners();
         parser.addErrorListener(new ErrorHandler());
-        StarRocksParser.ExpressionContext expressionContext = parser.expression();
-        return ((Expr) new AstBuilder(sqlMode).visit(expressionContext));
-    }
+        parser.removeParseListeners();
+        parser.addParseListener(new PostProcessListener(tokenLimit, exprLimit));
+        if (!Config.enable_parser_context_cache) {
+            DFA[] decisionDFA = new DFA[parser.getATN().getNumberOfDecisions()];
+            for (int i = 0; i < parser.getATN().getNumberOfDecisions(); i++) {
+                decisionDFA[i] = new DFA(parser.getATN().getDecisionState(i), i);
+            }
+            parser.setInterpreter(new ParserATNSimulator(parser, parser.getATN(), decisionDFA, new PredictionContextCache()));
+        }
 
-    public static StatementBase parseWithOldParser(String originStmt, long sqlMode, int idx) {
-        SqlScanner input = new SqlScanner(new StringReader(originStmt), sqlMode);
-        com.starrocks.analysis.SqlParser parser = new com.starrocks.analysis.SqlParser(input);
         try {
-            return SqlParserUtils.getStmt(parser, idx);
-        } catch (Error e) {
-            throw new ParsingException("Please check your sql, we meet an error when parsing.");
-        } catch (AnalysisException e) {
-            String errorMessage = parser.getErrorMsg(originStmt);
-            if (errorMessage == null) {
-                throw new ParsingException(e.getMessage());
-            } else {
-                throw new ParsingException(errorMessage);
-            }
-        } catch (Exception e) {
-            String errorMessage = e.getMessage();
-            if (errorMessage == null) {
-                throw new ParsingException("Internal Error");
-            } else {
-                throw new ParsingException("Internal Error: " + errorMessage);
-            }
+            // inspire by https://github.com/antlr/antlr4/issues/192#issuecomment-15238595
+            // try SLL mode with BailErrorStrategy firstly
+            parser.getInterpreter().setPredictionMode(PredictionMode.SLL);
+            parser.setErrorHandler(new StarRocksBailErrorStrategy());
+            return Pair.create(parseFunction.apply(parser), parser);
+        } catch (ParseCancellationException e) {
+            // if we fail, parse with LL mode with our own error strategy
+            // rewind input stream
+            tokenStream.seek(0);
+            parser.reset();
+            parser.getInterpreter().setPredictionMode(PredictionMode.LL);
+            parser.setErrorHandler(new StarRocksDefaultErrorStrategy());
+            return Pair.create(parseFunction.apply(parser), parser);
         }
     }
 
-    private static List<String> splitSQL(String sql) {
-        sql = removeComment(sql);
-
-        List<String> sqlLists = Lists.newArrayList();
-        boolean inString = false;
-        int sqlStartOffset = 0;
-        char inStringStart = '-';
-        for (int i = 0; i < sql.length(); ++i) {
-            if (!inString && (sql.charAt(i) == '\"' || sql.charAt(i) == '\'' || sql.charAt(i) == '`')) {
-                inString = true;
-                inStringStart = sql.charAt(i);
-            } else if (inString && (sql.charAt(i) == inStringStart)) {
-                inString = false;
-            }
-
-            if (sql.charAt(i) == ';') {
-                if (!inString) {
-                    sqlLists.add(sql.substring(sqlStartOffset, i));
-                    sqlStartOffset = i + 1;
-                }
-            }
+    public static String getTokenDisplay(Token t) {
+        if (t == null) {
+            return "<no token>";
         }
 
-        String last = sql.substring(sqlStartOffset).trim();
-        if (!last.isEmpty()) {
-            sqlLists.add(last);
-        }
-        return sqlLists;
-    }
-
-    /*
-     * The new version of parser can handle comments (discarded directly in lexical analysis).
-     * But there are some special cases when the old and new parsers are compatible.
-     * Because the parser does not support all statements, we split the sql according to ";".
-     * For example, sql: --xxx;\nselect 1; According to the old version, it will be parsed into one statement,
-     * but after splitting according to the statement,
-     * two statements will appear. This leads to incompatibility.
-     * Because originSql is stored in the old version of the materialized view, it is the index stored in the old version.
-     * */
-    private static String removeComment(String sql) {
-        boolean inString = false;
-        char inStringStart = '-';
-        boolean isSimpleComment = false;
-        boolean isBracketComment = false;
-
-        boolean inComment = false;
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < sql.length(); ++i) {
-            if (inComment) {
-                if (sql.charAt(i) == '\n' && isSimpleComment) {
-                    inComment = false;
-                }
-
-                if (sql.charAt(i) == '*' && i != sql.length() - 1 && sql.charAt(i + 1) == '/' && isBracketComment) {
-                    inComment = false;
-                    i++;
-                }
-
-                continue;
-            }
-
-            if (sql.charAt(i) == '-' && i != sql.length() - 1 && sql.charAt(i + 1) == '-') {
-                if (!inString) {
-                    inComment = true;
-                    isSimpleComment = true;
-                    continue;
-                }
-            }
-
-            if (sql.charAt(i) == '/' && i != sql.length() - 2 && sql.charAt(i + 1) == '*' && sql.charAt(i + 2) != '+') {
-                if (!inString) {
-                    inComment = true;
-                    isBracketComment = true;
-                    continue;
-                }
-            }
-
-            sb.append(sql.charAt(i));
-
-            if (!inString && (sql.charAt(i) == '\"' || sql.charAt(i) == '\'' || sql.charAt(i) == '`')) {
-                inString = true;
-                inStringStart = sql.charAt(i);
-            } else if (inString && (sql.charAt(i) == inStringStart)) {
-                inString = false;
+        String s = t.getText();
+        if (s == null) {
+            if (t.getType() == Token.EOF) {
+                s = EOF;
+            } else {
+                s = "<" + t.getType() + ">";
             }
         }
-        return sb.toString();
+        return s;
     }
 }

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/txn_manager.h
 
@@ -21,6 +34,8 @@
 
 #pragma once
 
+#include <bthread/condition_variable.h>
+#include <bthread/mutex.h>
 #include <pthread.h>
 #include <rapidjson/document.h>
 
@@ -48,15 +63,19 @@
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_meta.h"
 #include "storage/tablet.h"
+#include "util/countdown_latch.h"
 #include "util/lru_cache.h"
 #include "util/time.h"
 
 namespace starrocks {
 
+struct TxnInfo;
+
 struct TabletTxnInfo {
     PUniqueId load_id;
     RowsetSharedPtr rowset;
-    int64_t creation_time;
+    int64_t creation_time{0};
+    int64_t commit_time{0};
 
     TabletTxnInfo(PUniqueId load_id, RowsetSharedPtr rowset)
             : load_id(std::move(load_id)), rowset(std::move(rowset)), creation_time(UnixSeconds()) {}
@@ -67,7 +86,7 @@ struct TabletTxnInfo {
 // txn manager is used to manage mapping between tablet and txns
 class TxnManager {
 public:
-    TxnManager(int32_t txn_map_shard_size, int32_t txn_shard_size);
+    TxnManager(int32_t txn_map_shard_size, int32_t txn_shard_size, uint32_t store_num);
 
     ~TxnManager() = default;
 
@@ -78,13 +97,18 @@ public:
                       const PUniqueId& load_id, const RowsetSharedPtr& rowset_ptr, bool is_recovery);
 
     Status publish_txn(TPartitionId partition_id, const TabletSharedPtr& tablet, TTransactionId transaction_id,
-                       int64_t version, const RowsetSharedPtr& rowset);
+                       int64_t version, const RowsetSharedPtr& rowset, uint32_t wait_time = 0,
+                       bool is_double_write = false);
+
+    Status publish_overwrite_txn(TPartitionId partition_id, const TabletSharedPtr& tablet,
+                                 TTransactionId transaction_id, int64_t version, const RowsetSharedPtr& rowset,
+                                 uint32_t wait_time);
 
     // persist_tablet_related_txns persists the tablets' meta and make it crash-safe.
     Status persist_tablet_related_txns(const std::vector<TabletSharedPtr>& tablets);
 
     // persist metadata of affected_dirs and make it crash-safe
-    static void flush_dirs(std::unordered_set<DataDir*>& affected_dirs);
+    void flush_dirs(std::unordered_set<DataDir*>& affected_dirs);
 
     // delete the txn from manager if it is not committed(not have a valid rowset)
     Status rollback_txn(TPartitionId partition_id, const TabletSharedPtr& tablet, TTransactionId transaction_id,
@@ -132,8 +156,11 @@ public:
 
     void get_partition_ids(const TTransactionId transaction_id, std::vector<TPartitionId>* partition_ids);
 
+    void get_txn_infos(int64_t txn_id, int64_t tablet_id, std::vector<TxnInfo>& txn_infos);
+
 private:
     using TxnKey = std::pair<int64_t, int64_t>; // partition_id, transaction_id;
+    using BThreadCountDownLatch = GenericCountDownLatch<bthread::Mutex, bthread::ConditionVariable>;
 
     // implement TxnKey hash function to support TxnKey as a key for unordered_map
     struct TxnKeyHash {
@@ -179,6 +206,9 @@ private:
     std::unique_ptr<txn_partition_map_t[]> _txn_partition_maps;
 
     std::unique_ptr<std::shared_mutex[]> _txn_map_locks;
+
+    // Dynamic thread pool used to concurrently flush WAL to disk
+    std::unique_ptr<ThreadPool> _flush_thread_pool;
 
     TxnManager(const TxnManager&) = delete;
     const TxnManager& operator=(const TxnManager&) = delete;

@@ -1,24 +1,41 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include <cstdint>
+#include <vector>
 
 #include "column/vectorized_fwd.h"
 #include "gtest/gtest.h"
-#include "runtime/primitive_type.h"
 #include "simd/mulselector.h"
 #include "testutil/parallel_test.h"
+#include "types/logical_type.h"
 #include "util/value_generator.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
-template <PrimitiveType TYPE, int CASE_SIZE, int TEST_SIZE>
+template <LogicalType TYPE, int CASE_SIZE, int TEST_SIZE, bool IS_CONST>
 void test_simd_multi_select_if() {
-    static_assert(isArithmeticPT<TYPE>, "Now Select IF only support Arithmetic TYPE");
+    static_assert(isArithmeticLT<TYPE>, "Now Select IF only support Arithmetic TYPE");
 
     using SelectVec = typename SIMD_muti_selector<TYPE>::SelectVec;
     using Container = typename SIMD_muti_selector<TYPE>::Container;
     using SelectorContainer = typename BooleanColumn::Container;
     using RuntimeCppType = typename SIMD_muti_selector<TYPE>::CppType;
+    using DataInit =
+            std::conditional_t<IS_CONST,
+                               ContainerIniter<RandomConstGenerator<RuntimeCppType, 128>, Container, TEST_SIZE>,
+                               ContainerIniter<RandomGenerator<RuntimeCppType, 128>, Container, TEST_SIZE>>;
 
     {
         SelectorContainer selectors[CASE_SIZE];
@@ -27,9 +44,7 @@ void test_simd_multi_select_if() {
 
         SelectVec select_vecs[CASE_SIZE];
         Container* select_lists[CASE_SIZE + 1];
-
         using SelectorInit = ContainerIniter<RandomGenerator<uint8_t, 2>, SelectorContainer, TEST_SIZE>;
-        using DataInit = ContainerIniter<RandomGenerator<RuntimeCppType, 128>, Container, TEST_SIZE>;
 
         // Init TEST Value
         for (int i = 0; i < CASE_SIZE; ++i) {
@@ -41,8 +56,15 @@ void test_simd_multi_select_if() {
             select_lists[i] = &data_valus[i];
         }
         DataInit::init(dst);
+        std::vector<bool> is_const(CASE_SIZE + 1, false);
+        if constexpr (IS_CONST) {
+            for (int i = 0; i < CASE_SIZE + 1; i++) {
+                is_const[i] = true;
+            }
+        }
 
-        SIMD_muti_selector<TYPE>::multi_select_if(select_vecs, CASE_SIZE, dst, select_lists, CASE_SIZE + 1);
+        SIMD_muti_selector<TYPE>::multi_select_if(select_vecs, CASE_SIZE, dst, select_lists, CASE_SIZE + 1, is_const,
+                                                  selectors[0].size());
 
         for (int i = 0; i < TEST_SIZE; i++) {
             int index = 0;
@@ -55,13 +77,14 @@ void test_simd_multi_select_if() {
     }
 }
 
-template <PrimitiveType TYPE, int CASE_SIZE, int TEST_SIZE>
+template <LogicalType TYPE, int CASE_SIZE, int TEST_SIZE>
 bool test_function_wrapper() {
-    test_simd_multi_select_if<TYPE, CASE_SIZE, TEST_SIZE>();
+    test_simd_multi_select_if<TYPE, CASE_SIZE, TEST_SIZE, false>();
+    test_simd_multi_select_if<TYPE, CASE_SIZE, TEST_SIZE, true>();
     return true;
 }
 
-template <PrimitiveType... TYPE>
+template <LogicalType... TYPE>
 bool test_all() {
     constexpr int chunk_size = 4095;
 
@@ -85,4 +108,4 @@ PARALLEL_TEST(SIMDMultiSelectorTest, TestVarVar) {
             TYPE_DOUBLE>();
     // clang-format on
 }
-} // namespace starrocks::vectorized
+} // namespace starrocks

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/rowset/segment_v2/bitshuffle_wrapper.cpp
 
@@ -29,10 +42,29 @@
 
 // Include the bitshuffle header again, but this time importing the
 // AVX2-compiled symbols by defining some macros.
+// See `build_bitshuffle` in `build-thirdparty.sh` for detail.
+#undef BITSHUFFLE_H
+#define bshuf_compress_lz4_bound bshuf_compress_lz4_bound_avx512
+#define bshuf_compress_lz4 bshuf_compress_lz4_avx512
+#define bshuf_decompress_lz4 bshuf_decompress_lz4_avx512
+#include <bitshuffle/bitshuffle.h> // NOLINT(*)
+#undef bshuf_compress_lz4_bound
+#undef bshuf_compress_lz4
+#undef bshuf_decompress_lz4
+
 #undef BITSHUFFLE_H
 #define bshuf_compress_lz4_bound bshuf_compress_lz4_bound_avx2
 #define bshuf_compress_lz4 bshuf_compress_lz4_avx2
 #define bshuf_decompress_lz4 bshuf_decompress_lz4_avx2
+#include <bitshuffle/bitshuffle.h> // NOLINT(*)
+#undef bshuf_compress_lz4_bound
+#undef bshuf_compress_lz4
+#undef bshuf_decompress_lz4
+
+#undef BITSHUFFLE_H
+#define bshuf_compress_lz4_bound bshuf_compress_lz4_bound_neon
+#define bshuf_compress_lz4 bshuf_compress_lz4_neon
+#define bshuf_decompress_lz4 bshuf_decompress_lz4_neon
 #include <bitshuffle/bitshuffle.h> // NOLINT(*)
 #undef bshuf_compress_lz4_bound
 #undef bshuf_compress_lz4
@@ -57,7 +89,11 @@ decltype(&bshuf_decompress_lz4) g_bshuf_decompress_lz4;
 // the cost of a 'std::once' call.
 __attribute__((constructor)) void SelectBitshuffleFunctions() {
 #if (defined(__i386) || defined(__x86_64__))
-    if (CPU().has_avx2()) {
+    if (CPU().has_avx512f() && CPU().has_avx512bw()) {
+        g_bshuf_compress_lz4_bound = bshuf_compress_lz4_bound_avx512;
+        g_bshuf_compress_lz4 = bshuf_compress_lz4_avx512;
+        g_bshuf_decompress_lz4 = bshuf_decompress_lz4_avx512;
+    } else if (CPU().has_avx2()) {
         g_bshuf_compress_lz4_bound = bshuf_compress_lz4_bound_avx2;
         g_bshuf_compress_lz4 = bshuf_compress_lz4_avx2;
         g_bshuf_decompress_lz4 = bshuf_decompress_lz4_avx2;
@@ -66,6 +102,10 @@ __attribute__((constructor)) void SelectBitshuffleFunctions() {
         g_bshuf_compress_lz4 = bshuf_compress_lz4;
         g_bshuf_decompress_lz4 = bshuf_decompress_lz4;
     }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    g_bshuf_compress_lz4_bound = bshuf_compress_lz4_bound_neon;
+    g_bshuf_compress_lz4 = bshuf_compress_lz4_neon;
+    g_bshuf_decompress_lz4 = bshuf_decompress_lz4_neon;
 #else
     g_bshuf_compress_lz4_bound = bshuf_compress_lz4_bound;
     g_bshuf_compress_lz4 = bshuf_compress_lz4;

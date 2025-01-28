@@ -38,7 +38,7 @@ public class RangeUtils {
             Comparator.comparing(o -> o.getValue().lowerEndpoint());
 
     public static final Comparator<Range<PartitionKey>> RANGE_COMPARATOR =
-            Comparator.comparing(o -> o.lowerEndpoint());
+            Comparator.comparing(Range::lowerEndpoint);
 
     public static void checkRangeIntersect(Range<PartitionKey> range1, Range<PartitionKey> range2) throws DdlException {
         if (range2.isConnected(range1)) {
@@ -46,6 +46,14 @@ public class RangeUtils {
                 throw new DdlException("Range " + range1 + " is intersected with range: " + range2);
             }
         }
+    }
+
+    public static <T extends Comparable> boolean isRangeEqual(Range<T> l, Range<T> r) {
+        if (l == null || r == null) {
+            return false;
+        }
+        return l.lowerEndpoint().compareTo(r.lowerEndpoint()) == 0 &&
+                l.upperEndpoint().compareTo(r.upperEndpoint()) == 0;
     }
 
     /*
@@ -75,6 +83,9 @@ public class RangeUtils {
      */
     public static void checkRangeListsMatch(List<Range<PartitionKey>> list1, List<Range<PartitionKey>> list2)
             throws DdlException {
+        if (list1.isEmpty() && list2.isEmpty()) {
+            return;
+        }
         Collections.sort(list1, RangeUtils.RANGE_COMPARATOR);
         Collections.sort(list2, RangeUtils.RANGE_COMPARATOR);
 
@@ -84,7 +95,7 @@ public class RangeUtils {
         Range<PartitionKey> range2 = list2.get(idx2);
         while (true) {
             if (range1.lowerEndpoint().compareTo(range2.lowerEndpoint()) != 0) {
-                throw new DdlException("2 range lists are not stricly matched. "
+                throw new DdlException("2 range lists are not strictly matched. "
                         + range1.lowerEndpoint() + " vs. " + range2.lowerEndpoint());
             }
 
@@ -114,7 +125,7 @@ public class RangeUtils {
         }
 
         if (idx1 < list1.size() || idx2 < list2.size()) {
-            throw new DdlException("2 range lists are not stricly matched. "
+            throw new DdlException("2 range lists are not strictly matched. "
                     + list1 + " vs. " + list2);
         }
     }

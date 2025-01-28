@@ -25,11 +25,52 @@
 namespace starrocks {
 
 class CpuMetrics;
-class MemoryMetrics;
 class DiskMetrics;
 class NetMetrics;
 class FileDescriptorMetrics;
 class SnmpMetrics;
+class QueryCacheMetrics;
+class VectorIndexCacheMetrics;
+class RuntimeFilterMetrics;
+class VectorIndexCacheMetrics;
+
+class MemoryMetrics {
+public:
+    METRIC_DEFINE_INT_GAUGE(jemalloc_allocated_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(jemalloc_active_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(jemalloc_metadata_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(jemalloc_metadata_thp, MetricUnit::NOUNIT);
+    METRIC_DEFINE_INT_GAUGE(jemalloc_resident_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(jemalloc_mapped_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(jemalloc_retained_bytes, MetricUnit::BYTES);
+
+    // MemPool metrics
+    METRIC_DEFINE_INT_GAUGE(process_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(query_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(load_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(metadata_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(tablet_metadata_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(rowset_metadata_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(segment_metadata_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(column_metadata_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(tablet_schema_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(column_zonemap_index_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(ordinal_index_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(bitmap_index_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(bloom_filter_index_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(segment_zonemap_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(short_key_index_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(compaction_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(schema_change_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(storage_page_cache_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(jit_cache_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(update_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(chunk_allocator_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(passthrough_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(clone_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(consistency_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(datacache_mem_bytes, MetricUnit::BYTES);
+};
 
 class SystemMetrics {
 public:
@@ -50,6 +91,7 @@ public:
     void get_max_net_traffic(const std::map<std::string, int64_t>& lst_send_map,
                              const std::map<std::string, int64_t>& lst_rcv_map, int64_t interval_sec,
                              int64_t* send_rate, int64_t* rcv_rate);
+    const MemoryMetrics* memory_metrics() const { return _memory_metrics.get(); }
 
 private:
     void _install_cpu_metrics(MetricRegistry*);
@@ -71,7 +113,20 @@ private:
     void _update_fd_metrics();
 
     void _install_snmp_metrics(MetricRegistry* registry);
+
     void _update_snmp_metrics();
+
+    void _install_query_cache_metrics(MetricRegistry* registry);
+
+    void _update_query_cache_metrics();
+
+    void _install_runtime_filter_metrics(MetricRegistry* registry);
+
+    void _update_runtime_filter_metrics();
+
+    void _install_vector_index_cache_metrics(MetricRegistry* registry);
+
+    void _update_vector_index_cache_metrics();
 
 private:
     static const char* const _s_hook_name;
@@ -81,6 +136,9 @@ private:
     std::map<std::string, DiskMetrics*> _disk_metrics;
     std::map<std::string, NetMetrics*> _net_metrics;
     std::unique_ptr<FileDescriptorMetrics> _fd_metrics;
+    std::unique_ptr<QueryCacheMetrics> _query_cache_metrics;
+    std::unique_ptr<VectorIndexCacheMetrics> _vector_index_cache_metrics;
+    std::map<std::string, RuntimeFilterMetrics*> _runtime_filter_metrics;
     int _proc_net_dev_version = 0;
     std::unique_ptr<SnmpMetrics> _snmp_metrics;
 

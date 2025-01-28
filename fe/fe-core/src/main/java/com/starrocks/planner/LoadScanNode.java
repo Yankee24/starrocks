@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/planner/LoadScanNode.java
 
@@ -31,8 +44,11 @@ import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.catalog.AggregateType;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.common.UserException;
-import com.starrocks.load.Load;
+import com.starrocks.common.StarRocksException;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.RunMode;
+import com.starrocks.sql.analyzer.AnalyzerUtils;
+import com.starrocks.system.ComputeNode;
 
 import java.util.List;
 import java.util.Map;
@@ -43,7 +59,7 @@ public abstract class LoadScanNode extends ScanNode {
         super(id, desc, planNodeName);
     }
 
-    protected void initWhereExpr(Expr whereExpr, Analyzer analyzer) throws UserException {
+    protected void initWhereExpr(Expr whereExpr, Analyzer analyzer) throws StarRocksException {
         if (whereExpr == null) {
             return;
         }
@@ -60,8 +76,8 @@ public abstract class LoadScanNode extends ScanNode {
         for (SlotRef slot : slots) {
             SlotDescriptor slotDesc = dstDescMap.get(slot.getColumnName());
             if (slotDesc == null) {
-                throw new UserException("unknown column reference in where statement, reference="
-                        + slot.getColumnName());
+                throw new StarRocksException("unknown column in where statement. "
+                        + "the column '" + slot.getColumnName() + "' in where clause must be in the target table.");
             }
             smap.getLhs().add(slot);
             SlotRef slotRef = new SlotRef(slotDesc);
@@ -69,12 +85,12 @@ public abstract class LoadScanNode extends ScanNode {
             smap.getRhs().add(slotRef);
         }
         whereExpr = whereExpr.clone(smap);
-        whereExpr = Load.analyzeAndCastExprForLoad(whereExpr);
+        whereExpr = Expr.analyzeAndCastFold(whereExpr);
 
         if (!whereExpr.getType().isBoolean()) {
-            throw new UserException("where statement is not a valid statement return bool");
+            throw new StarRocksException("where statement is not a valid statement return bool");
         }
-        addConjuncts(whereExpr.getConjuncts());
+        addConjuncts(AnalyzerUtils.extractConjuncts(whereExpr));
     }
 
     protected void checkBitmapCompatibility(Analyzer analyzer, SlotDescriptor slotDesc, Expr expr)
@@ -87,6 +103,30 @@ public abstract class LoadScanNode extends ScanNode {
                 throw new AnalysisException(errorMsg);
             }
         }
+    }
+
+    // Return all available nodes under the warehouse to run load scan. Should consider different deployment modes
+    // 1. Share-nothing: only backends can be used for scan
+    // 2. Share-data: both backends and compute nodes can be used for scan
+    public static List<ComputeNode> getAvailableComputeNodes(long warehouseId) {
+        List<ComputeNode> nodes = Lists.newArrayList();
+        // TODO: need to refactor after be split into cn + dn
+        if (RunMode.isSharedDataMode()) {
+            List<Long> computeNodeIds = GlobalStateMgr.getCurrentState().getWarehouseMgr().getAllComputeNodeIds(warehouseId);
+            for (long cnId : computeNodeIds) {
+                ComputeNode cn = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackendOrComputeNode(cnId);
+                if (cn != null && cn.isAvailable()) {
+                    nodes.add(cn);
+                }
+            }
+        } else {
+            for (ComputeNode be : GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getIdToBackend().values()) {
+                if (be.isAvailable()) {
+                    nodes.add(be);
+                }
+            }
+        }
+        return nodes;
     }
 
 }

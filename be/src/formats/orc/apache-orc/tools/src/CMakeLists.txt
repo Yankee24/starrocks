@@ -1,9 +1,10 @@
-
+# Copyright 2021-present StarRocks, Inc. All rights reserved.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#     https://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -29,6 +30,7 @@ set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g ${CXX11_FLAGS} ${WARN_FLAGS}")
 
 add_executable (orc-contents
   FileContents.cc
+  ToolsHelper.cc
   )
 
 target_link_libraries (orc-contents
@@ -38,6 +40,7 @@ target_link_libraries (orc-contents
 
 add_executable (orc-scan
   FileScan.cc
+  ToolsHelper.cc
   )
 
 target_link_libraries (orc-scan
@@ -47,6 +50,7 @@ target_link_libraries (orc-scan
 
 add_executable (orc-metadata
   FileMetadata.cc
+  ToolsHelper.cc
   )
 
 target_link_libraries (orc-metadata
@@ -66,6 +70,7 @@ target_link_libraries (orc-statistics
 
 add_executable (orc-memory
   FileMemory.cc
+  ToolsHelper.cc
   )
 
 target_link_libraries (orc-memory

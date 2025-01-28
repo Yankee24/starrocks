@@ -17,6 +17,7 @@
 
 package com.starrocks.common;
 
+import com.starrocks.rpc.ThriftConnectionPool;
 import com.starrocks.thrift.BackendService;
 import com.starrocks.thrift.InternalServiceVersion;
 import com.starrocks.thrift.TAgentPublishRequest;
@@ -31,6 +32,8 @@ import com.starrocks.thrift.TExportStatusResult;
 import com.starrocks.thrift.TExportTaskRequest;
 import com.starrocks.thrift.TFetchDataParams;
 import com.starrocks.thrift.TFetchDataResult;
+import com.starrocks.thrift.TGetTabletsInfoRequest;
+import com.starrocks.thrift.TGetTabletsInfoResult;
 import com.starrocks.thrift.TMiniLoadEtlStatusRequest;
 import com.starrocks.thrift.TMiniLoadEtlStatusResult;
 import com.starrocks.thrift.TMiniLoadEtlTaskRequest;
@@ -45,6 +48,7 @@ import com.starrocks.thrift.TScanOpenParams;
 import com.starrocks.thrift.TScanOpenResult;
 import com.starrocks.thrift.TSnapshotRequest;
 import com.starrocks.thrift.TStatus;
+import com.starrocks.thrift.TStreamLoadChannel;
 import com.starrocks.thrift.TTabletStatResult;
 import com.starrocks.thrift.TTransmitDataParams;
 import com.starrocks.thrift.TTransmitDataResult;
@@ -64,7 +68,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class GenericPoolTest {
-    static GenericPool<BackendService.Client> backendService;
+    static ThriftConnectionPool<BackendService.Client> backendService;
     static ThriftServer service;
     static String ip = "127.0.0.1";
     static int port;
@@ -90,7 +94,7 @@ public class GenericPoolTest {
             config.setMaxTotal(3); // (default -1)
             config.setMaxWaitMillis(500);
             // new ClientPool
-            backendService = new GenericPool("BackendService", config, 0);
+            backendService = new ThriftConnectionPool("BackendService", config, 0);
             // new ThriftService
             TProcessor tprocessor = new BackendService.Processor<BackendService.Iface>(
                     new InternalProcessor());
@@ -143,7 +147,7 @@ public class GenericPoolTest {
         }
 
         @Override
-        public TAgentResult release_snapshot(String snapshot_path) throws TException {
+        public TAgentResult release_snapshot(String snapshotPath) throws TException {
             return null;
         }
 
@@ -168,7 +172,7 @@ public class GenericPoolTest {
         }
 
         @Override
-        public TAgentResult make_snapshot(TSnapshotRequest snapshot_request) throws TException {
+        public TAgentResult make_snapshot(TSnapshotRequest snapshotRequest) throws TException {
             // TODO Auto-generated method stub
             return null;
         }
@@ -180,13 +184,13 @@ public class GenericPoolTest {
         }
 
         @Override
-        public TExportStatusResult get_export_status(TUniqueId task_id) throws TException {
+        public TExportStatusResult get_export_status(TUniqueId taskId) throws TException {
             // TODO Auto-generated method stub
             return null;
         }
 
         @Override
-        public TStatus erase_export_task(TUniqueId task_id) throws TException {
+        public TStatus erase_export_task(TUniqueId taskId) throws TException {
             // TODO Auto-generated method stub
             return null;
         }
@@ -198,7 +202,18 @@ public class GenericPoolTest {
         }
 
         @Override
+        public TGetTabletsInfoResult get_tablets_info(TGetTabletsInfoRequest request) throws TException {
+            return null;
+        }
+
+        @Override
         public TStatus submit_routine_load_task(List<TRoutineLoadTask> tasks) throws TException {
+            // TODO Auto-generated method stub
+            return null;
+        }
+
+        @Override
+        public TStatus finish_stream_load_channel(TStreamLoadChannel streamLoadChannel) throws TException {
             // TODO Auto-generated method stub
             return null;
         }

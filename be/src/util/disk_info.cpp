@@ -20,14 +20,11 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
-#include <sys/vfs.h>
 #include <unistd.h>
 
 #include <boost/algorithm/string.hpp>
-#include <boost/algorithm/string/join.hpp>
 #include <fstream>
 #include <iostream>
-#include <sstream>
 
 #include "fs/fs_util.h"
 #include "gutil/strings/split.h"
@@ -46,8 +43,6 @@ int DiskInfo::_s_num_datanode_dirs;
 void DiskInfo::get_device_names() {
     // Format of this file is:
     //    major, minor, #blocks, name
-    // We are only interesting in name which is formatted as device_name<partition #>
-    // The same device will show up multiple times for each partition (e.g. sda1, sda2).
     std::ifstream partitions("/proc/partitions", std::ios::in);
 
     while (partitions.good() && !partitions.eof()) {
@@ -67,9 +62,6 @@ void DiskInfo::get_device_names() {
             continue;
         }
 
-        // Remove the partition# from the name.  e.g. sda2 --> sda
-        boost::trim_right_if(name, boost::is_any_of("0123456789"));
-
         // Create a mapping of all device ids (one per partition) to the disk id.
         int major_dev_id = atoi(fields[0].c_str());
         int minor_dev_id = atoi(fields[1].c_str());
@@ -77,7 +69,7 @@ void DiskInfo::get_device_names() {
         DCHECK(_s_device_id_to_disk_id.find(dev) == _s_device_id_to_disk_id.end());
 
         int disk_id = -1;
-        std::map<std::string, int>::iterator it = _s_disk_name_to_disk_id.find(name);
+        auto it = _s_disk_name_to_disk_id.find(name);
 
         if (it == _s_disk_name_to_disk_id.end()) {
             // First time seeing this disk
@@ -130,7 +122,7 @@ void DiskInfo::init() {
 int DiskInfo::disk_id(const char* path) {
     struct stat s;
     stat(path, &s);
-    std::map<dev_t, int>::iterator it = _s_device_id_to_disk_id.find(s.st_dev);
+    auto it = _s_device_id_to_disk_id.find(s.st_dev);
 
     if (it == _s_device_id_to_disk_id.end()) {
         return -1;
@@ -195,7 +187,6 @@ Status DiskInfo::get_disk_devices(const std::vector<std::string>& paths, std::se
                 continue;
             }
             std::string dev(basename(dev_path));
-            boost::trim_right_if(dev, boost::is_any_of("0123456789"));
             if (_s_disk_name_to_disk_id.find(dev) != std::end(_s_disk_name_to_disk_id)) {
                 max_mount_size = mount_size;
                 match_dev = dev;

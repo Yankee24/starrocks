@@ -1,45 +1,69 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/StructField.java
-
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.catalog;
 
+import com.google.common.base.Objects;
 import com.google.common.base.Strings;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.thrift.TStructField;
 import com.starrocks.thrift.TTypeDesc;
 import com.starrocks.thrift.TTypeNode;
+import org.apache.commons.lang3.StringUtils;
+
+import java.util.StringJoiner;
 
 /**
  * TODO: Support comments for struct fields. The Metastore does not properly store
  * comments of struct fields. We set comment to null to avoid compatibility issues.
  */
 public class StructField {
-    protected final String name;
-    protected final Type type;
-    protected final String comment;
-    protected int position;  // in struct
+    @SerializedName(value = "name")
+    private String name;
+    @SerializedName(value = "type")
+    private Type type;
 
-    public StructField(String name, Type type, String comment) {
+    // comment is not used now, it's always null.
+    @SerializedName(value = "comment")
+    private String comment;
+    private int position;  // in struct
+
+    @SerializedName(value = "fieldId")
+    private int fieldId = -1;
+
+    // fieldPhysicalName is used to store the physical name of the field in the storage layer.
+    // for example, the physical name of a struct field in a parquet file.
+    // used in delta lake column mapping name mode
+    @SerializedName(value = "fieldPhysicalName")
+    private String fieldPhysicalName = "";
+
+    public StructField() {}
+
+    public StructField(String name, int fieldId, Type type, String comment) {
+        this(name, fieldId, "", type, comment);
+    }
+
+    public StructField(String name, int fieldId, String fieldPhysicalName, Type type, String comment) {
         this.name = name;
         this.type = type;
         this.comment = comment;
+        this.fieldId = fieldId;
+        this.fieldPhysicalName = fieldPhysicalName;
+    }
+
+    public StructField(String name, Type type, String comment) {
+        this(name, -1, type, comment);
     }
 
     public StructField(String name, Type type) {
@@ -62,19 +86,32 @@ public class StructField {
         return position;
     }
 
+    public int getFieldId() {
+        return fieldId;
+    }
+
     public void setPosition(int position) {
         this.position = position;
     }
 
-    public String toSql(int depth) {
+    public String toSql(int depth, boolean printName) {
         String typeSql = (depth < Type.MAX_NESTING_DEPTH) ? type.toSql(depth) : "...";
-        StringBuilder sb = new StringBuilder(name);
-        if (type != null) {
-            sb.append(":" + typeSql);
+        StringBuilder sb = new StringBuilder();
+        if (printName) {
+            sb.append(name).append(' ');
         }
+        sb.append(typeSql);
         if (comment != null) {
             sb.append(String.format(" COMMENT '%s'", comment));
         }
+        return sb.toString();
+    }
+
+    public String toTypeString(int depth) {
+        String typeSql = (depth < Type.MAX_NESTING_DEPTH) ? type.toTypeString(depth) : "...";
+        StringBuilder sb = new StringBuilder();
+        sb.append(name).append(' ');
+        sb.append(typeSql);
         return sb.toString();
     }
 
@@ -82,16 +119,19 @@ public class StructField {
      * Pretty prints this field with lpad number of leading spaces.
      * Calls prettyPrint(lpad) on this field's type.
      */
-    public String prettyPrint(int lpad) {
+    public String prettyPrint(int lpad, boolean printName) {
         String leftPadding = Strings.repeat(" ", lpad);
-        StringBuilder sb = new StringBuilder(leftPadding + name);
-        if (type != null) {
-            // Pass in the padding to make sure nested fields are aligned properly,
-            // even if we then strip the top-level padding.
-            String typeStr = type.prettyPrint(lpad);
-            typeStr = typeStr.substring(lpad);
-            sb.append(":" + typeStr);
+        StringBuilder sb = new StringBuilder(leftPadding);
+        if (printName) {
+            sb.append(name).append(' ');
         }
+
+        // Pass in the padding to make sure nested fields are aligned properly,
+        // even if we then strip the top-level padding.
+        String typeStr = type.prettyPrint(lpad);
+        typeStr = typeStr.substring(lpad);
+        sb.append(typeStr);
+
         if (comment != null) {
             sb.append(String.format(" COMMENT '%s'", comment));
         }
@@ -101,11 +141,16 @@ public class StructField {
     public void toThrift(TTypeDesc container, TTypeNode node) {
         TStructField field = new TStructField();
         field.setName(name);
-        if (comment != null) {
-            field.setComment(comment);
-        }
+        field.setComment(comment);
+        field.setId(fieldId);
+        field.setPhysical_name(fieldPhysicalName);
         node.struct_fields.add(field);
         type.toThrift(container);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(name.toLowerCase(), type, fieldId, fieldPhysicalName);
     }
 
     @Override
@@ -114,7 +159,29 @@ public class StructField {
             return false;
         }
         StructField otherStructField = (StructField) other;
-        return otherStructField.name.equals(name) && otherStructField.type.equals(type);
+        // Both are named struct field
+        return StringUtils.equalsIgnoreCase(name, otherStructField.name) && Objects.equal(type, otherStructField.type) &&
+                    (fieldId == otherStructField.fieldId) && Objects.equal(fieldPhysicalName, otherStructField.fieldPhysicalName);
+    }
+
+    @Override
+    public String toString() {
+        return new StringJoiner(", ", StructField.class.getSimpleName() + "[", "]")
+                .add("name='" + (Strings.isNullOrEmpty(name) ? "" : name) + "'")
+                .add("type=" + type)
+                .add("position=" + position)
+                .add("fieldId=" + fieldId)
+                .add("fieldPhysicalName='" + (Strings.isNullOrEmpty(fieldPhysicalName) ? "" : fieldPhysicalName) + "'")
+                .toString();
+    }
+
+    @Override
+    public StructField clone() {
+        return new StructField(name, fieldId, fieldPhysicalName, type.clone(), comment);
+    }
+
+    public int getMaxUniqueId() {
+        return Math.max(fieldId, type.getMaxUniqueId());
     }
 }
 

@@ -1,14 +1,26 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
 #include <vector>
 
-#include "storage/vectorized_column_predicate.h"
+#include "storage/column_predicate.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
-class ColumnOrPredicate : public ColumnPredicate {
+class ColumnOrPredicate final : public ColumnPredicate {
 public:
     explicit ColumnOrPredicate(const TypeInfoPtr& type_info, ColumnId cid) : ColumnPredicate(type_info, cid) {}
 
@@ -39,13 +51,15 @@ public:
     PredicateType type() const override { return PredicateType::kOr; }
 
     // Always return `NULL`.
-    Datum value() const override { return Datum(); }
+    Datum value() const override { return {}; }
 
     // Always return an empty set.
     std::vector<Datum> values() const override { return std::vector<Datum>{}; }
 
     Status convert_to(const ColumnPredicate** output, const TypeInfoPtr& target_type_info,
                       ObjectPool* obj_pool) const override;
+
+    std::string debug_string() const override;
 
 private:
     Status _evaluate(const Column* column, uint8_t* selection, uint16_t from, uint16_t to) const;
@@ -55,4 +69,4 @@ private:
     mutable std::vector<uint8_t> _buff;
 };
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

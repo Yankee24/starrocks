@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/metric/MetricCalculator.java
 
@@ -21,8 +34,11 @@
 
 package com.starrocks.metric;
 
+import com.starrocks.common.Config;
 import com.starrocks.qe.QueryDetail;
 import com.starrocks.qe.QueryDetailQueue;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.RunMode;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -38,6 +54,10 @@ public class MetricCalculator extends TimerTask {
     private long lastQueryCounter = -1;
     private long lastRequestCounter = -1;
     private long lastQueryErrCounter = -1;
+    private long lastQueryInternalErrCounter = -1;
+    private long lastQueryAnalysisErrCounter = -1;
+    private long lastQueryTimeOutCounter = -1;
+
     private long lastQueryEventTime = -1;
 
     @Override
@@ -52,6 +72,9 @@ public class MetricCalculator extends TimerTask {
             lastQueryCounter = MetricRepo.COUNTER_QUERY_ALL.getValue();
             lastRequestCounter = MetricRepo.COUNTER_REQUEST_ALL.getValue();
             lastQueryErrCounter = MetricRepo.COUNTER_QUERY_ERR.getValue();
+            lastQueryInternalErrCounter = MetricRepo.COUNTER_QUERY_INTERNAL_ERR.getValue();
+            lastQueryAnalysisErrCounter = MetricRepo.COUNTER_QUERY_ANALYSIS_ERR.getValue();
+            lastQueryTimeOutCounter = MetricRepo.COUNTER_QUERY_TIMEOUT.getValue();
             lastQueryEventTime = System.currentTimeMillis() * 1000000;
             return;
         }
@@ -76,21 +99,43 @@ public class MetricCalculator extends TimerTask {
         MetricRepo.GAUGE_QUERY_ERR_RATE.setValue(errRate < 0 ? 0.0 : errRate);
         lastQueryErrCounter = currentErrCounter;
 
+        // internal err rate
+        long currentInternalErrCounter = MetricRepo.COUNTER_QUERY_INTERNAL_ERR.getValue();
+        double internalErrRate = (double) (currentInternalErrCounter - lastQueryInternalErrCounter) / interval;
+        MetricRepo.GAUGE_QUERY_INTERNAL_ERR_RATE.setValue(errRate < 0 ? 0.0 : internalErrRate);
+        lastQueryInternalErrCounter = currentErrCounter;
+
+        // analysis error rate
+        long currentAnalysisErrCounter = MetricRepo.COUNTER_QUERY_ANALYSIS_ERR.getValue();
+        double analysisErrRate = (double) (currentAnalysisErrCounter - lastQueryAnalysisErrCounter) / interval;
+        MetricRepo.GAUGE_QUERY_ANALYSIS_ERR_RATE.setValue(errRate < 0 ? 0.0 : analysisErrRate);
+        lastQueryAnalysisErrCounter = currentErrCounter;
+
+        // query timeout rate
+        long currentTimeoutErrCounter = MetricRepo.COUNTER_QUERY_TIMEOUT.getValue();
+        double timeoutErrRate = (double) (currentTimeoutErrCounter - lastQueryTimeOutCounter) / interval;
+        MetricRepo.GAUGE_QUERY_TIMEOUT_RATE.setValue(errRate < 0 ? 0.0 : timeoutErrRate);
+        lastQueryTimeOutCounter = currentErrCounter;
+
         lastTs = currentTs;
 
         // max tablet compaction score of all backends
-        long maxCompactionScore = 0;
-        List<Metric> compactionScoreMetrics = MetricRepo.getMetricsByName(MetricRepo.TABLET_MAX_COMPACTION_SCORE);
-        for (Metric metric : compactionScoreMetrics) {
-            if (((GaugeMetric<Long>) metric).getValue() > maxCompactionScore) {
-                maxCompactionScore = ((GaugeMetric<Long>) metric).getValue();
+        if (RunMode.isSharedDataMode()) {
+            MetricRepo.GAUGE_MAX_TABLET_COMPACTION_SCORE.setValue(
+                    (long) GlobalStateMgr.getCurrentState().getCompactionMgr().getMaxCompactionScore());
+        } else {
+            long maxCompactionScore = 0;
+            List<Metric> compactionScoreMetrics = MetricRepo.getMetricsByName(MetricRepo.TABLET_MAX_COMPACTION_SCORE);
+            for (Metric metric : compactionScoreMetrics) {
+                if (((GaugeMetric<Long>) metric).getValue() > maxCompactionScore) {
+                    maxCompactionScore = ((GaugeMetric<Long>) metric).getValue();
+                }
             }
+            MetricRepo.GAUGE_MAX_TABLET_COMPACTION_SCORE.setValue(maxCompactionScore);
         }
-        MetricRepo.GAUGE_MAX_TABLET_COMPACTION_SCORE.setValue(maxCompactionScore);
 
         // query latency
         List<QueryDetail> queryList = QueryDetailQueue.getQueryDetailsAfterTime(lastQueryEventTime);
-        ResourceGroupMetricMgr.updateQueryLatency(queryList);
         List<Long> latencyList = new ArrayList<>();
         double latencySum = 0L;
         for (QueryDetail queryDetail : queryList) {
@@ -128,5 +173,15 @@ public class MetricCalculator extends TimerTask {
             MetricRepo.GAUGE_QUERY_LATENCY_P99.setValue(0.0);
             MetricRepo.GAUGE_QUERY_LATENCY_P999.setValue(0.0);
         }
+
+        if (Config.enable_routine_load_lag_metrics)  {
+            MetricRepo.updateRoutineLoadProcessMetrics();
+        }
+
+        if (Config.memory_tracker_enable)  {
+            MetricRepo.updateMemoryUsageMetrics();
+        }
+
+        MetricRepo.GAUGE_SAFE_MODE.setValue(GlobalStateMgr.getCurrentState().isSafeMode() ? 1 : 0);
     }
 }

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/options.cpp
 
@@ -22,12 +35,14 @@
 #include "storage/options.h"
 
 #include <algorithm>
+#include <filesystem>
 
 #include "common/config.h"
 #include "common/logging.h"
 #include "common/status.h"
 #include "fs/fs.h"
 #include "gutil/strings/split.h"
+#include "gutil/strings/substitute.h"
 #include "util/path_util.h"
 
 namespace starrocks {
@@ -61,8 +76,14 @@ Status parse_root_path(const string& root_path, StorePath* path) {
         return Status::InvalidArgument("Invalid store path");
     }
 
+    Status status = FileSystem::Default()->create_dir_if_missing(tmp_vec[0]);
+    if (!status.ok()) {
+        LOG(WARNING) << "path can not be created. path=" << tmp_vec[0];
+        return status;
+    }
+
     string canonicalized_path;
-    Status status = FileSystem::Default()->canonicalize(tmp_vec[0], &canonicalized_path);
+    status = FileSystem::Default()->canonicalize(tmp_vec[0], &canonicalized_path);
     if (!status.ok()) {
         LOG(WARNING) << "path can not be canonicalized. may be not exist. path=" << tmp_vec[0];
         return status;
@@ -83,9 +104,8 @@ Status parse_root_path(const string& root_path, StorePath* path) {
         string value;
         std::pair<string, string> pair = strings::Split(tmp_vec[i], strings::delimiter::Limit(":", 1));
         if (pair.second.empty()) {
-            // deprecated
-            // format_1: <value> only supports setting capacity
-            property = CAPACITY_UC;
+            LOG(WARNING) << "invalid property of store path, " << tmp_vec[i];
+            return Status::InvalidArgument(strings::Substitute("invalid property of store path, $0", tmp_vec[i]));
         } else {
             // format_2
             property = to_upper(pair.first);

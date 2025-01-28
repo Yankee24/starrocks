@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/exprs/expr_context.cpp
 
@@ -22,7 +35,7 @@
 #include "exprs/expr_context.h"
 
 #include <fmt/format.h>
-#include <gperftools/profiler.h>
+#include <storage/chunk_helper.h>
 
 #include <memory>
 #include <sstream>
@@ -30,24 +43,20 @@
 
 #include "column/chunk.h"
 #include "common/statusor.h"
+#include "exprs/column_ref.h"
 #include "exprs/expr.h"
-#include "exprs/vectorized/column_ref.h"
 #include "runtime/mem_pool.h"
 #include "runtime/runtime_state.h"
-#include "udf/udf_internal.h"
-#include "util/debug_util.h"
-#include "util/stack_util.h"
 
 namespace starrocks {
 
-ExprContext::ExprContext(Expr* root)
-        : _fn_contexts_ptr(nullptr), _root(root), _is_clone(false), _prepared(false), _opened(false), _closed(false) {}
+ExprContext::ExprContext(Expr* root) : _root(root) {}
 
 ExprContext::~ExprContext() {
-    // DCHECK(!_prepared || _closed) << ". expr context address = " << this;
-    if (_prepared) {
-        close(_runtime_state);
-    }
+    // nothing to do
+    if (_runtime_state == nullptr) return;
+
+    close(_runtime_state);
     for (auto& _fn_context : _fn_contexts) {
         delete _fn_context;
     }
@@ -74,7 +83,11 @@ Status ExprContext::open(RuntimeState* state) {
     // original's fragment state and only need to have thread-local state initialized.
     FunctionContext::FunctionStateScope scope =
             _is_clone ? FunctionContext::THREAD_LOCAL : FunctionContext::FRAGMENT_LOCAL;
-    return _root->open(state, this, scope);
+    try {
+        return _root->open(state, this, scope);
+    } catch (std::runtime_error& e) {
+        return Status::RuntimeError(fmt::format("Expr evaluate meet error: {}", e.what()));
+    }
 }
 
 Status ExprContext::open(std::vector<ExprContext*> evals, RuntimeState* state) {
@@ -85,6 +98,9 @@ Status ExprContext::open(std::vector<ExprContext*> evals, RuntimeState* state) {
 }
 
 void ExprContext::close(RuntimeState* state) {
+    if (!_prepared) {
+        return;
+    }
     bool expected = false;
     if (!_closed.compare_exchange_strong(expected, true)) {
         return;
@@ -92,10 +108,6 @@ void ExprContext::close(RuntimeState* state) {
     FunctionContext::FunctionStateScope scope =
             _is_clone ? FunctionContext::THREAD_LOCAL : FunctionContext::FRAGMENT_LOCAL;
     _root->close(state, this, scope);
-
-    for (auto& _fn_context : _fn_contexts) {
-        _fn_context->impl()->close();
-    }
     // _pool can be nullptr if Prepare() was never called
     if (_pool != nullptr) {
         _pool->free_all();
@@ -103,64 +115,29 @@ void ExprContext::close(RuntimeState* state) {
     _pool.reset();
 }
 
-int ExprContext::register_func(RuntimeState* state, const starrocks_udf::FunctionContext::TypeDesc& return_type,
-                               const std::vector<starrocks_udf::FunctionContext::TypeDesc>& arg_types,
-                               int varargs_buffer_size) {
-    _fn_contexts.push_back(FunctionContextImpl::create_context(state, _pool.get(), return_type, arg_types,
-                                                               varargs_buffer_size, false));
-    _fn_contexts_ptr = &_fn_contexts[0];
+int ExprContext::register_func(RuntimeState* state, const FunctionContext::TypeDesc& return_type,
+                               const std::vector<FunctionContext::TypeDesc>& arg_types) {
+    _fn_contexts.push_back(FunctionContext::create_context(state, _pool.get(), return_type, arg_types));
     return _fn_contexts.size() - 1;
 }
 
-Status ExprContext::clone(RuntimeState* state, ExprContext** new_ctx) {
+Status ExprContext::clone(RuntimeState* state, ObjectPool* pool, ExprContext** new_ctx) {
     DCHECK(_prepared);
     DCHECK(_opened);
     DCHECK(*new_ctx == nullptr);
 
-    *new_ctx = state->obj_pool()->add(new ExprContext(_root));
+    *new_ctx = pool->add(new ExprContext(_root));
     (*new_ctx)->_pool = std::make_unique<MemPool>();
     for (auto& _fn_context : _fn_contexts) {
-        (*new_ctx)->_fn_contexts.push_back(_fn_context->impl()->clone((*new_ctx)->_pool.get()));
+        (*new_ctx)->_fn_contexts.push_back(_fn_context->clone((*new_ctx)->_pool.get()));
     }
-    (*new_ctx)->_fn_contexts_ptr = &((*new_ctx)->_fn_contexts[0]);
 
     (*new_ctx)->_is_clone = true;
     (*new_ctx)->_prepared = true;
     (*new_ctx)->_opened = true;
+    (*new_ctx)->_runtime_state = state;
 
     return _root->open(state, *new_ctx, FunctionContext::THREAD_LOCAL);
-}
-
-Status ExprContext::clone(RuntimeState* state, ExprContext** new_ctx, Expr* root) {
-    DCHECK(_prepared);
-    DCHECK(_opened);
-    DCHECK(*new_ctx == nullptr);
-
-    *new_ctx = state->obj_pool()->add(new ExprContext(root));
-    (*new_ctx)->_pool = std::make_unique<MemPool>();
-    for (auto& _fn_context : _fn_contexts) {
-        (*new_ctx)->_fn_contexts.push_back(_fn_context->impl()->clone((*new_ctx)->_pool.get()));
-    }
-    (*new_ctx)->_fn_contexts_ptr = &((*new_ctx)->_fn_contexts[0]);
-
-    (*new_ctx)->_is_clone = true;
-    (*new_ctx)->_prepared = true;
-    (*new_ctx)->_opened = true;
-
-    return root->open(state, *new_ctx, FunctionContext::THREAD_LOCAL);
-}
-
-Status ExprContext::get_error(int start_idx, int end_idx) const {
-    DCHECK(_opened);
-    end_idx = end_idx == -1 ? _fn_contexts.size() : end_idx;
-    DCHECK_GE(start_idx, 0);
-    DCHECK_LE(end_idx, _fn_contexts.size());
-    for (int idx = start_idx; idx < end_idx; ++idx) {
-        DCHECK_LT(idx, _fn_contexts.size());
-        FunctionContext* fn_ctx = _fn_contexts[idx];
-        if (fn_ctx->has_error()) return Status::InternalError(fn_ctx->error_msg());
-    }
-    return Status::OK();
 }
 
 Status ExprContext::get_udf_error() {
@@ -177,17 +154,28 @@ Status ExprContext::get_udf_error() {
 std::string ExprContext::get_error_msg() const {
     for (auto fn_ctx : _fn_contexts) {
         if (fn_ctx->has_error()) {
-            return std::string(fn_ctx->error_msg());
+            return {fn_ctx->error_msg()};
         }
     }
     return "";
 }
 
-StatusOr<ColumnPtr> ExprContext::evaluate(vectorized::Chunk* chunk) {
-    return evaluate(_root, chunk);
+StatusOr<ColumnPtr> ExprContext::evaluate(Chunk* chunk, uint8_t* filter) {
+    return evaluate(_root, chunk, filter);
 }
 
-StatusOr<ColumnPtr> ExprContext::evaluate(Expr* e, vectorized::Chunk* chunk) {
+StatusOr<ColumnPtr> ExprContext::evaluate(Expr* e, Chunk* chunk, uint8_t* filter) {
+    DCHECK(_prepared);
+    DCHECK(_opened);
+    DCHECK(!_closed);
+    ChunkPtr dummy_chunk;
+    // this may happen if expr is constant, which means it doesn't need any input chunk
+    // but some expr can not handle situation that input chunk is nullptr or empty correctly
+    // so we create chunk with one column and one raw
+    if (chunk == nullptr) {
+        dummy_chunk = ChunkHelper::createDummyChunk();
+        chunk = dummy_chunk.get();
+    }
 #ifndef NDEBUG
     if (chunk != nullptr) {
         chunk->check_or_die();
@@ -195,15 +183,56 @@ StatusOr<ColumnPtr> ExprContext::evaluate(Expr* e, vectorized::Chunk* chunk) {
     }
 #endif
     try {
-        auto ptr = e->evaluate(this, chunk);
+        ColumnPtr ptr = nullptr;
+        if (filter == nullptr) {
+            ASSIGN_OR_RETURN(ptr, e->evaluate_checked(this, chunk));
+        } else {
+            ASSIGN_OR_RETURN(ptr, e->evaluate_with_filter(this, chunk, filter));
+        }
         DCHECK(ptr != nullptr);
-        if (chunk != nullptr && 0 != chunk->num_columns() && ptr->is_constant()) {
+        if (chunk != nullptr && 0 != chunk->num_columns() && ptr->is_constant() && (dummy_chunk.get() == nullptr)) {
             ptr->resize(chunk->num_rows());
         }
         return ptr;
     } catch (std::runtime_error& e) {
         return Status::RuntimeError(fmt::format("Expr evaluate meet error: {}", e.what()));
     }
+}
+
+bool ExprContext::ngram_bloom_filter(const BloomFilter* bf, const NgramBloomFilterReaderOptions& reader_options) {
+    return _root->ngram_bloom_filter(this, bf, reader_options);
+}
+
+bool ExprContext::support_ngram_bloom_filter() {
+    return _root->support_ngram_bloom_filter(this);
+}
+
+bool ExprContext::is_index_only_filter() const {
+    return _root->is_index_only_filter();
+}
+
+bool ExprContext::error_if_overflow() const {
+    return _runtime_state != nullptr && _runtime_state->error_if_overflow();
+}
+
+Status ExprContext::rewrite_jit_expr(ObjectPool* pool) {
+    if (_runtime_state == nullptr || !_runtime_state->is_jit_enabled()) {
+        return Status::OK();
+    }
+#ifdef STARROCKS_JIT_ENABLE
+    bool replaced = false;
+    auto st = _root->replace_compilable_exprs(&_root, pool, _runtime_state, replaced);
+    if (!st.ok()) {
+        LOG(WARNING) << "Can't replace compilable exprs.\n" << st.message() << "\n" << (root())->debug_string();
+        // Fall back to the non-JIT path.
+        return Status::OK();
+    }
+    if (replaced) { // only prepare jit_expr
+        WARN_IF_ERROR(_root->prepare_jit_expr(_runtime_state, this), "prepare rewritten expr failed");
+    }
+#endif
+
+    return Status::OK();
 }
 
 } // namespace starrocks

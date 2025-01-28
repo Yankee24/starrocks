@@ -1,22 +1,38 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "exec/pipeline/hashjoin/hash_join_probe_operator.h"
 
-namespace starrocks {
-namespace pipeline {
+#include "exec/hash_joiner.h"
+#include "exec/pipeline/hashjoin/hash_joiner_factory.h"
+#include "runtime/current_thread.h"
+
+namespace starrocks::pipeline {
 
 HashJoinProbeOperator::HashJoinProbeOperator(OperatorFactory* factory, int32_t id, const string& name,
                                              int32_t plan_node_id, int32_t driver_sequence, HashJoinerPtr join_prober,
                                              HashJoinerPtr join_builder)
-        : OperatorWithDependency(factory, id, name, plan_node_id, driver_sequence),
+        : OperatorWithDependency(factory, id, name, plan_node_id, false, driver_sequence),
           _join_prober(std::move(join_prober)),
           _join_builder(std::move(join_builder)) {}
 
 void HashJoinProbeOperator::close(RuntimeState* state) {
-    _join_prober->unref(state);
-    if (_join_builder != _join_prober) {
-        _join_builder->unref(state);
+    if (_join_prober != _join_builder) {
+        _join_prober->unref(state);
     }
+
+    _join_builder->decr_prober(state);
 
     OperatorWithDependency::close(state);
 }
@@ -24,12 +40,14 @@ void HashJoinProbeOperator::close(RuntimeState* state) {
 Status HashJoinProbeOperator::prepare(RuntimeState* state) {
     RETURN_IF_ERROR(OperatorWithDependency::prepare(state));
 
+    _join_builder->incr_prober();
+
     if (_join_builder != _join_prober) {
-        _join_builder->ref();
+        _join_prober->ref();
     }
-    _join_prober->ref();
 
     RETURN_IF_ERROR(_join_prober->prepare_prober(state, _unique_metrics.get()));
+    _join_builder->attach_probe_observer(state, observer());
 
     return Status::OK();
 }
@@ -39,24 +57,40 @@ bool HashJoinProbeOperator::has_output() const {
 }
 
 bool HashJoinProbeOperator::need_input() const {
-    return _join_prober->need_input();
+    if (_join_prober->need_input()) {
+        return true;
+    }
+
+    if (is_ready()) {
+        // If hasn't referenced hash table, return true to reference hash table in push_chunk.
+        return !_join_prober->has_referenced_hash_table();
+    }
+    return false;
 }
 
 bool HashJoinProbeOperator::is_finished() const {
-    return _join_prober->is_done();
+    return _join_prober->is_done() || _join_builder->is_done();
 }
 
-Status HashJoinProbeOperator::push_chunk(RuntimeState* state, const vectorized::ChunkPtr& chunk) {
-    _join_prober->push_chunk(state, std::move(const_cast<vectorized::ChunkPtr&>(chunk)));
+bool HashJoinProbeOperator::is_ready() const {
+    return _join_builder->is_build_done();
+}
+
+Status HashJoinProbeOperator::push_chunk(RuntimeState* state, const ChunkPtr& chunk) {
+    RETURN_IF_ERROR(_reference_builder_hash_table_once());
+    RETURN_IF_ERROR(_join_prober->push_chunk(state, std::move(const_cast<ChunkPtr&>(chunk))));
     return Status::OK();
 }
 
-StatusOr<vectorized::ChunkPtr> HashJoinProbeOperator::pull_chunk(RuntimeState* state) {
+StatusOr<ChunkPtr> HashJoinProbeOperator::pull_chunk(RuntimeState* state) {
+    RETURN_IF_ERROR(_reference_builder_hash_table_once());
     return _join_prober->pull_chunk(state);
 }
 
 Status HashJoinProbeOperator::set_finishing(RuntimeState* state) {
-    _is_finished = true;
+    // TODO: notify one will be ok
+    auto notify = _join_builder->defer_notify_build();
+    RETURN_IF_ERROR(_join_prober->probe_input_finished(state));
     _join_prober->enter_post_probe_phase();
     return Status::OK();
 }
@@ -67,8 +101,44 @@ Status HashJoinProbeOperator::set_finished(RuntimeState* state) {
     return Status::OK();
 }
 
-bool HashJoinProbeOperator::is_ready() const {
-    return _join_prober->is_build_done();
+Status HashJoinProbeOperator::_reference_builder_hash_table_once() {
+    if (!is_ready()) {
+        return Status::OK();
+    }
+
+    if (_join_prober->has_referenced_hash_table()) {
+        return Status::OK();
+    }
+
+    TRY_CATCH_ALLOC_SCOPE_START()
+    _join_prober->reference_hash_table(_join_builder.get());
+    TRY_CATCH_ALLOC_SCOPE_END()
+    return Status::OK();
+}
+
+Status HashJoinProbeOperator::reset_state(RuntimeState* state, const vector<ChunkPtr>& refill_chunks) {
+    RETURN_IF_ERROR(_reference_builder_hash_table_once());
+    // Reset probe state only when it has valid state after referencing the build hash table.
+    if (_join_prober->has_referenced_hash_table()) {
+        RETURN_IF_ERROR(_join_prober->reset_probe(state));
+    }
+    return Status::OK();
+}
+
+void HashJoinProbeOperator::update_exec_stats(RuntimeState* state) {
+    auto ctx = state->query_ctx();
+    if (ctx != nullptr) {
+        ctx->update_pull_rows_stats(_plan_node_id, _pull_row_num_counter->value());
+        if (_conjuncts_input_counter != nullptr && _conjuncts_output_counter != nullptr) {
+            ctx->update_pred_filter_stats(_plan_node_id,
+                                          _conjuncts_input_counter->value() - _conjuncts_output_counter->value());
+        }
+        if (_bloom_filter_eval_context.join_runtime_filter_input_counter != nullptr) {
+            int64_t input_rows = _bloom_filter_eval_context.join_runtime_filter_input_counter->value();
+            int64_t output_rows = _bloom_filter_eval_context.join_runtime_filter_output_counter->value();
+            ctx->update_rf_filter_stats(_plan_node_id, input_rows - output_rows);
+        }
+    }
 }
 
 HashJoinProbeOperatorFactory::HashJoinProbeOperatorFactory(int32_t id, int32_t plan_node_id,
@@ -82,11 +152,10 @@ void HashJoinProbeOperatorFactory::close(RuntimeState* state) {
     OperatorFactory::close(state);
 }
 
-OperatorPtr HashJoinProbeOperatorFactory::create(int32_t degree_of_parallelism, int32_t driver_sequence) {
+OperatorPtr HashJoinProbeOperatorFactory::create(int32_t dop, int32_t driver_sequence) {
     return std::make_shared<HashJoinProbeOperator>(this, _id, _name, _plan_node_id, driver_sequence,
-                                                   _hash_joiner_factory->create_prober(driver_sequence),
-                                                   _hash_joiner_factory->create_builder(driver_sequence));
+                                                   _hash_joiner_factory->create_prober(dop, driver_sequence),
+                                                   _hash_joiner_factory->get_builder(dop, driver_sequence));
 }
 
-} // namespace pipeline
-} // namespace starrocks
+} // namespace starrocks::pipeline

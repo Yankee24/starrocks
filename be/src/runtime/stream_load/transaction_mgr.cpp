@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "runtime/stream_load/transaction_mgr.h"
 
@@ -41,6 +53,7 @@
 #include "util/defer_op.h"
 #include "util/json_util.h"
 #include "util/metrics.h"
+#include "util/misc.h"
 #include "util/starrocks_metrics.h"
 #include "util/string_parser.hpp"
 #include "util/thrift_rpc_helper.h"
@@ -76,7 +89,7 @@ TransactionMgr::TransactionMgr(ExecEnv* exec_env) : _exec_env(exec_env) {
 
         while (!_is_stopped.load()) {
             _clean_stream_context();
-            sleep(interval);
+            nap_sleep(interval, [this] { return _is_stopped.load(); });
         }
     });
     Thread::set_thread_name(_transaction_clean_thread, "transaction_clean");
@@ -98,11 +111,11 @@ std::string TransactionMgr::_build_reply(const std::string& label, const std::st
 }
 
 Status TransactionMgr::list_transactions(const HttpRequest* req, std::string* resp) {
-    auto ids = std::move(_exec_env->stream_context_mgr()->get_ids());
+    auto ids = _exec_env->stream_context_mgr()->get_ids();
 
     rapidjson::StringBuffer s;
     rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(s);
-    for (auto id : ids) {
+    for (const auto& id : ids) {
         std::string txn_resp;
         auto ctx = _exec_env->stream_context_mgr()->get(id);
         if (ctx != nullptr) {
@@ -132,7 +145,7 @@ Status TransactionMgr::list_transactions(const HttpRequest* req, std::string* re
             writer.Int64(ctx->number_unselected_rows);
             writer.Key("LoadBytes");
             writer.Int64(ctx->receive_bytes);
-            writer.Key("StreamLoadPutTimeMs");
+            writer.Key("StreamLoadPlanTimeMs");
             writer.Int64(ctx->stream_load_put_cost_nanos / 1000000);
             writer.Key("ReceivedDataTimeMs");
             writer.Int64(ctx->total_received_data_cost_nanos / 1000000);
@@ -142,6 +155,10 @@ Status TransactionMgr::list_transactions(const HttpRequest* req, std::string* re
             writer.Int64(ctx->begin_txn_ts);
             writer.Key("LastActiveTimestamp");
             writer.Int64(ctx->last_active_ts);
+            writer.Key("TransactionTimeoutSec");
+            writer.Int64(ctx->timeout_second);
+            writer.Key("IdleTransactionTimeoutSec");
+            writer.Int64(ctx->idle_timeout_sec);
 
             writer.EndObject();
 
@@ -167,9 +184,10 @@ Status TransactionMgr::begin_transaction(const HttpRequest* req, std::string* re
         if (!st.ok()) {
             ctx->status = st;
             if (ctx->need_rollback) {
-                _rollback_transaction(ctx);
+                (void)_rollback_transaction(ctx);
             }
         }
+        LOG(INFO) << "new transaction manage request. " << ctx->brief() << ", tbl=" << ctx->table << " op=begin";
         *resp = _build_reply(TXN_BEGIN, ctx);
         if (ctx->unref()) {
             delete ctx;
@@ -192,11 +210,19 @@ Status TransactionMgr::rollback_transaction(const HttpRequest* req, std::string*
     if (ctx == nullptr) {
         st = Status::TransactionNotExists(fmt::format("transaction with label {} not exists", label));
     } else {
+        LOG(INFO) << "new transaction manage request. " << ctx->brief() << ", tbl=" << ctx->table << " op=rollback";
         DeferOp defer([&] {
             if (ctx->unref()) {
                 delete ctx;
             }
         });
+        if (ctx->db != req->header(HTTP_DB_KEY)) {
+            st = Status::InvalidArgument(
+                    fmt::format("request db {} transaction db {} not match", req->header(HTTP_DB_KEY), ctx->db));
+            *resp = _build_reply(label, TXN_ROLLBACK, st);
+            return st;
+        }
+        ctx->status = Status::Aborted(fmt::format("transaction is aborted by user."));
         st = _rollback_transaction(ctx);
     }
     *resp = _build_reply(label, TXN_ROLLBACK, st);
@@ -212,21 +238,31 @@ Status TransactionMgr::commit_transaction(const HttpRequest* req, std::string* r
         *resp = _build_reply(label, TXN_COMMIT, st);
         return st;
     } else {
+        LOG(INFO) << "new transaction manage request. " << ctx->brief() << ", tbl=" << ctx->table
+                  << " op=" << req->param(HTTP_TXN_OP_KEY);
         DeferOp defer([&] {
             if (ctx->unref()) {
                 delete ctx;
             }
         });
+        if (ctx->db != req->header(HTTP_DB_KEY)) {
+            st = Status::InvalidArgument(
+                    fmt::format("request db {} transaction db {} not match", req->header(HTTP_DB_KEY), ctx->db));
+            *resp = _build_reply(label, TXN_COMMIT, st);
+            return st;
+        }
         if (!ctx->lock.try_lock()) {
             st = Status::TransactionInProcessing("Transaction in processing, please retry later");
             *resp = _build_reply(label, TXN_COMMIT, st);
             return st;
         }
-        st = _commit_transaction(ctx);
+
+        st = _commit_transaction(ctx, boost::iequals(TXN_PREPARE, req->param(HTTP_TXN_OP_KEY)));
         if (!st.ok()) {
+            LOG(ERROR) << "Fail to commit txn: " << st << " " << ctx->brief();
             ctx->status = st;
             if (ctx->need_rollback) {
-                _rollback_transaction(ctx);
+                (void)_rollback_transaction(ctx);
             }
         }
         *resp = _build_reply(TXN_COMMIT, ctx);
@@ -240,7 +276,8 @@ Status TransactionMgr::_begin_transaction(const HttpRequest* req, StreamLoadCont
     ctx->load_type = TLoadType::MANUAL_LOAD;
     ctx->load_src_type = TLoadSourceType::RAW;
 
-    ctx->db = req->param(HTTP_DB_KEY);
+    ctx->db = req->header(HTTP_DB_KEY);
+    ctx->table = req->header(HTTP_TABLE_KEY);
     ctx->label = req->header(HTTP_LABEL_KEY);
 
     if (!req->header(HTTP_TIMEOUT).empty()) {
@@ -270,10 +307,11 @@ Status TransactionMgr::_begin_transaction(const HttpRequest* req, StreamLoadCont
     }
 
     // 2. begin transaction
-    ctx->begin_txn_ts = MonotonicNanos();
+    ctx->begin_txn_ts = UnixSeconds();
+    int64_t begin_nanos = MonotonicNanos();
     ctx->last_active_ts = ctx->begin_txn_ts;
     RETURN_IF_ERROR(_exec_env->stream_load_executor()->begin_txn(ctx));
-    ctx->begin_txn_cost_nanos = MonotonicNanos() - ctx->begin_txn_ts;
+    ctx->begin_txn_cost_nanos = MonotonicNanos() - begin_nanos;
 
     // 4. put load stream context
     RETURN_IF_ERROR(_exec_env->stream_context_mgr()->put(ctx->label, ctx));
@@ -284,13 +322,18 @@ Status TransactionMgr::_begin_transaction(const HttpRequest* req, StreamLoadCont
     return Status::OK();
 }
 
-Status TransactionMgr::_commit_transaction(StreamLoadContext* ctx) {
+Status TransactionMgr::_commit_transaction(StreamLoadContext* ctx, bool prepare) {
     if (!ctx->status.ok()) {
-        return Status::Aborted(fmt::format("current transaction is aborted"));
+        return Status::Aborted(fmt::format("transaction is aborted"));
     }
 
     if (ctx->body_sink != nullptr) {
         // 1. finish stream pipe & wait it done
+        if (ctx->buffer != nullptr && ctx->buffer->pos > 0) {
+            ctx->buffer->flip();
+            RETURN_IF_ERROR(ctx->body_sink->append(std::move(ctx->buffer)));
+            ctx->buffer = nullptr;
+        }
         RETURN_IF_ERROR(ctx->body_sink->finish());
         RETURN_IF_ERROR(ctx->future.get());
     } else {
@@ -302,14 +345,18 @@ Status TransactionMgr::_commit_transaction(StreamLoadContext* ctx) {
 
     // 3. commit transaction
     int64_t commit_and_publish_start_time = MonotonicNanos();
-    RETURN_IF_ERROR(_exec_env->stream_load_executor()->commit_txn(ctx));
+    if (prepare) {
+        RETURN_IF_ERROR(_exec_env->stream_load_executor()->prepare_txn(ctx));
+    } else {
+        RETURN_IF_ERROR(_exec_env->stream_load_executor()->commit_txn(ctx));
+    }
     ctx->commit_and_publish_txn_cost_nanos = MonotonicNanos() - commit_and_publish_start_time;
 
     // 4. remove stream load context
     _exec_env->stream_context_mgr()->remove(ctx->label);
 
-    ctx->last_active_ts = MonotonicNanos();
-    ctx->load_cost_nanos = ctx->last_active_ts - ctx->start_nanos;
+    ctx->last_active_ts = UnixSeconds();
+    ctx->load_cost_nanos = MonotonicNanos() - ctx->start_nanos;
     transaction_streaming_load_duration_ms.increment(ctx->load_cost_nanos / 1000000);
     transaction_streaming_load_bytes.increment(ctx->receive_bytes);
     transaction_streaming_load_current_processing.increment(-1);
@@ -322,6 +369,9 @@ Status TransactionMgr::_rollback_transaction(StreamLoadContext* ctx) {
     LOG(INFO) << "Rollback transaction " << ctx->brief();
     // 1. cancel stream pipe
     if (ctx->body_sink != nullptr) {
+        if (ctx->status.ok()) {
+            ctx->status = Status::Aborted(fmt::format("transaction is aborted by system."));
+        }
         ctx->body_sink->cancel(ctx->status);
     }
 
@@ -341,16 +391,17 @@ Status TransactionMgr::_rollback_transaction(StreamLoadContext* ctx) {
 }
 
 void TransactionMgr::_clean_stream_context() {
-    auto ids = std::move(_exec_env->stream_context_mgr()->get_ids());
+    auto ids = _exec_env->stream_context_mgr()->get_ids();
 
-    for (auto id : ids) {
+    for (const auto& id : ids) {
         auto ctx = _exec_env->stream_context_mgr()->get(id);
         if (ctx != nullptr) {
-            int64_t now = MonotonicNanos();
+            int64_t now = UnixSeconds();
             // try lock fail means transaction in processing
             if (ctx->lock.try_lock()) {
                 // abort timeout transaction
-                if ((now - ctx->begin_txn_ts) / NANOS_PER_SEC > ctx->timeout_second && ctx->timeout_second > 0) {
+                if ((now - ctx->begin_txn_ts) > ctx->timeout_second && ctx->timeout_second > 0) {
+                    ctx->status = Status::Aborted(fmt::format("transaction is aborted by timeout."));
                     auto st = _rollback_transaction(ctx);
                     LOG(INFO) << "Abort transaction " << ctx->brief() << " since timeout " << ctx->timeout_second
                               << " begin ts " << ctx->begin_txn_ts << " status " << st;
@@ -358,12 +409,12 @@ void TransactionMgr::_clean_stream_context() {
 
                 if (ctx->body_sink != nullptr) {
                     if (!ctx->body_sink->exhausted()) {
-                        ctx->last_active_ts = MonotonicNanos();
+                        ctx->last_active_ts = UnixSeconds();
                     }
                 }
 
-                if ((now - ctx->last_active_ts) / NANOS_PER_SEC > ctx->idle_timeout_sec + interval &&
-                    ctx->idle_timeout_sec > 0) {
+                if ((now - ctx->last_active_ts) > ctx->idle_timeout_sec + interval && ctx->idle_timeout_sec > 0) {
+                    ctx->status = Status::Aborted(fmt::format("transaction is aborted by idle timeout."));
                     auto st = _rollback_transaction(ctx);
                     LOG(INFO) << "Abort transaction " << ctx->brief() << " since idle timeout "
                               << ctx->idle_timeout_sec + interval << " last active ts " << ctx->last_active_ts

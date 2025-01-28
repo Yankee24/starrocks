@@ -19,8 +19,10 @@ package com.starrocks.common;
 
 /**
  * Thrown for errors encountered during analysis of a SQL statement.
+ * Use SemanticException instead
  */
-public class AnalysisException extends UserException {
+@Deprecated
+public class AnalysisException extends StarRocksException {
     public AnalysisException(String msg, Throwable cause) {
         super(msg, cause);
     }

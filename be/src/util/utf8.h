@@ -1,13 +1,26 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
+#include <cstring>
 #include <vector>
 
+#include "simdutf.h"
 #include "util/slice.h"
 
 namespace starrocks {
-namespace vectorized {
 
 // SIZE: 256 * uint8_t
 static const uint8_t UTF8_BYTE_LENGTH_TABLE[256] = {
@@ -56,6 +69,20 @@ static inline size_t get_utf8_small_index(const Slice& str, uint8_t* small_index
     return n;
 }
 
+static inline Slice truncate_utf8(const Slice& str, const size_t max_size) {
+    std::vector<size_t> index{};
+    const size_t utf8_length = get_utf8_index(str, &index);
+    size_t actual_size = 0;
+    if (utf8_length > max_size) {
+        // do truncate
+        actual_size = index[max_size];
+    } else {
+        // don't need to truncate
+        actual_size = str.size;
+    }
+    return {str.data, actual_size};
+}
+
 // table-driven is faster than computing as follow:
 /*
  *      uint8_t b = ~static_cast<uint8_t>(*p);
@@ -92,54 +119,35 @@ static inline const char* skip_trailing_utf8(const char* p, const char* begin, s
     return p;
 }
 
-// utf8_length
-// this SIMD optimization bases upon the brilliant implementation of ClickHouse
-// (https://github.com/ClickHouse/ClickHouse/blob/master/src/Common/UTF8Helpers.cpp)
-// utf8-encoding:
-// - 1-byte: 0xxx_xxxx;
-// - 2-byte: 110x_xxxx 10xx_xxxx;
-// - 3-byte: 1110_xxxx 10xx_xxxx 10xx_xxxx 10xx_xxxx;
-// - 4-byte: 1111_0xxx 10xx_xxxx 10xx_xxxx 10xx_xxxx 10xx_xxxx.
-// Counting utf8 chars in a byte string is equivalent to counting first byte of utf chars, that
-// is to say, counting bytes which do not match 10xx_xxxx pattern.
-// All 0xxx_xxxx, 110x_xxxx, 1110_xxxx and 1111_0xxx are greater than 1011_1111 when use int8_t arithmetic,
-// so just count bytes greater than 1011_1111 in a byte string as the result of utf8_length.
-static int utf8_len(const char* begin, const char* end) {
-    int len = 0;
-    const char* p = begin;
-#if defined(__AVX2__)
-    size_t str_size = end - begin;
-    constexpr auto bytes_avx2 = sizeof(__m256i);
-    // Bytes processed by SIMD operations must be mutiples of bytes_avx2, so:
-    // src_end_avx2 = p + str_size / bytes_avx2 * bytes_avx2;
-    //
-    // use bitwise operations to speed up alignment evaluation when bytes_avx2
-    // is power of 2.
-    //
-    // _mm256_loadu_si256 need not to load bytes from addresses aligning at bytes_avx2
-    // boundary.
-    const auto src_end_avx2 = p + (str_size & ~(bytes_avx2 - 1));
-    const auto threshold = _mm256_set1_epi8(0xBF);
-    for (; p < src_end_avx2; p += bytes_avx2)
-        len += __builtin_popcount(_mm256_movemask_epi8(
-                _mm256_cmpgt_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)), threshold)));
-#elif defined(__SSE2__)
-    size_t str_size = end - begin;
-    constexpr auto bytes_sse2 = sizeof(__m128i);
-    const auto src_end_sse2 = p + (str_size & ~(bytes_sse2 - 1));
-    const auto threshold = _mm_set1_epi8(0xBF);
-    for (; p < src_end_sse2; p += bytes_sse2) {
-        len += __builtin_popcount(
-                _mm_movemask_epi8(_mm_cmpgt_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)), threshold)));
-    }
-#endif
-    // process remaining bytes the number of which not exceed bytes_avx2 at the
-    // tail of string, one by one.
-    for (; p < end; ++p) {
-        len += static_cast<int8_t>(*p) > static_cast<int8_t>(0xBF);
-    }
-    return len;
+static inline int utf8_len(const char* begin, const char* end) {
+    return simdutf::count_utf8(begin, end - begin);
 }
 
-} // namespace vectorized
+// Check if the string contains a utf-8 character
+static inline bool utf8_contains(const std::string& str, const std::vector<size_t>& utf8_index, Slice utf8_char) {
+    for (int i = 0; i < utf8_index.size(); i++) {
+        size_t char_idx = utf8_index[i];
+        // TODO: optimize the utf8-index, add a length guard at the tail
+        size_t char_len = i < utf8_index.size() - 1 ? utf8_index[i + 1] - char_idx : str.length() - char_idx;
+        if (memcmp(str.data() + char_idx, utf8_char.data, char_len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Find the start of utf8 character
+// NOTE: it must be a valid utf-8 string
+static inline Slice utf8_char_start(const char* end) {
+    const char* p = end;
+    size_t count = 1;
+    for (; (*p & 0xC0) == 0x80; p--, count++) {
+    }
+    return {p, count};
+}
+
+static inline bool validate_ascii_fast(const char* src, size_t len) {
+    return simdutf::validate_ascii(src, len);
+}
+
 } // namespace starrocks

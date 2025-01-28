@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include <gtest/gtest.h>
 
@@ -7,7 +19,7 @@
 #include "formats/csv/output_stream_string.h"
 #include "runtime/types.h"
 
-namespace starrocks::vectorized::csv {
+namespace starrocks::csv {
 
 class NullableConverterTest : public ::testing::Test {
 public:
@@ -86,7 +98,7 @@ TEST_F(NullableConverterTest, test_read_string_invalid_value_as_error) {
 }
 
 // NOLINTNEXTLINE
-TEST_F(NullableConverterTest, test_write_string) {
+TEST_F(NullableConverterTest, test_write_string_nullable_column) {
     auto conv = csv::get_converter(_type, true);
     auto col = ColumnHelper::create_column(_type, true);
     col->append_datum(Datum()); // null
@@ -101,4 +113,20 @@ TEST_F(NullableConverterTest, test_write_string) {
     ASSERT_EQ("\\N10null10", buff.as_string());
 }
 
-} // namespace starrocks::vectorized::csv
+// NOLINTNEXTLINE
+TEST_F(NullableConverterTest, test_write_string_not_nullable_column) {
+    auto conv = csv::get_converter(_type, true);
+    auto col = ColumnHelper::create_column(_type, false);
+    col->append_datum((int32_t)1);
+    col->append_datum((int32_t)10);
+
+    csv::OutputStreamString buff;
+    ASSERT_TRUE(conv->write_string(&buff, *col, 0, Converter::Options()).ok());
+    ASSERT_TRUE(conv->write_string(&buff, *col, 1, Converter::Options()).ok());
+    ASSERT_TRUE(conv->write_quoted_string(&buff, *col, 0, Converter::Options()).ok());
+    ASSERT_TRUE(conv->write_quoted_string(&buff, *col, 1, Converter::Options()).ok());
+    ASSERT_TRUE(buff.finalize().ok());
+    ASSERT_EQ("110110", buff.as_string());
+}
+
+} // namespace starrocks::csv

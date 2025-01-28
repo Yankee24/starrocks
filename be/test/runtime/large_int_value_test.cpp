@@ -15,28 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "runtime/large_int_value.h"
+#include "types/large_int_value.h"
 
 #include <gtest/gtest.h>
 
-#include <boost/lexical_cast.hpp>
-#include <iostream>
-#include <sstream>
 #include <string>
 
 #include "common/configbase.h"
-#include "common/logging.h"
 #include "types/constexpr.h"
 
 namespace starrocks {
 
 class LargeIntValueTest : public testing::Test {
 public:
-    LargeIntValueTest() {}
+    LargeIntValueTest() = default;
 
 protected:
-    virtual void SetUp() {}
-    virtual void TearDown() {}
+    void SetUp() override {}
+    void TearDown() override {}
 };
 
 TEST_F(LargeIntValueTest, string_to_largeint) {

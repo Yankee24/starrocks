@@ -1,8 +1,21 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include <gtest/gtest.h>
 
 #include "common/logging.h"
+#include "fs/encrypt_file.h"
 #include "io/array_input_stream.h"
 #include "testutil/assert.h"
 #include "testutil/parallel_test.h"
@@ -12,7 +25,7 @@ namespace starrocks::io {
 class TestInputStream : public io::SeekableInputStream {
 public:
     explicit TestInputStream(std::string contents, int64_t block_size)
-            : _contents(std::move(contents)), _block_size(block_size), _offset(0) {}
+            : _contents(std::move(contents)), _block_size(block_size) {}
 
     StatusOr<int64_t> read(void* data, int64_t count) override {
         count = std::min(count, _block_size);
@@ -34,7 +47,7 @@ public:
 private:
     std::string _contents;
     int64_t _block_size;
-    int64_t _offset;
+    int64_t _offset{0};
 };
 
 // NOLINTNEXTLINE
@@ -87,6 +100,23 @@ PARALLEL_TEST(SeekableInputStreamTest, test_read_at_fully) {
     ASSERT_EQ(10, *in.position());
 
     ASSERT_ERROR(in.read_at_fully(1, buff, 10));
+}
+
+// NOLINTNEXTLINE
+PARALLEL_TEST(SeekableInputStreamTest, test_encrypted) {
+    TestInputStream in("0123456789", 5);
+    char buff[10];
+    ASSERT_OK(in.read_at_fully(1, buff, 9));
+    ASSERT_EQ(10, *in.position());
+
+    ASSERT_ERROR(in.read_at_fully(1, buff, 10));
+    ASSERT_FALSE(in.is_encrypted());
+    std::unique_ptr<SeekableInputStream> s =
+            std::make_unique<SeekableInputStreamWrapper>(&in, Ownership::kDontTakeOwnership);
+    ASSERT_FALSE(s->is_encrypted());
+
+    EncryptSeekableInputStream encrypted(std::move(s), {EncryptionAlgorithmPB::AES_128, "0000000000000000"});
+    ASSERT_TRUE(encrypted.is_encrypted());
 }
 
 } // namespace starrocks::io

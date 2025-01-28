@@ -47,7 +47,7 @@ private:
 
 class RleDecoderV1 : public RleDecoder {
 public:
-    RleDecoderV1(std::unique_ptr<SeekableInputStream> input, bool isSigned);
+    RleDecoderV1(std::unique_ptr<SeekableInputStream> input, bool isSigned, ReaderMetrics* metrics);
 
     /**
     * Seek to a particular spot.
@@ -72,6 +72,8 @@ private:
     inline uint64_t readLong();
 
     inline void skipLongs(uint64_t numValues);
+
+    inline void reset();
 
     const std::unique_ptr<SeekableInputStream> inputStream;
     const bool isSigned;

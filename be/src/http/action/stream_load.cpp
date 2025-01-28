@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/http/action/stream_load.cpp
 
@@ -29,9 +42,11 @@
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
 #include <event2/http.h>
+#include <fmt/format.h>
 #include <rapidjson/prettywriter.h>
 #include <thrift/protocol/TDebugProtocol.h>
 
+#include "agent/master_info.h"
 #include "common/logging.h"
 #include "common/utils.h"
 #include "gen_cpp/FrontendService.h"
@@ -43,6 +58,8 @@
 #include "http/http_request.h"
 #include "http/http_response.h"
 #include "http/utils.h"
+#include "runtime/batch_write/batch_write_mgr.h"
+#include "runtime/batch_write/batch_write_util.h"
 #include "runtime/client_cache.h"
 #include "runtime/current_thread.h"
 #include "runtime/exec_env.h"
@@ -110,7 +127,11 @@ static bool is_format_support_streaming(TFileFormatType::type format) {
     }
 }
 
-StreamLoadAction::StreamLoadAction(ExecEnv* exec_env) : _exec_env(exec_env) {
+static Status stream_load_put_internal(const TStreamLoadPutRequest& request, int32_t rpc_timeout_ms,
+                                       TStreamLoadPutResult* result);
+
+StreamLoadAction::StreamLoadAction(ExecEnv* exec_env, ConcurrentLimiter* limiter)
+        : _exec_env(exec_env), _http_concurrent_limiter(limiter) {
     StarRocksMetrics::instance()->metrics()->register_metric("streaming_load_requests_total",
                                                              &streaming_load_requests_total);
     StarRocksMetrics::instance()->metrics()->register_metric("streaming_load_bytes", &streaming_load_bytes);
@@ -121,25 +142,32 @@ StreamLoadAction::StreamLoadAction(ExecEnv* exec_env) : _exec_env(exec_env) {
 
 StreamLoadAction::~StreamLoadAction() = default;
 
+static void _send_reply(HttpRequest* req, const std::string& str) {
+    if (config::enable_stream_load_verbose_log) {
+        LOG(INFO) << "streaming load response: " << str;
+    }
+    HttpChannel::send_reply(req, str);
+}
+
 void StreamLoadAction::handle(HttpRequest* req) {
-    StreamLoadContext* ctx = (StreamLoadContext*)req->handler_ctx();
+    auto* ctx = (StreamLoadContext*)req->handler_ctx();
     if (ctx == nullptr) {
         return;
     }
 
     // status already set to fail
     if (ctx->status.ok()) {
-        ctx->status = _handle(ctx);
-        if (!ctx->status.ok() && ctx->status.code() != TStatusCode::PUBLISH_TIMEOUT) {
-            LOG(WARNING) << "Fail to handle streaming load, id=" << ctx->id
-                         << " errmsg=" << ctx->status.get_error_msg();
+        ctx->status = ctx->enable_batch_write ? _handle_batch_write(req, ctx) : _handle(ctx);
+        if (!ctx->status.ok() && !ctx->status.is_publish_timeout()) {
+            LOG(WARNING) << "Fail to handle streaming load, id=" << ctx->id << " errmsg=" << ctx->status.message()
+                         << " " << ctx->brief();
         }
     }
     ctx->load_cost_nanos = MonotonicNanos() - ctx->start_nanos;
 
-    if (!ctx->status.ok() && ctx->status.code() != TStatusCode::PUBLISH_TIMEOUT) {
+    if (!ctx->status.ok() && !ctx->status.is_publish_timeout()) {
         if (ctx->need_rollback) {
-            _exec_env->stream_load_executor()->rollback_txn(ctx);
+            (void)_exec_env->stream_load_executor()->rollback_txn(ctx);
             ctx->need_rollback = false;
         }
         if (ctx->body_sink != nullptr) {
@@ -148,7 +176,7 @@ void StreamLoadAction::handle(HttpRequest* req) {
     }
 
     auto str = ctx->to_json();
-    HttpChannel::send_reply(req, str);
+    _send_reply(req, str);
 
     // update statstics
     streaming_load_requests_total.increment(1);
@@ -172,7 +200,7 @@ Status StreamLoadAction::_handle(StreamLoadContext* ctx) {
     } else {
         if (ctx->buffer != nullptr && ctx->buffer->pos > 0) {
             ctx->buffer->flip();
-            ctx->body_sink->append(std::move(ctx->buffer));
+            RETURN_IF_ERROR(ctx->body_sink->append(std::move(ctx->buffer)));
             ctx->buffer = nullptr;
         }
         RETURN_IF_ERROR(ctx->body_sink->finish());
@@ -185,14 +213,20 @@ Status StreamLoadAction::_handle(StreamLoadContext* ctx) {
     int64_t commit_and_publish_start_time = MonotonicNanos();
     RETURN_IF_ERROR(_exec_env->stream_load_executor()->commit_txn(ctx));
     ctx->commit_and_publish_txn_cost_nanos = MonotonicNanos() - commit_and_publish_start_time;
-
     return Status::OK();
+}
+
+Status StreamLoadAction::_handle_batch_write(starrocks::HttpRequest* http_req, StreamLoadContext* ctx) {
+    ctx->mc_read_data_cost_nanos = MonotonicNanos() - ctx->start_nanos;
+    ctx->load_parameters = get_load_parameters_from_http(http_req);
+    ctx->buffer->flip();
+    return _exec_env->batch_write_mgr()->append_data(ctx);
 }
 
 int StreamLoadAction::on_header(HttpRequest* req) {
     streaming_load_current_processing.increment(1);
 
-    StreamLoadContext* ctx = new StreamLoadContext(_exec_env);
+    auto* ctx = new StreamLoadContext(_exec_env);
     ctx->ref();
     req->set_handler_ctx(ctx);
 
@@ -206,20 +240,36 @@ int StreamLoadAction::on_header(HttpRequest* req) {
         ctx->label = generate_uuid_string();
     }
 
-    LOG(INFO) << "new income streaming load request." << ctx->brief() << ", db=" << ctx->db << ", tbl=" << ctx->table;
+    if (config::enable_http_stream_load_limit && !ctx->check_and_set_http_limiter(_http_concurrent_limiter)) {
+        LOG(WARNING) << "income streaming load request hit limit." << ctx->brief() << ", db=" << ctx->db
+                     << ", tbl=" << ctx->table;
+        ctx->status =
+                Status::ResourceBusy(fmt::format("Stream Load exceed http cuncurrent limit {}, please try again later",
+                                                 config::be_http_num_workers - 1));
+        auto str = ctx->to_json();
+        _send_reply(req, str);
+        return -1;
+    } else {
+        LOG(INFO) << "new income streaming load request." << ctx->brief() << ", db=" << ctx->db
+                  << ", tbl=" << ctx->table;
+    }
+
+    if (config::enable_stream_load_verbose_log) {
+        LOG(INFO) << "streaming load request: " << req->debug_string();
+    }
 
     auto st = _on_header(req, ctx);
     if (!st.ok()) {
         ctx->status = st;
         if (ctx->need_rollback) {
-            _exec_env->stream_load_executor()->rollback_txn(ctx);
+            (void)_exec_env->stream_load_executor()->rollback_txn(ctx);
             ctx->need_rollback = false;
         }
         if (ctx->body_sink != nullptr) {
             ctx->body_sink->cancel(st);
         }
         auto str = ctx->to_json();
-        HttpChannel::send_reply(req, str);
+        _send_reply(req, str);
         streaming_load_current_processing.increment(-1);
         return -1;
     }
@@ -232,23 +282,38 @@ Status StreamLoadAction::_on_header(HttpRequest* http_req, StreamLoadContext* ct
         LOG(WARNING) << "parse basic authorization failed." << ctx->brief();
         return Status::InternalError("no valid Basic authorization");
     }
+
+    if (!http_req->header(HTTP_ENABLE_MERGE_COMMIT).empty()) {
+        auto value = http_req->header(HTTP_ENABLE_MERGE_COMMIT);
+        StringParser::ParseResult parse_result = StringParser::PARSE_SUCCESS;
+        ctx->enable_batch_write = StringParser::string_to_bool(value.c_str(), value.length(), &parse_result);
+        if (UNLIKELY(parse_result != StringParser::PARSE_SUCCESS)) {
+            return Status::InvalidArgument(fmt::format("Invalid parameter {}. The value must be bool type, but is {}",
+                                                       HTTP_ENABLE_MERGE_COMMIT, value));
+        }
+    }
+
     // check content length
     ctx->body_bytes = 0;
     size_t max_body_bytes = config::streaming_load_max_mb * 1024 * 1024;
     if (!http_req->header(HttpHeaders::CONTENT_LENGTH).empty()) {
         ctx->body_bytes = std::stol(http_req->header(HttpHeaders::CONTENT_LENGTH));
         if (ctx->body_bytes > max_body_bytes) {
-            LOG(WARNING) << "body exceed max size." << ctx->brief();
-
             std::stringstream ss;
-            ss << "body exceed max size: " << max_body_bytes << ", limit: " << max_body_bytes;
+            ss << "body size " << ctx->body_bytes << " exceed limit: " << max_body_bytes << ", " << ctx->brief()
+               << ". You can increase the limit by setting streaming_load_max_mb in be.conf.";
+            LOG(WARNING) << ss.str();
             return Status::InternalError(ss.str());
         }
 
         if (ctx->format == TFileFormatType::FORMAT_JSON) {
             // Allocate buffer in advance, since the json payload cannot be parsed in stream mode.
             // For efficiency reasons, simdjson requires a string with a few bytes (simdjson::SIMDJSON_PADDING) at the end.
-            ctx->buffer = ByteBuffer::allocate(ctx->body_bytes + simdjson::SIMDJSON_PADDING);
+            ASSIGN_OR_RETURN(ctx->buffer,
+                             ByteBuffer::allocate_with_tracker(ctx->body_bytes + simdjson::SIMDJSON_PADDING));
+        } else if (ctx->enable_batch_write) {
+            // batch write does not support parsing data in stream mode
+            ASSIGN_OR_RETURN(ctx->buffer, ByteBuffer::allocate_with_tracker(ctx->body_bytes));
         }
     } else {
 #ifndef BE_TEST
@@ -291,17 +356,20 @@ Status StreamLoadAction::_on_header(HttpRequest* http_req, StreamLoadContext* ct
         ctx->timeout_second = timeout_second;
     }
 
+    if (ctx->enable_batch_write) {
+        return Status::OK();
+    }
+
     // begin transaction
     int64_t begin_txn_start_time = MonotonicNanos();
     RETURN_IF_ERROR(_exec_env->stream_load_executor()->begin_txn(ctx));
     ctx->begin_txn_cost_nanos = MonotonicNanos() - begin_txn_start_time;
-
     // process put file
     return _process_put(http_req, ctx);
 }
 
 void StreamLoadAction::on_chunk_data(HttpRequest* req) {
-    StreamLoadContext* ctx = (StreamLoadContext*)req->handler_ctx();
+    auto* ctx = (StreamLoadContext*)req->handler_ctx();
     if (ctx == nullptr || !ctx->status.ok()) {
         return;
     }
@@ -313,23 +381,27 @@ void StreamLoadAction::on_chunk_data(HttpRequest* req) {
 
     int64_t start_read_data_time = MonotonicNanos();
 
+    bool processInBatchMode = ctx->format == TFileFormatType::FORMAT_JSON || ctx->enable_batch_write;
     size_t len = 0;
     while ((len = evbuffer_get_length(evbuf)) > 0) {
         if (ctx->buffer == nullptr) {
             // Initialize buffer.
-            ctx->buffer = ByteBuffer::allocate(
-                    ctx->format == TFileFormatType::FORMAT_JSON ? std::max(len, ctx->kDefaultBufferSize) : len);
-
+            ASSIGN_OR_SET_STATUS_AND_RETURN_IF_ERROR(
+                    ctx->status, ctx->buffer,
+                    ByteBuffer::allocate_with_tracker(processInBatchMode ? std::max(len, ctx->kDefaultBufferSize)
+                                                                         : len));
         } else if (ctx->buffer->remaining() < len) {
-            if (ctx->format == TFileFormatType::FORMAT_JSON) {
-                // For json format, we need build a complete json before we push the buffer to the pipe.
+            if (processInBatchMode) {
+                // For json format or batch write, we need build a complete data before we push the buffer to the pipe.
                 // buffer capacity is not enough, so we try to expand the buffer.
-                ByteBufferPtr buf = ByteBuffer::allocate(BitUtil::RoundUpToPowerOfTwo(ctx->buffer->pos + len));
+                ASSIGN_OR_SET_STATUS_AND_RETURN_IF_ERROR(
+                        ctx->status, ByteBufferPtr buf,
+                        ByteBuffer::allocate_with_tracker(BitUtil::RoundUpToPowerOfTwo(ctx->buffer->pos + len)));
                 buf->put_bytes(ctx->buffer->ptr, ctx->buffer->pos);
                 std::swap(buf, ctx->buffer);
 
             } else {
-                // For non-json format, we could push buffer to the body_sink in streaming mode.
+                // Otherwise, we could push buffer to the body_sink in streaming mode.
                 // buffer capacity is not enough, so we push the buffer to the pipe and allocate new one.
                 ctx->buffer->flip();
                 auto st = ctx->body_sink->append(std::move(ctx->buffer));
@@ -339,7 +411,9 @@ void StreamLoadAction::on_chunk_data(HttpRequest* req) {
                     return;
                 }
 
-                ctx->buffer = ByteBuffer::allocate(std::max(len, ctx->kDefaultBufferSize));
+                ASSIGN_OR_SET_STATUS_AND_RETURN_IF_ERROR(
+                        ctx->status, ctx->buffer,
+                        ByteBuffer::allocate_with_tracker(std::max(len, ctx->kDefaultBufferSize)));
             }
         }
 
@@ -352,12 +426,13 @@ void StreamLoadAction::on_chunk_data(HttpRequest* req) {
         }
         ctx->buffer->pos += remove_bytes;
         ctx->receive_bytes += remove_bytes;
+        ctx->total_receive_bytes += remove_bytes;
     }
     ctx->total_received_data_cost_nanos += (MonotonicNanos() - start_read_data_time);
 }
 
 void StreamLoadAction::free_handler_ctx(void* param) {
-    StreamLoadContext* ctx = (StreamLoadContext*)param;
+    auto* ctx = (StreamLoadContext*)param;
     if (ctx == nullptr) {
         return;
     }
@@ -365,7 +440,11 @@ void StreamLoadAction::free_handler_ctx(void* param) {
     if (ctx->body_sink != nullptr) {
         ctx->body_sink->cancel(Status::Cancelled("Cancelled"));
     }
-    _exec_env->load_stream_mgr()->remove(ctx->id);
+
+    if (!ctx->enable_batch_write) {
+        _exec_env->load_stream_mgr()->remove(ctx->id);
+    }
+
     if (ctx->unref()) {
         delete ctx;
     }
@@ -382,6 +461,11 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
     request.tbl = ctx->table;
     request.txnId = ctx->txn_id;
     request.formatType = ctx->format;
+    auto backend_id = get_backend_id();
+    if (backend_id.has_value()) {
+        request.__set_backend_id(backend_id.value());
+    }
+
     request.__set_loadId(ctx->id.to_thrift());
     if (ctx->use_streaming) {
         auto pipe =
@@ -408,6 +492,32 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
     }
     if (!http_req->header(HTTP_ROW_DELIMITER).empty()) {
         request.__set_rowDelimiter(http_req->header(HTTP_ROW_DELIMITER));
+    }
+    if (!http_req->header(HTTP_SKIP_HEADER).empty()) {
+        try {
+            auto skip_header = std::stoll(http_req->header(HTTP_SKIP_HEADER));
+            if (skip_header < 0) {
+                return Status::InvalidArgument("skip_header must be equal or greater than 0");
+            }
+            request.__set_skipHeader(skip_header);
+        } catch (const std::invalid_argument& e) {
+            return Status::InvalidArgument("Invalid csv load skip_header format");
+        }
+    }
+    if (!http_req->header(HTTP_TRIM_SPACE).empty()) {
+        if (boost::iequals(http_req->header(HTTP_TRIM_SPACE), "false")) {
+            request.__set_trimSpace(false);
+        } else if (boost::iequals(http_req->header(HTTP_TRIM_SPACE), "true")) {
+            request.__set_trimSpace(true);
+        } else {
+            return Status::InvalidArgument("Invalid trim space format. Must be bool type");
+        }
+    }
+    if (!http_req->header(HTTP_ENCLOSE).empty() && http_req->header(HTTP_ENCLOSE).size() > 0) {
+        request.__set_enclose(http_req->header(HTTP_ENCLOSE)[0]);
+    }
+    if (!http_req->header(HTTP_ESCAPE).empty() && http_req->header(HTTP_ESCAPE).size() > 0) {
+        request.__set_escape(http_req->header(HTTP_ESCAPE)[0]);
     }
     if (!http_req->header(HTTP_PARTITIONS).empty()) {
         request.__set_partitions(http_req->header(HTTP_PARTITIONS));
@@ -475,6 +585,18 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
             return Status::InvalidArgument("Invalid partial update flag format. Must be bool type");
         }
     }
+    if (!http_req->header(HTTP_MERGE_CONDITION).empty()) {
+        request.__set_merge_condition(http_req->header(HTTP_MERGE_CONDITION));
+    }
+    if (!http_req->header(HTTP_PARTIAL_UPDATE_MODE).empty()) {
+        if (http_req->header(HTTP_PARTIAL_UPDATE_MODE) == "row") {
+            request.__set_partial_update_mode(TPartialUpdateMode::type::ROW_MODE);
+        } else if (http_req->header(HTTP_PARTIAL_UPDATE_MODE) == "auto") {
+            request.__set_partial_update_mode(TPartialUpdateMode::type::AUTO_MODE);
+        } else if (http_req->header(HTTP_PARTIAL_UPDATE_MODE) == "column") {
+            request.__set_partial_update_mode(TPartialUpdateMode::type::COLUMN_UPSERT_MODE);
+        }
+    }
     if (!http_req->header(HTTP_TRANSMISSION_COMPRESSION_TYPE).empty()) {
         request.__set_transmission_compression_type(http_req->header(HTTP_TRANSMISSION_COMPRESSION_TYPE));
     }
@@ -486,28 +608,50 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
             return Status::InvalidArgument("Invalid load_dop format");
         }
     }
+    if (!http_req->header(HTTP_LOG_REJECTED_RECORD_NUM).empty()) {
+        try {
+            auto log_rejected_record_num = std::stoll(http_req->header(HTTP_LOG_REJECTED_RECORD_NUM));
+            if (log_rejected_record_num < -1) {
+                return Status::InvalidArgument("log_rejected_record_num must be equal or greater than -1");
+            }
+            request.__set_log_rejected_record_num(log_rejected_record_num);
+        } catch (const std::invalid_argument& e) {
+            return Status::InvalidArgument("Invalid log_rejected_record_num format");
+        }
+    }
+    int32_t rpc_timeout_ms = config::txn_commit_rpc_timeout_ms;
     if (ctx->timeout_second != -1) {
         request.__set_timeout(ctx->timeout_second);
+        rpc_timeout_ms = std::min(ctx->timeout_second * 1000 / 2, rpc_timeout_ms);
+        rpc_timeout_ms = std::max(ctx->timeout_second * 1000 / 4, rpc_timeout_ms);
     }
-    request.__set_thrift_rpc_timeout_ms(config::thrift_rpc_timeout_ms);
-    // plan this load
-    TNetworkAddress master_addr = _exec_env->master_info()->network_address;
-#ifndef BE_TEST
+    request.__set_thrift_rpc_timeout_ms(rpc_timeout_ms);
     if (!http_req->header(HTTP_MAX_FILTER_RATIO).empty()) {
         ctx->max_filter_ratio = strtod(http_req->header(HTTP_MAX_FILTER_RATIO).c_str(), nullptr);
     }
 
+    if (!http_req->header(HttpHeaders::CONTENT_ENCODING).empty() && !http_req->header(HTTP_COMPRESSION).empty()) {
+        return Status::InvalidArgument("Only one of http header content-encoding and compression can be set");
+    }
+
+    if (!http_req->header(HttpHeaders::CONTENT_ENCODING).empty()) {
+        request.__set_payload_compression_type(http_req->header(HttpHeaders::CONTENT_ENCODING));
+    } else if (!http_req->header(HTTP_COMPRESSION).empty()) {
+        request.__set_payload_compression_type(http_req->header(HTTP_COMPRESSION));
+    }
+
+    // plan this load
     int64_t stream_load_put_start_time = MonotonicNanos();
-    RETURN_IF_ERROR(ThriftRpcHelper::rpc<FrontendServiceClient>(
-            master_addr.hostname, master_addr.port,
-            [&request, ctx](FrontendServiceConnection& client) { client->streamLoadPut(ctx->put_result, request); }));
-    ctx->stream_load_put_cost_nanos = MonotonicNanos() - stream_load_put_start_time;
-#else
-    ctx->put_result = k_stream_load_put_result;
-#endif
+    RETURN_IF_ERROR(stream_load_put_internal(request, rpc_timeout_ms, &ctx->put_result));
     Status plan_status(ctx->put_result.status);
+    if (plan_status.is_time_out()) {
+        LOG(WARNING) << "plan streaming load failed, will retry. errmsg=" << plan_status.message() << ctx->brief();
+        RETURN_IF_ERROR(stream_load_put_internal(request, rpc_timeout_ms, &ctx->put_result));
+        plan_status = Status(ctx->put_result.status);
+    }
+    ctx->stream_load_put_cost_nanos = MonotonicNanos() - stream_load_put_start_time;
     if (!plan_status.ok()) {
-        LOG(WARNING) << "plan streaming load failed. errmsg=" << plan_status.get_error_msg() << ctx->brief();
+        LOG(WARNING) << "plan streaming load failed. errmsg=" << plan_status.message() << ctx->brief();
         return plan_status;
     }
     VLOG(3) << "params is " << apache::thrift::ThriftDebugString(ctx->put_result.params);
@@ -524,8 +668,21 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
         }
         ctx->put_result.params.query_options.mem_limit = exec_mem_limit;
     }
-
     return _exec_env->stream_load_executor()->execute_plan_fragment(ctx);
+}
+
+Status stream_load_put_internal(const TStreamLoadPutRequest& request, int32_t rpc_timeout_ms,
+                                TStreamLoadPutResult* result) {
+    TNetworkAddress master_addr = get_master_address();
+#ifndef BE_TEST
+    RETURN_IF_ERROR(ThriftRpcHelper::rpc<FrontendServiceClient>(
+            master_addr.hostname, master_addr.port,
+            [&request, &result](FrontendServiceConnection& client) { client->streamLoadPut(*result, request); },
+            rpc_timeout_ms));
+#else
+    *result = k_stream_load_put_result;
+#endif
+    return Status::OK();
 }
 
 Status StreamLoadAction::_data_saved_path(HttpRequest* req, std::string* file_path) {

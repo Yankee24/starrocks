@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.analyzer;
 
 import com.starrocks.sql.ast.JoinRelation;
@@ -55,7 +68,8 @@ public class AnalyzeJoinTest {
         analyzeSuccess("select sum(v1) from t0 left semi join t1 on v1 = v4 and v2 = v5 group by v2,v3");
 
         QueryRelation query = ((QueryStatement) analyzeSuccess(
-                "select * from (select sum(v1) as v, sum(v2) from t0) a left semi join (select v1,v2 from t0 order by v3) b on a.v = b.v2")).getQueryRelation();
+                "select * from (select sum(v1) as v, sum(v2) from t0) a " +
+                        "left semi join (select v1,v2 from t0 order by v3) b on a.v = b.v2")).getQueryRelation();
         Assert.assertEquals("v,sum(v2)", String.join(",", query.getColumnOutputNames()));
     }
 
@@ -74,7 +88,9 @@ public class AnalyzeJoinTest {
         analyzeSuccess("select * from tnotnull inner join (select * from t0) t using (v1)");
 
         analyzeSuccess("select * from (t0 join tnotnull using(v1)) , t1");
-        analyzeFail("select * from (t0 join tnotnull using(v1)) t , t1", "Syntax error");
+        analyzeFail("select * from (t0 join tnotnull using(v1)) t , t1",
+                "Getting syntax error at line 1, column 43. Detail message: Unexpected input 't', " +
+                        "the most similar input is {<EOF>, ';'}.");
         analyzeFail("select v1 from (t0 join tnotnull using(v1)), t1", "Column 'v1' is ambiguous");
         analyzeSuccess("select a.v1 from (t0 a join tnotnull b using(v1)), t1");
     }
@@ -120,12 +136,18 @@ public class AnalyzeJoinTest {
         analyzeFail("select v1 from t0 right join [broadcast] t1 on t0.v1 = t1.v4");
         //Full outer does not support BROADCAST
         analyzeFail("select v1 from t0 full outer join [broadcast] t1 on t0.v1 = t1.v4");
+
+        QueryStatement queryStatement =
+                (QueryStatement) analyzeSuccess("select v1 from t0 inner join [broadcast] t1 on t0.v1 = t1.v4");
+        SelectRelation selectRelation = (SelectRelation) queryStatement.getQueryRelation();
+        JoinRelation joinRelation = (JoinRelation) selectRelation.getRelation();
+        Assert.assertEquals("BROADCAST", joinRelation.getJoinHint());
     }
 
     @Test
     public void testJoinPreceding() {
         QueryStatement query = ((QueryStatement) analyzeSuccess("select * from t0,t1 inner join t2 on v4 = v7"));
-        System.out.println(AST2SQL.toString(query));
+        System.out.println(AstToStringBuilder.toString(query));
     }
 
     @Test
@@ -168,7 +190,8 @@ public class AnalyzeJoinTest {
         analyzeSuccess(sql);
 
         sql = "select * from (t0 a, (t1) b)";
-        analyzeFail(sql, "Syntax error");
+        analyzeFail(sql, "Getting syntax error at line 1, column 26. " +
+                "Detail message: Unexpected input 'b', the most similar input is {')'}.");
 
         sql = "select * from (t0 a, t1 a)";
         analyzeFail(sql, "Not unique table/alias: 'a'");
@@ -183,9 +206,38 @@ public class AnalyzeJoinTest {
         analyzeFail(sql, "Not unique table/alias: 't1'");
 
         sql = "select * from (t0 join t1) t,t1";
-        analyzeFail(sql, "Syntax error");
+        analyzeFail(sql, "Getting syntax error at line 1, column 27. " +
+                "Detail message: Unexpected input 't', the most similar input is {<EOF>, ';'}.");
 
         sql = "select * from (t0 join t1 t) ,t1";
         analyzeSuccess(sql);
+    }
+
+    //The precedence of the comma operator is less than that of INNER JOIN, CROSS JOIN, LEFT JOIN, and so on
+    @Test
+    public void testJoinPrecedence() {
+        String sql = "SELECT * FROM t0,t1 INNER JOIN t2 on t1.v4 = t2.v7";
+        QueryStatement statement = (QueryStatement) analyzeSuccess(sql);
+        Assert.assertTrue(((SelectRelation) statement.getQueryRelation()).getRelation() instanceof JoinRelation);
+        JoinRelation joinRelation = (JoinRelation) ((SelectRelation) statement.getQueryRelation()).getRelation();
+        Assert.assertTrue(joinRelation.getJoinOp().isCrossJoin());
+
+        sql = "SELECT * FROM t0 inner join t1 INNER JOIN t2 on t1.v4 = t2.v7";
+        statement = (QueryStatement) analyzeSuccess(sql);
+        Assert.assertTrue(((SelectRelation) statement.getQueryRelation()).getRelation() instanceof JoinRelation);
+        joinRelation = (JoinRelation) ((SelectRelation) statement.getQueryRelation()).getRelation();
+        Assert.assertTrue(joinRelation.getJoinOp().isInnerJoin());
+        Assert.assertNotNull(joinRelation.getOnPredicate());
+
+        sql = "SELECT * FROM t0 inner join t1,t2";
+        statement = (QueryStatement) analyzeSuccess(sql);
+        Assert.assertTrue(((SelectRelation) statement.getQueryRelation()).getRelation() instanceof JoinRelation);
+        joinRelation = (JoinRelation) ((SelectRelation) statement.getQueryRelation()).getRelation();
+        Assert.assertTrue(joinRelation.getJoinOp().isCrossJoin());
+
+        analyzeFail("SELECT * FROM t0,t1 INNER JOIN t2 on t0.v1 = t2.v4",
+                "Column '`t0`.`v1`' cannot be resolved");
+        analyzeSuccess("select * from t0 inner join t1 on t0.v1 = t1.v4 inner join t2 on t0.v2 = t2.v7");
+        analyzeSuccess("select * from t0 inner join t1 on t0.v1 = t1.v4 inner join t2 on t1.v5 = t2.v7");
     }
 }

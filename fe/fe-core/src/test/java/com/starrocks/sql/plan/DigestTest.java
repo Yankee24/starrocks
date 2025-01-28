@@ -1,8 +1,25 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.plan;
 
+import com.starrocks.sql.analyzer.AstToStringBuilder;
+import com.starrocks.sql.ast.NormalizedTableFunctionRelation;
 import com.starrocks.utframe.UtFrameUtils;
+import mockit.Mock;
+import mockit.MockUp;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -113,5 +130,19 @@ public class DigestTest extends PlanTestBase {
         String digest2 = UtFrameUtils.getStmtDigest(connectContext, sql2);
 
         Assert.assertEquals(digest1, digest2);
+    }
+
+    @Test
+    public void testAnalyzeError() throws Exception {
+        new MockUp<AstToStringBuilder.AST2StringBuilderVisitor>() {
+            @Mock
+            public String visitNormalizedTableFunction(NormalizedTableFunctionRelation node, Void scope) {
+                throw new NullPointerException();
+            }
+        };
+
+        String originStmt = "SELECT ltrim(rand(), '0.') from TABLE(generate_series(0, 100000000))";
+        String digest1 = UtFrameUtils.getStmtDigest(connectContext, originStmt);
+        Assert.assertEquals(digest1, "");
     }
 }

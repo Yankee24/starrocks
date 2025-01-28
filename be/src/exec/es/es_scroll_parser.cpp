@@ -1,18 +1,31 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "exec/es/es_scroll_parser.h"
 
 #include <fmt/format.h>
 
+#include "column/array_column.h"
 #include "column/column_helper.h"
 #include "column/nullable_column.h"
 #include "common/config.h"
-#include "runtime/primitive_type.h"
 #include "runtime/runtime_state.h"
+#include "types/logical_type.h"
 #include "types/timestamp_value.h"
 #include "util/timezone_utils.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 static const char* FIELD_SCROLL_ID = "_scroll_id";
 static const char* FIELD_HITS = "hits";
@@ -47,6 +60,15 @@ std::string json_value_to_string(const rapidjson::Value& value) {
     value.Accept(temp_writer);
     return scratch_buffer.GetString();
 }
+
+#define RETURN_NULL_IF_STR_EMPTY(col, column)                                          \
+    do {                                                                               \
+        const std::string& null_str = json_value_to_string(col);                       \
+        if ((null_str.length() <= 0 || "\"\"" == null_str) && column->is_nullable()) { \
+            _append_null(column);                                                      \
+            return Status::OK();                                                       \
+        }                                                                              \
+    } while (false)
 
 #define RETURN_ERROR_IF_COL_IS_ARRAY(col, type)                               \
     do {                                                                      \
@@ -102,17 +124,12 @@ std::string json_value_to_string(const rapidjson::Value& value) {
     } while (false)
 
 template <typename T>
-static Status get_int_value(const rapidjson::Value& col, PrimitiveType type, void* slot, bool pure_doc_value) {
+static Status get_int_value(const rapidjson::Value& col, LogicalType type, void* slot, bool pure_doc_value) {
     return Status::OK();
 }
 
 ScrollParser::ScrollParser(bool doc_value_mode)
-        : _tuple_desc(nullptr),
-          _docvalue_context(nullptr),
-          _size(0),
-          _cur_line(0),
-          _doc_value_mode(doc_value_mode),
-          _temp_writer(_scratch_buffer) {}
+        : _tuple_desc(nullptr), _doc_value_context(nullptr), _size(0), _cur_line(0), _temp_writer(_scratch_buffer) {}
 
 Status ScrollParser::parse(const std::string& scroll_result, bool exactly_once) {
     _size = 0;
@@ -174,13 +191,20 @@ Status ScrollParser::fill_chunk(RuntimeState* state, ChunkPtr* chunk, bool* line
     // TODO: we could fill chunk by column rather than row
     for (size_t i = 0; i < fill_sz; ++i) {
         const rapidjson::Value& obj = _inner_hits_node[_cur_line + i];
-        bool pure_doc_value = _pure_doc_value(obj);
+        bool pure_doc_value = _is_pure_doc_value(obj);
         bool has_source = obj.HasMember(FIELD_SOURCE);
         bool has_fields = obj.HasMember(FIELD_FIELDS);
 
         if (!has_source && !has_fields) {
-            for (auto column : (*chunk)->columns()) {
-                column->append_default();
+            for (size_t col_idx = 0; col_idx < slots.size(); ++col_idx) {
+                SlotDescriptor* slot_desc = slot_descs[col_idx];
+                ColumnPtr& column = (*chunk)->get_column_by_slot_id(slot_desc->id());
+                if (slot_desc->is_nullable()) {
+                    column->append_default();
+                } else {
+                    return Status::DataQualityError(
+                            fmt::format("col `{}` is not null, but value from ES is null", slot_desc->col_name()));
+                }
             }
             continue;
         }
@@ -209,7 +233,7 @@ Status ScrollParser::fill_chunk(RuntimeState* state, ChunkPtr* chunk, bool* line
                 if (pure_doc_value) {
                     return Status::RuntimeError("obtain `_id` is not supported in doc_values mode");
                 }
-                PrimitiveType type = slot_desc->type().type;
+                LogicalType type = slot_desc->type().type;
                 DCHECK(type == TYPE_CHAR || type == TYPE_VARCHAR);
 
                 const auto& _id = obj[FIELD_ID];
@@ -222,7 +246,7 @@ Status ScrollParser::fill_chunk(RuntimeState* state, ChunkPtr* chunk, bool* line
             // if pure_doc_value enabled, docvalue_context must contains the key
             // todo: need move all `pure_docvalue` for every tuple outside fill_tuple
             //  should check pure_docvalue for one table scan not every tuple
-            const char* col_name = pure_doc_value ? _docvalue_context->at(slot_desc->col_name()).c_str()
+            const char* col_name = pure_doc_value ? _doc_value_context->at(slot_desc->col_name()).c_str()
                                                   : slot_desc->col_name().c_str();
 
             auto has_col = line.HasMember(col_name);
@@ -232,8 +256,7 @@ Status ScrollParser::fill_chunk(RuntimeState* state, ChunkPtr* chunk, bool* line
                 bool is_null = col.IsNull() || (pure_doc_value && col.IsArray() && (col.Empty() || col[0].IsNull()));
                 if (!is_null) {
                     // append value from ES to column
-                    RETURN_IF_ERROR(
-                            _append_value_from_json_val(column.get(), slot_desc->type().type, col, pure_doc_value));
+                    RETURN_IF_ERROR(_append_value_from_json_val(column.get(), slot_desc->type(), col, pure_doc_value));
                     continue;
                 }
                 // handle null col
@@ -253,24 +276,25 @@ Status ScrollParser::fill_chunk(RuntimeState* state, ChunkPtr* chunk, bool* line
     return Status::OK();
 }
 
-void ScrollParser::set_params(const TupleDescriptor* descs,
-                              const std::map<std::string, std::string>* docvalue_context) {
+void ScrollParser::set_params(const TupleDescriptor* descs, const std::map<std::string, std::string>* docvalue_context,
+                              const std::string& timezone) {
     _tuple_desc = descs;
-    _docvalue_context = docvalue_context;
+    _doc_value_context = docvalue_context;
+    _timezone = timezone;
 }
 
-bool ScrollParser::_pure_doc_value(const rapidjson::Value& obj) {
+bool ScrollParser::_is_pure_doc_value(const rapidjson::Value& obj) {
     if (obj.HasMember(FIELD_FIELDS)) {
         return true;
     }
     return false;
 }
 
-template <PrimitiveType type, typename CppType>
+template <LogicalType type, typename CppType>
 void ScrollParser::_append_data(Column* column, CppType& value) {
     auto appender = [](auto* column, CppType& value) {
-        using ColumnType = typename vectorized::RunTimeColumnType<type>;
-        ColumnType* runtime_column = down_cast<ColumnType*>(column);
+        using ColumnType = typename starrocks::RunTimeColumnType<type>;
+        auto* runtime_column = down_cast<ColumnType*>(column);
         runtime_column->append(value);
     };
 
@@ -289,8 +313,12 @@ void ScrollParser::_append_null(Column* column) {
     column->append_default();
 }
 
-Status ScrollParser::_append_value_from_json_val(Column* column, PrimitiveType type, const rapidjson::Value& col,
-                                                 bool pure_doc_value) {
+Status ScrollParser::_append_value_from_json_val(Column* column, const TypeDescriptor& type_desc,
+                                                 const rapidjson::Value& col, bool pure_doc_value) {
+    LogicalType type = type_desc.type;
+    if (type != TYPE_CHAR && type != TYPE_VARCHAR) {
+        RETURN_NULL_IF_STR_EMPTY(col, column);
+    }
     switch (type) {
     case TYPE_CHAR:
     case TYPE_VARCHAR: {
@@ -345,11 +373,19 @@ Status ScrollParser::_append_value_from_json_val(Column* column, PrimitiveType t
         break;
     }
     case TYPE_DATE: {
-        RETURN_IF_ERROR(_append_date_val<TYPE_DATE>(col, column, pure_doc_value));
+        RETURN_IF_ERROR(_append_date_val<TYPE_DATE>(col, column, pure_doc_value, _timezone));
         break;
     }
     case TYPE_DATETIME: {
-        RETURN_IF_ERROR(_append_date_val<TYPE_DATETIME>(col, column, pure_doc_value));
+        RETURN_IF_ERROR(_append_date_val<TYPE_DATETIME>(col, column, pure_doc_value, _timezone));
+        break;
+    }
+    case TYPE_ARRAY: {
+        RETURN_IF_ERROR(_append_array_val(col, type_desc, column, pure_doc_value));
+        break;
+    }
+    case TYPE_JSON: {
+        RETURN_IF_ERROR(_append_json_val(col, type_desc, column, pure_doc_value));
         break;
     }
     default: {
@@ -368,7 +404,7 @@ Slice ScrollParser::_json_val_to_slice(const rapidjson::Value& val) {
     return {_scratch_buffer.GetString(), _scratch_buffer.GetSize()};
 }
 
-template <PrimitiveType type, typename T>
+template <LogicalType type, typename T>
 Status ScrollParser::_append_int_val(const rapidjson::Value& col, Column* column, bool pure_doc_value) {
     T value;
     if (col.IsNumber()) {
@@ -412,7 +448,7 @@ Status ScrollParser::_append_int_val(const rapidjson::Value& col, Column* column
     return Status::OK();
 }
 
-template <PrimitiveType type, typename T>
+template <LogicalType type, typename T>
 Status ScrollParser::_append_float_val(const rapidjson::Value& col, Column* column, bool pure_doc_value) {
     static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>);
     T value;
@@ -453,7 +489,7 @@ Status ScrollParser::_append_float_val(const rapidjson::Value& col, Column* colu
 }
 
 Status ScrollParser::_append_bool_val(const rapidjson::Value& col, Column* column, bool pure_doc_value) {
-    PrimitiveType type = TYPE_BOOLEAN;
+    LogicalType type = TYPE_BOOLEAN;
     uint8_t value;
     if (col.IsBool()) {
         value = col.GetBool();
@@ -497,21 +533,104 @@ Status ScrollParser::_append_bool_val(const rapidjson::Value& col, Column* colum
 
     return Status::OK();
 }
+
+Status ScrollParser::_append_array_val(const rapidjson::Value& col, const TypeDescriptor& type_desc, Column* column,
+                                       bool pure_doc_value) {
+    // Array type must have child type.
+    const auto& child_type = type_desc.children[0];
+    DCHECK(child_type.type != TYPE_UNKNOWN);
+
+    // In Elasticsearch, n-dimensional array will be flattened into one-dimensional array.
+    // https://www.elastic.co/guide/en/elasticsearch/reference/8.3/array.html
+    // So we do not support user to create nested array column.
+    // TODO: We should prevent user to create nested array column in FE, but we don't do any schema validation now.
+    if (child_type.type == TYPE_ARRAY) {
+        std::string str = fmt::format("Invalid array format; Document slice is: {}.", json_value_to_string(col));
+        return Status::RuntimeError(str);
+    }
+
+    ArrayColumn* array = nullptr;
+
+    if (column->is_nullable()) {
+        auto* nullable_column = down_cast<NullableColumn*>(column);
+        auto* data_column = nullable_column->data_column().get();
+        NullData& null_data = nullable_column->null_column_data();
+        null_data.push_back(0);
+        array = down_cast<ArrayColumn*>(data_column);
+    } else {
+        array = down_cast<ArrayColumn*>(column);
+    }
+
+    auto* offsets = array->offsets_column().get();
+    auto* elements = array->elements_column().get();
+
+    if (pure_doc_value) {
+        RETURN_IF_ERROR(_append_array_val_from_docvalue(col, child_type, elements));
+    } else {
+        RETURN_IF_ERROR(_append_array_val_from_source(col, child_type, elements));
+    }
+
+    size_t new_size = elements->size();
+    offsets->append(new_size);
+    return Status::OK();
+}
+
+Status ScrollParser::_append_json_val(const rapidjson::Value& col, const TypeDescriptor& type_desc, Column* column,
+                                      bool pure_doc_value) {
+    std::string s = json_value_to_string(col);
+    Slice slice{s};
+    if (!col.IsObject() && !col.IsArray()) {
+        return Status::InternalError("col: " + slice.to_string() + " is not an object/array");
+    }
+    ASSIGN_OR_RETURN(JsonValue json, JsonValue::parse_json_or_string(slice));
+    JsonValue* tmp = &json;
+    _append_data<TYPE_JSON>(column, tmp);
+    return Status::OK();
+}
+
+Status ScrollParser::_append_array_val_from_docvalue(const rapidjson::Value& val, const TypeDescriptor& child_type_desc,
+                                                     Column* column) {
+    for (auto& item : val.GetArray()) {
+        RETURN_IF_ERROR(_append_value_from_json_val(column, child_type_desc, item, true));
+    }
+    return Status::OK();
+}
+
+Status ScrollParser::_append_array_val_from_source(const rapidjson::Value& val, const TypeDescriptor& child_type_desc,
+                                                   Column* column) {
+    if (val.IsNull()) {
+        // Ignore null item in _source.
+        return Status::OK();
+    }
+
+    if (!val.IsArray()) {
+        // For one item situation, like "1" should be treated as "[1]".
+        RETURN_IF_ERROR(_append_value_from_json_val(column, child_type_desc, val, false));
+        return Status::OK();
+    }
+
+    for (auto& item : val.GetArray()) {
+        RETURN_IF_ERROR(_append_array_val_from_source(item, child_type_desc, column));
+    }
+    return Status::OK();
+}
+
 // TODO: test here
-template <PrimitiveType type, typename T>
-Status ScrollParser::_append_date_val(const rapidjson::Value& col, Column* column, bool pure_doc_value) {
-    auto append_timestamp = [](auto& col, Column* column) {
+template <LogicalType type, typename T>
+Status ScrollParser::_append_date_val(const rapidjson::Value& col, Column* column, bool pure_doc_value,
+                                      const std::string& timezone) {
+    auto append_timestamp = [](auto& col, Column* column, const std::string& timezone) {
         TimestampValue value;
-        value.from_unixtime(col.GetInt64() / 1000, TimezoneUtils::default_time_zone);
+        value.from_unixtime(col.GetInt64() / 1000, timezone);
         if constexpr (type == TYPE_DATE) {
-            DateValue date_val = DateValue(value);
+            auto date_val = DateValue(value);
             _append_data<TYPE_DATE>(column, date_val);
         } else if constexpr (type == TYPE_DATETIME) {
             _append_data<TYPE_DATETIME>(column, value);
         }
     };
 
-    auto append_strval = [](auto& col, Column* column) {
+    auto append_strval = [](auto& col, Column* column, const std::string& timezone) {
         const char* raw_str = col.GetString();
         size_t val_size = col.GetStringLength();
 
@@ -529,7 +648,7 @@ Status ScrollParser::_append_date_val(const rapidjson::Value& col, Column* colum
             // https://en.wikipedia.org/wiki/ISO_8601
             // 2020-06-06T16:00:00.000Z was UTC time.
             if (raw_str[val_size - 1] == 'Z') {
-                value.from_unixtime(value.to_unix_second(), TimezoneUtils::default_time_zone);
+                value.from_unixtime(value.to_unix_second(), timezone);
             }
             _append_data<TYPE_DATETIME>(column, value);
         }
@@ -538,20 +657,20 @@ Status ScrollParser::_append_date_val(const rapidjson::Value& col, Column* colum
     };
 
     if (col.IsNumber()) {
-        append_timestamp(col, column);
+        append_timestamp(col, column, timezone);
     } else if (col.IsArray() && pure_doc_value) {
         if (col[0].IsString()) {
-            RETURN_IF_ERROR(append_strval(col[0], column));
+            RETURN_IF_ERROR(append_strval(col[0], column, timezone));
         } else {
-            append_timestamp(col[0], column);
+            append_timestamp(col[0], column, timezone);
         }
 
     } else {
         RETURN_ERROR_IF_COL_IS_ARRAY(col, type);
         RETURN_ERROR_IF_COL_IS_NOT_STRING(col, type);
-        RETURN_IF_ERROR(append_strval(col, column));
+        RETURN_IF_ERROR(append_strval(col, column, timezone));
     }
     return Status::OK();
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

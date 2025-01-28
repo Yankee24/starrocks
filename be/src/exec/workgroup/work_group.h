@@ -1,6 +1,19 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
+
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -9,11 +22,10 @@
 
 #include "exec/pipeline/pipeline_driver_queue.h"
 #include "exec/pipeline/query_context.h"
-#include "exec/workgroup/scan_task_queue.h"
+#include "exec/workgroup/work_group_fwd.h"
+#include "pipeline_executor_set_manager.h"
 #include "runtime/mem_tracker.h"
 #include "storage/olap_define.h"
-#include "util/blocking_queue.hpp"
-#include "util/metrics.h"
 #include "util/priority_thread_pool.hpp"
 #include "util/starrocks_metrics.h"
 
@@ -29,83 +41,117 @@ using steady_clock = std::chrono::steady_clock;
 using std::chrono::duration_cast;
 
 using pipeline::QueryContext;
-
-class WorkGroup;
-class WorkGroupManager;
-using WorkGroupPtr = std::shared_ptr<WorkGroup>;
-using WorkGroupPtrSet = std::unordered_set<WorkGroupPtr>;
 using WorkGroupType = TWorkGroupType::type;
+struct WorkGroupMetrics;
+using WorkGroupMetricsPtr = std::shared_ptr<WorkGroupMetrics>;
+
+template <typename Q>
+class WorkGroupSchedEntity {
+public:
+    explicit WorkGroupSchedEntity(WorkGroup* workgroup);
+    ~WorkGroupSchedEntity();
+
+    WorkGroup* workgroup() { return _workgroup; }
+
+    Q* queue() { return _my_queue.get(); }
+    void set_queue(std::unique_ptr<Q> my_queue);
+
+    Q* in_queue() { return _in_queue; }
+    const Q* in_queue() const { return _in_queue; }
+    void set_in_queue(Q* in_queue) { _in_queue = in_queue; }
+
+    int64_t cpu_weight() const;
+
+    int64_t vruntime_ns() const { return _vruntime_ns; }
+    int64_t runtime_ns() const { return _vruntime_ns * cpu_weight(); }
+
+    /// Return the growth runtime in the range [last, curr].
+    /// For example:
+    ///     mark_curr_runtime_ns();           // Move curr to latest.
+    ///     auto value = growth_runtime_ns;   // Get growth value in [curr, last] multiple times.
+    ///     auto value = growth_runtime_ns;
+    ///     mark_last_runtime_ns();           // Move last to curr.
+    int64_t growth_runtime_ns() const { return _curr_unadjusted_runtime_ns - _last_unadjusted_runtime_ns; }
+    /// Update curr runtime to the latest runtime.
+    void mark_curr_runtime_ns() { _curr_unadjusted_runtime_ns = _unadjusted_runtime_ns; }
+    /// Update last runtime to the curr runtime.
+    void mark_last_runtime_ns() { _last_unadjusted_runtime_ns = _curr_unadjusted_runtime_ns; }
+
+    int64_t unadjusted_runtime_ns() const { return _unadjusted_runtime_ns; }
+
+    void incr_runtime_ns(int64_t runtime_ns);
+    void adjust_runtime_ns(int64_t runtime_ns);
+
+private:
+    WorkGroup* _workgroup; // The workgroup owning this entity.
+
+    std::unique_ptr<Q> _my_queue; // The queue owned by this group.
+    Q* _in_queue = nullptr;       // The queue on which this entity is queued.
+
+    int64_t _vruntime_ns = 0;
+
+    int64_t _unadjusted_runtime_ns = 0;
+    int64_t _curr_unadjusted_runtime_ns = 0;
+    int64_t _last_unadjusted_runtime_ns = 0;
+};
+
+using WorkGroupDriverSchedEntity = WorkGroupSchedEntity<pipeline::DriverQueue>;
+using WorkGroupScanSchedEntity = WorkGroupSchedEntity<ScanTaskQueue>;
+
+struct RunningQueryToken {
+    explicit RunningQueryToken(WorkGroupPtr wg) : wg(std::move(wg)) {}
+    ~RunningQueryToken();
+    WorkGroupPtr get_wg() { return wg; }
+
+private:
+    WorkGroupPtr wg;
+};
+using RunningQueryTokenPtr = std::unique_ptr<RunningQueryToken>;
 
 // WorkGroup is the unit of resource isolation, it has {CPU, Memory, Concurrency} quotas which limit the
 // resource usage of the queries belonging to the WorkGroup. Each user has be bound to a WorkGroup, when
 // the user issues a query, then the corresponding WorkGroup is chosen to manage the query.
-class WorkGroup {
+class WorkGroup : public std::enable_shared_from_this<WorkGroup> {
 public:
-    WorkGroup(const std::string& name, int64_t id, int64_t version, size_t cpu_limit, double memory_limit,
-              size_t concurrency, WorkGroupType type);
-    WorkGroup(const TWorkGroup& twg);
+    WorkGroup(std::string name, int64_t id, int64_t version, size_t cpu_weight, double memory_limit, size_t concurrency,
+              double spill_mem_limit_threshold, WorkGroupType type);
+    explicit WorkGroup(const TWorkGroup& twg);
     ~WorkGroup() = default;
+
+    void init();
 
     TWorkGroup to_thrift() const;
     TWorkGroup to_thrift_verbose() const;
-    void init();
+    std::string to_string() const;
+
+    // Copy metrics from the other work group
+    void copy_metrics(const WorkGroup& rhs);
 
     MemTracker* mem_tracker() { return _mem_tracker.get(); }
-    double get_mem_limit() const { return _memory_limit; }
-    pipeline::DriverQueue* driver_queue() { return _driver_queue.get(); }
-    ScanTaskQueue* scan_task_queue() { return _scan_task_queue.get(); }
+    std::shared_ptr<MemTracker> grab_mem_tracker() { return _mem_tracker; }
+    const MemTracker* mem_tracker() const { return _mem_tracker.get(); }
+    MemTracker* connector_scan_mem_tracker() { return _connector_scan_mem_tracker.get(); }
 
     int64_t id() const { return _id; }
-
     int64_t version() const { return _version; }
-
     const std::string& name() const { return _name; }
+    size_t cpu_weight() const { return _cpu_weight; }
+    size_t exclusive_cpu_cores() const { return _exclusive_cpu_cores; }
+    size_t mem_limit() const { return _memory_limit; }
+    int64_t mem_limit_bytes() const { return _memory_limit_bytes; }
 
-    size_t cpu_limit() const { return _cpu_limit; }
+    int64_t mem_consumption_bytes() const { return _mem_tracker == nullptr ? 0L : _mem_tracker->consumption(); }
 
-    int64_t vruntime_ns() const { return _vruntime_ns; }
-    int64_t real_runtime_ns() const { return _vruntime_ns * _cpu_limit; }
+    WorkGroupDriverSchedEntity* driver_sched_entity() { return &_driver_sched_entity; }
+    const WorkGroupDriverSchedEntity* driver_sched_entity() const { return &_driver_sched_entity; }
+    WorkGroupScanSchedEntity* scan_sched_entity() { return &_scan_sched_entity; }
+    const WorkGroupScanSchedEntity* scan_sched_entity() const { return &_scan_sched_entity; }
+    WorkGroupScanSchedEntity* connector_scan_sched_entity() { return &_connector_scan_sched_entity; }
+    const WorkGroupScanSchedEntity* connector_scan_sched_entity() const { return &_connector_scan_sched_entity; }
 
-    int64_t growth_real_runtime_ns() const { return _vruntime_ns * _cpu_limit - _last_vruntime_ns; }
-    void update_last_real_runtime_ns(int64_t last_vruntime_ns) { _last_vruntime_ns = last_vruntime_ns; }
-
-    // Accumulate virtual runtime divided by _cpu_limit, so that the larger _cpu_limit,
-    // the more cpu time can be consumed proportionally.
-    void increment_real_runtime_ns(int64_t real_runtime_ns) { _vruntime_ns += real_runtime_ns / _cpu_limit; }
-    void set_vruntime_ns(int64_t vruntime_ns) { _vruntime_ns = vruntime_ns; }
-
-    double get_cpu_expected_use_ratio() const;
-    double get_cpu_actual_use_ratio() const;
-    void set_cpu_actual_use_ratio(double ratio) { _cpu_actual_use_ratio = ratio; }
-
-    // If the scan layer generates data, then this interface should be called
-    void incr_period_scaned_chunk_num(int32_t chunk_num);
-
-    // This interface should be called if a request for a chunk is made
-    // Whether successful or not
-    void incr_period_ask_chunk_num(int32_t chunk_num);
-
-    void estimate_trend_factor_period();
-    double get_expect_factor() const;
-    double get_diff_factor() const;
-    double get_select_factor() const;
-    void set_select_factor(double value);
-    void update_select_factor(double value);
-    double get_cur_select_factor() const;
-    void update_cur_select_factor(double value);
-
-    // increase num_driver when the driver is attached to the workgroup
-    void increase_num_drivers() {
-        ++_num_drivers;
-        ++_acc_num_drivers;
-    }
-    // decrease num_driver when the driver is detached from the workgroup
-    void decrease_num_drivers() {
-        int64_t old = _num_drivers.fetch_sub(1);
-        DCHECK_GT(old, 0);
-    }
-
-    int num_drivers() const { return _num_drivers; }
+    void incr_num_running_drivers();
+    void decr_num_running_drivers();
+    int num_running_drivers() const { return _num_running_drivers; }
 
     // mark the workgroup is deleted, but at the present, it can not be removed from WorkGroupManager, because
     // 1. there exists pending drivers
@@ -119,18 +165,25 @@ public:
     }
     // no drivers shall be added to this workgroup
     bool is_marked_del() const { return _is_marked_del.load(std::memory_order_acquire); }
-
     // a workgroup should wait several seconds to be cleaned safely.
-    bool is_expired() {
+    bool is_expired() const {
         auto now = duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
         return now > _vacuum_ttl;
     }
 
-    int64_t total_cpu_cost() const { return _total_cpu_cost.load(); }
-    void incr_total_cpu_cost(int64_t cpu_cost) { _total_cpu_cost.fetch_add(cpu_cost); }
+    // return true if current workgroup is removable:
+    // 1. is already marked del
+    // 2. no pending drivers exists
+    // 3. wait for a period of vacuum_ttl to prevent race condition
+    bool is_removable() const {
+        return is_marked_del() && _num_running_drivers.load(std::memory_order_acquire) == 0 && is_expired();
+    }
+
+    int128_t unique_id() const { return create_unique_id(_id, _version); }
+    static int128_t create_unique_id(int64_t id, int64_t version) { return (((int128_t)version) << 64) | id; }
 
     Status check_big_query(const QueryContext& query_context);
-    Status try_incr_num_queries();
+    StatusOr<RunningQueryTokenPtr> acquire_running_query_token(bool enable_group_level_query_queue);
     void decr_num_queries();
     int64_t num_running_queries() const { return _num_running_queries; }
     int64_t num_total_queries() const { return _num_total_queries; }
@@ -141,175 +194,153 @@ public:
     bool use_big_query_mem_limit() const {
         return 0 < _big_query_mem_limit && _big_query_mem_limit <= _mem_tracker->limit();
     }
-    int64_t big_query_cpu_second_limit() const { return _big_query_cpu_second_limit; }
+    int64_t big_query_cpu_second_limit() const { return _big_query_cpu_nanos_limit / NANOS_PER_SEC; }
     int64_t big_query_scan_rows_limit() const { return _big_query_scan_rows_limit; }
+    void incr_cpu_runtime_ns(int64_t delta_ns) { _cpu_runtime_ns += delta_ns; }
+    int64_t cpu_runtime_ns() const { return _cpu_runtime_ns; }
 
-    // return true if current workgroup is removable:
-    // 1. is already marked del
-    // 2. no pending drivers exists
-    // 3. wait for a period of vacuum_ttl to prevent race condition
-    bool is_removable() { return is_marked_del() && _num_drivers.load(std::memory_order_acquire) == 0 && is_expired(); }
+    void set_shared_executors(PipelineExecutorSet* executors) { _executors = executors; }
+    void set_exclusive_executors(std::unique_ptr<PipelineExecutorSet> executors) {
+        _exclusive_executors = std::move(executors);
+        _executors = _exclusive_executors.get();
+    }
 
-    int128_t unique_id() const { return create_unique_id(_id, _version); }
-    static int128_t create_unique_id(int64_t id, int64_t version) { return (((int128_t)version) << 64) | id; }
+    PipelineExecutorSet* exclusive_executors() const { return _exclusive_executors.get(); }
+    PipelineExecutorSet* executors() const { return _executors; }
 
     static constexpr int64 DEFAULT_WG_ID = 0;
+    static constexpr int64 DEFAULT_MV_WG_ID = 1;
     static constexpr int64 DEFAULT_VERSION = 0;
+    static constexpr int64 DEFAULT_MV_VERSION = 1;
 
-    int64_t mem_limit() const;
+    // Yield scan io task when maximum time in nano-seconds has spent in current execution round.
+    static constexpr int64_t YIELD_MAX_TIME_SPENT = 100'000'000L;
+    // Yield scan io task when maximum time in nano-seconds has spent in current execution round,
+    // if it runs in the worker thread owned by other workgroup, which has running drivers.
+    static constexpr int64_t YIELD_PREEMPT_MAX_TIME_SPENT = 5'000'000L;
 
 private:
+    static constexpr double ABSENT_MEMORY_LIMIT = -1;
+    static constexpr size_t ABSENT_CONCURRENCY_LIMIT = 0;
+
     std::string _name;
     int64_t _id;
-    int64_t _version;
-    WorkGroupType _type;
+    int64_t _version = 0;
+    WorkGroupType _type = WorkGroupType::WG_NORMAL;
 
     // Specified limitations
-    size_t _cpu_limit;
-    double _memory_limit;
+    size_t _cpu_weight = 1;
+    size_t _exclusive_cpu_cores = 0;
+    double _memory_limit = ABSENT_MEMORY_LIMIT;
     int64_t _memory_limit_bytes = -1;
-    size_t _concurrency_limit = 0;
-
-    // Big query metrics, when a query exceeds one of the following metrics, it will likely fail
+    size_t _concurrency_limit = ABSENT_CONCURRENCY_LIMIT;
     int64_t _big_query_mem_limit = 0;
     int64_t _big_query_scan_rows_limit = 0;
-    int64_t _big_query_cpu_second_limit = 0;
+    int64_t _big_query_cpu_nanos_limit = 0;
+    double _spill_mem_limit_threshold = 1.0;
+    int64_t _spill_mem_limit_bytes = -1;
 
-    std::shared_ptr<starrocks::MemTracker> _mem_tracker = nullptr;
+    std::shared_ptr<MemTracker> _mem_tracker = nullptr;
+    std::shared_ptr<MemTracker> _connector_scan_mem_tracker = nullptr;
 
-    pipeline::DriverQueuePtr _driver_queue = nullptr;
-    int64_t _vruntime_ns = 0;
-    int64_t _last_vruntime_ns = 0;
+    WorkGroupDriverSchedEntity _driver_sched_entity;
+    WorkGroupScanSchedEntity _scan_sched_entity;
+    WorkGroupScanSchedEntity _connector_scan_sched_entity;
 
     std::atomic<bool> _is_marked_del = false;
-    std::atomic<size_t> _num_drivers = 0;
+
+    std::atomic<size_t> _num_running_drivers = 0;
     std::atomic<size_t> _acc_num_drivers = 0;
     int64_t _vacuum_ttl = std::numeric_limits<int64_t>::max();
 
-    std::unique_ptr<ScanTaskQueue> _scan_task_queue = nullptr;
-
-    //  some variables for io schedule
-    std::atomic<size_t> _period_scaned_chunk_num = 1;
-    std::atomic<size_t> _period_ask_chunk_num = 1;
-
-    double _expect_factor = 0; // the factor which should be selected to run by scheduler
-    double _diff_factor = 0;
-    double _select_factor = 0;
-    double _cur_select_factor = 0;
-
-    std::atomic<int64_t> _total_cpu_cost = 0;
-
-    double _cpu_actual_use_ratio = 0;
-
+    // Metrics of this workgroup
     std::atomic<int64_t> _num_running_queries = 0;
     std::atomic<int64_t> _num_total_queries = 0;
     std::atomic<int64_t> _concurrency_overflow_count = 0;
     std::atomic<int64_t> _bigquery_count = 0;
-};
+    /// The total CPU runtime cost in nanos unit, including driver execution time, and the cpu execution time of
+    /// other threads including Source and Sink threads.
+    std::atomic<int64_t> _cpu_runtime_ns = 0;
 
-class WorkerOwnerManager {
-public:
-    explicit WorkerOwnerManager(int num_total_workers);
-    ~WorkerOwnerManager() = default;
-
-    // Disable copy/move ctor and assignment.
-    WorkerOwnerManager(const WorkerOwnerManager&) = delete;
-    WorkerOwnerManager& operator=(const WorkerOwnerManager&) = delete;
-    WorkerOwnerManager(WorkerOwnerManager&&) = delete;
-    WorkerOwnerManager& operator=(WorkerOwnerManager&&) = delete;
-
-    int num_total_workers() const { return _num_total_workers; }
-
-    std::shared_ptr<WorkGroupPtrSet> get_owners(int worker_id) const {
-        return _worker_id2owner_wgs[_index % 2][worker_id];
-    }
-
-    // Labels which workgroups each worker thread belongs to based on the cpu limit of each workgroup.
-    void reassign_to_wgs(const std::unordered_map<int128_t, WorkGroupPtr>& workgroups, int sum_cpu_limit);
-
-    // Return true, when the worker thread is running the workgroup which it doesn't belong to,
-    // and any owner workgroups of it has running drivers.
-    bool should_yield(int worker_id, const WorkGroupPtr& running_wg) const;
-
-private:
-    const int _num_total_workers;
-    // Use two _worker_id2owner_wgs and _index to insulate read and write.
-    std::vector<std::shared_ptr<WorkGroupPtrSet>> _worker_id2owner_wgs[2]{};
-    std::atomic<size_t> _index = 0;
+    std::unique_ptr<PipelineExecutorSet> _exclusive_executors;
+    PipelineExecutorSet* _executors = nullptr;
 };
 
 // WorkGroupManager is a singleton used to manage WorkGroup instances in BE, it has an io queue and a cpu queues for
 // pick next workgroup for computation and launching io tasks.
 class WorkGroupManager {
-    DECLARE_SINGLETON(WorkGroupManager);
-
 public:
+    explicit WorkGroupManager(PipelineExecutorSetConfig executors_manager_conf);
+
+    ~WorkGroupManager();
+
+    Status start();
+
     // add a new workgroup to WorkGroupManger
     WorkGroupPtr add_workgroup(const WorkGroupPtr& wg);
     // return reserved beforehand default workgroup for query is not bound to any workgroup
     WorkGroupPtr get_default_workgroup();
+    // return reserved beforehand default mv workgroup for MV query is not bound to any workgroup
+    WorkGroupPtr get_default_mv_workgroup();
+
+    void close();
     // destruct workgroups
     void destroy();
 
-    size_t sum_cpu_limit() const { return _sum_cpu_limit; }
-    void increment_cpu_runtime_ns(int64_t cpu_runtime_ns) { _sum_cpu_runtime_ns += cpu_runtime_ns; }
-    int64_t sum_cpu_runtime_ns() const { return _sum_cpu_runtime_ns; }
     void apply(const std::vector<TWorkGroupOp>& ops);
     std::vector<TWorkGroup> list_workgroups();
-    std::vector<TWorkGroup> list_all_workgroups();
 
-    std::shared_ptr<WorkGroupPtrSet> get_owners_of_driver_worker(int worker_id);
-    bool should_yield_driver_worker(int worker_id, WorkGroupPtr running_wg);
-
-    std::shared_ptr<WorkGroupPtrSet> get_owners_of_scan_worker(ScanExecutorType type, int worker_id);
-    bool get_owners_of_scan_worker(ScanExecutorType type, int worker_id, WorkGroupPtr running_wg);
-
-    int num_total_driver_workers() const { return _driver_worker_owner_manager->num_total_workers(); }
+    using WorkGroupConsumer = std::function<void(const WorkGroup&)>;
+    void for_each_workgroup(const WorkGroupConsumer& consumer) const;
 
     void update_metrics();
 
+    bool should_yield(const WorkGroup* wg) const;
+    PipelineExecutorSet* shared_executors() const { return _executors_manager.shared_executors(); }
+    void for_each_executors(const ExecutorsManager::ExecutorsConsumer& consumer) const;
+    void change_num_connector_scan_threads(uint32_t num_connector_scan_threads);
+    void change_enable_resource_group_cpu_borrowing(bool val);
+
 private:
+    using MutexType = std::shared_mutex;
+    using UniqueLockType = std::unique_lock<MutexType>;
+    using SharedLockType = std::shared_lock<MutexType>;
+
     // {create, alter,delete}_workgroup_unlocked is used to replay WorkGroupOps.
     // WorkGroupManager::_mutex is held when invoking these method.
-    void create_workgroup_unlocked(const WorkGroupPtr& wg);
-    void alter_workgroup_unlocked(const WorkGroupPtr& wg);
+    void create_workgroup_unlocked(const WorkGroupPtr& wg, UniqueLockType& lock);
+    void alter_workgroup_unlocked(const WorkGroupPtr& wg, UniqueLockType& lock);
     void delete_workgroup_unlocked(const WorkGroupPtr& wg);
+    void add_metrics_unlocked(const WorkGroupPtr& wg, UniqueLockType& unique_lock);
+    void update_metrics_unlocked();
+    WorkGroupPtr get_default_workgroup_unlocked();
 
-    // Label each executor thread to a specific workgroup by cpu limit.
-    // WorkGroupManager::_mutex is held when invoking this method.
-    void reassign_worker_to_wgs();
+private:
+    friend class ExecutorsManager;
 
-    std::shared_mutex _mutex;
+    mutable std::shared_mutex _mutex;
+    // Place it before _workgroups to ensure the shared executors is destructed after all the dedicated executors for
+    // workgroups, since _executors_manager owns the shared executors, and WorkGroup owns the dedicated executors.
+    ExecutorsManager _executors_manager;
+
     std::unordered_map<int128_t, WorkGroupPtr> _workgroups;
     std::unordered_map<int64_t, int64_t> _workgroup_versions;
     std::list<int128_t> _workgroup_expired_versions;
 
-    std::atomic<size_t> _sum_cpu_limit = 0;
-    std::atomic<int64_t> _sum_cpu_runtime_ns = 0;
-
-    std::unique_ptr<WorkerOwnerManager> _driver_worker_owner_manager;
-    std::unique_ptr<WorkerOwnerManager> _scan_worker_owner_manager;
-    std::unique_ptr<WorkerOwnerManager> _hdfs_scan_worker_owner_manager;
+    std::atomic<size_t> _sum_cpu_weight = 0;
 
     std::once_flag init_metrics_once_flag;
-    std::unordered_map<std::string, int128_t> _wg_metrics;
-
-    std::unordered_map<std::string, std::unique_ptr<starrocks::DoubleGauge>> _wg_cpu_limit_metrics;
-    std::unordered_map<std::string, std::unique_ptr<starrocks::DoubleGauge>> _wg_cpu_metrics;
-    std::unordered_map<std::string, std::unique_ptr<starrocks::IntGauge>> _wg_mem_limit_metrics;
-    std::unordered_map<std::string, std::unique_ptr<starrocks::IntGauge>> _wg_mem_metrics;
-    std::unordered_map<std::string, std::unique_ptr<starrocks::IntGauge>> _wg_running_queries;
-    std::unordered_map<std::string, std::unique_ptr<starrocks::IntGauge>> _wg_total_queries;
-    std::unordered_map<std::string, std::unique_ptr<starrocks::IntGauge>> _wg_concurrency_overflow_count;
-    std::unordered_map<std::string, std::unique_ptr<starrocks::IntGauge>> _wg_bigquery_count;
-
-    void add_metrics(const WorkGroupPtr& wg);
-    void update_metrics_unlocked();
+    std::unordered_map<std::string, WorkGroupMetricsPtr> _wg_metrics;
 };
 
 class DefaultWorkGroupInitialization {
 public:
     DefaultWorkGroupInitialization();
+
+    // create or renew default group
+    std::shared_ptr<WorkGroup> create_default_workgroup();
+    // create or renew default mv group
+    std::shared_ptr<WorkGroup> create_default_mv_workgroup();
 };
 
 } // namespace workgroup

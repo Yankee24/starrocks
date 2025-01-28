@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/plugin/AuditEvent.java
 
@@ -21,8 +34,12 @@
 
 package com.starrocks.plugin;
 
+import com.google.common.base.Joiner;
+import com.starrocks.server.WarehouseManager;
+
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
+import java.util.List;
 
 /*
  * AuditEvent contains all information about audit log info.
@@ -43,8 +60,10 @@ public class AuditEvent {
     }
 
     @Retention(RetentionPolicy.RUNTIME)
-    public static @interface AuditField {
+    public @interface AuditField {
         String value() default "";
+
+        boolean ignore_zero() default false;
     }
 
     public EventType type;
@@ -55,10 +74,17 @@ public class AuditEvent {
     public long timestamp = -1;
     @AuditField(value = "Client")
     public String clientIp = "";
+    // The original login user
     @AuditField(value = "User")
     public String user = "";
+    // The user used to authorize
+    // `User` could be different from `AuthorizedUser` if impersonated
+    @AuditField(value = "AuthorizedUser")
+    public String authorizedUser = "";
     @AuditField(value = "ResourceGroup")
-    public String resourceGroup = "default_wg";
+    public String resourceGroup = "";
+    @AuditField(value = "Catalog")
+    public String catalog = "";
     @AuditField(value = "Db")
     public String db = "";
     @AuditField(value = "State")
@@ -73,10 +99,10 @@ public class AuditEvent {
     public long scanRows = -1;
     @AuditField(value = "ReturnRows")
     public long returnRows = -1;
-    @AuditField(value = "CpuCostNs")
+    @AuditField(value = "CpuCostNs", ignore_zero = true)
     public long cpuCostNs = -1;
-    @AuditField(value = "MemCostBytes")
-    public long memCostBytes = 0;
+    @AuditField(value = "MemCostBytes", ignore_zero = true)
+    public long memCostBytes = -1;
     @AuditField(value = "StmtId")
     public long stmtId = -1;
     @AuditField(value = "QueryId")
@@ -90,9 +116,32 @@ public class AuditEvent {
     @AuditField(value = "Digest")
     public String digest = "";
     @AuditField(value = "PlanCpuCost")
-    public double planCpuCosts = 0.0;
+    public double planCpuCosts = -1;
     @AuditField(value = "PlanMemCost")
-    public double planMemCosts = 0.0;
+    public double planMemCosts = -1;
+    @AuditField(value = "PendingTimeMs")
+    public long pendingTimeMs = -1;
+    @AuditField(value = "Slots")
+    public int numSlots = -1;
+    @AuditField(value = "BigQueryLogCPUSecondThreshold")
+    public long bigQueryLogCPUSecondThreshold = -1;
+    @AuditField(value = "BigQueryLogScanBytesThreshold")
+    public long bigQueryLogScanBytesThreshold = -1;
+    @AuditField(value = "BigQueryLogScanRowsThreshold")
+    public long bigQueryLogScanRowsThreshold = -1;
+    @AuditField(value = "SpilledBytes", ignore_zero = true)
+    public long spilledBytes = -1;
+    @AuditField(value = "Warehouse")
+    public String warehouse = WarehouseManager.DEFAULT_WAREHOUSE_NAME;
+
+    // Materialized View usage info
+    @AuditField(value = "CandidateMVs", ignore_zero = true)
+    public String candidateMvs;
+    @AuditField(value = "HitMvs", ignore_zero = true)
+    public String hitMVs;
+
+    @AuditField(value = "IsForwardToLeader")
+    public boolean isForwardToLeader = false;
 
     public static class AuditEventBuilder {
 
@@ -125,8 +174,18 @@ public class AuditEvent {
             return this;
         }
 
+        public AuditEventBuilder setAuthorizedUser(String authorizedUser) {
+            auditEvent.authorizedUser = authorizedUser;
+            return this;
+        }
+
         public AuditEventBuilder setResourceGroup(String resourceGroup) {
             auditEvent.resourceGroup = resourceGroup;
+            return this;
+        }
+
+        public AuditEventBuilder setCatalog(String catalog) {
+            auditEvent.catalog = catalog;
             return this;
         }
 
@@ -178,6 +237,16 @@ public class AuditEvent {
             return this;
         }
 
+        public AuditEventBuilder setSpilledBytes(long spilledBytes) {
+            auditEvent.spilledBytes = spilledBytes;
+            return this;
+        }
+
+        public AuditEventBuilder setWarehouse(String warehouse) {
+            auditEvent.warehouse = warehouse;
+            return this;
+        }
+
         public AuditEventBuilder setStmtId(long stmtId) {
             auditEvent.stmtId = stmtId;
             return this;
@@ -215,6 +284,50 @@ public class AuditEvent {
 
         public AuditEventBuilder setPlanMemCosts(double memCosts) {
             auditEvent.planMemCosts = memCosts;
+            return this;
+        }
+
+        public AuditEventBuilder setPendingTimeMs(long pendingTimeMs) {
+            auditEvent.pendingTimeMs = pendingTimeMs;
+            return this;
+        }
+
+        public AuditEventBuilder setNumSlots(int numSlots) {
+            auditEvent.numSlots = numSlots;
+            return this;
+        }
+
+        public AuditEventBuilder setBigQueryLogCPUSecondThreshold(long bigQueryLogCPUSecondThreshold) {
+            auditEvent.bigQueryLogCPUSecondThreshold = bigQueryLogCPUSecondThreshold;
+            return this;
+        }
+
+        public AuditEventBuilder setBigQueryLogScanBytesThreshold(long bigQueryLogScanBytesThreshold) {
+            auditEvent.bigQueryLogScanBytesThreshold = bigQueryLogScanBytesThreshold;
+            return this;
+        }
+
+        public AuditEventBuilder setBigQueryLogScanRowsThreshold(long bigQueryLogScanRowsThreshold) {
+            auditEvent.bigQueryLogScanRowsThreshold = bigQueryLogScanRowsThreshold;
+            return this;
+        }
+
+        public AuditEventBuilder setCandidateMvs(List<String> mvs) {
+            this.auditEvent.candidateMvs = Joiner.on(",").join(mvs);
+            return this;
+        }
+
+        public AuditEventBuilder setHitMvs(List<String> mvs) {
+            this.auditEvent.hitMVs = Joiner.on(",").join(mvs);
+            return this;
+        }
+
+        public String getHitMvs() {
+            return this.auditEvent.hitMVs;
+        }
+
+        public AuditEventBuilder setIsForwardToLeader(boolean isForwardToLeader) {
+            auditEvent.isForwardToLeader = isForwardToLeader;
             return this;
         }
 

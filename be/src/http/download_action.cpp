@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/http/download_action.cpp
 
@@ -21,19 +34,13 @@
 
 #include "http/download_action.h"
 
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <sstream>
 #include <string>
 
 #include "fs/fs.h"
 #include "fs/fs_util.h"
 #include "http/http_channel.h"
-#include "http/http_headers.h"
 #include "http/http_request.h"
-#include "http/http_response.h"
-#include "http/http_status.h"
 #include "http/utils.h"
 #include "runtime/exec_env.h"
 #include "util/filesystem_util.h"
@@ -43,8 +50,6 @@
 namespace starrocks {
 
 const std::string FILE_PARAMETER = "file";
-const std::string DB_PARAMETER = "db";
-const std::string LABEL_PARAMETER = "label";
 const std::string TOKEN_PARAMETER = "token";
 
 DownloadAction::DownloadAction(ExecEnv* exec_env, const std::vector<std::string>& allow_dirs)
@@ -68,23 +73,24 @@ void DownloadAction::handle_normal(HttpRequest* req, const std::string& file_par
     if (config::enable_token_check) {
         status = check_token(req);
         if (!status.ok()) {
-            std::string error_msg = status.get_error_msg();
-            HttpChannel::send_reply(req, error_msg);
+            HttpChannel::send_reply(req, status.message());
+            LOG(WARNING) << "Download method:" << to_method_desc(req->method()) << " " << file_param
+                         << " error:" << status;
             return;
         }
     }
 
     status = check_path_is_allowed(file_param);
     if (!status.ok()) {
-        std::string error_msg = status.get_error_msg();
-        HttpChannel::send_reply(req, error_msg);
+        HttpChannel::send_reply(req, status.message());
+        LOG(WARNING) << "Download method:" << to_method_desc(req->method()) << " " << file_param << " error:" << status;
         return;
     }
     auto is_dir = fs::is_directory(file_param);
     if (!is_dir.ok()) {
-        std::string error_msg = is_dir.status().get_error_msg();
-        HttpChannel::send_reply(req, error_msg);
-        return;
+        HttpChannel::send_reply(req, is_dir.status().message());
+        LOG(WARNING) << "Download method:" << to_method_desc(req->method()) << " " << file_param
+                     << " error:" << is_dir.status();
     }
     if (*is_dir) {
         do_dir_response(file_param, req);
@@ -98,14 +104,12 @@ void DownloadAction::handle_error_log(HttpRequest* req, const std::string& file_
 
     Status status = check_log_path_is_allowed(absolute_path);
     if (!status.ok()) {
-        std::string error_msg = status.get_error_msg();
-        HttpChannel::send_reply(req, error_msg);
+        HttpChannel::send_reply(req, status.message());
         return;
     }
     auto is_dir = fs::is_directory(absolute_path);
     if (!is_dir.ok()) {
-        std::string error_msg = is_dir.status().get_error_msg();
-        HttpChannel::send_reply(req, error_msg);
+        HttpChannel::send_reply(req, is_dir.status().message());
         return;
     }
     if (*is_dir) {

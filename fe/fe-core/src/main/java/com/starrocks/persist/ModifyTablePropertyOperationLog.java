@@ -23,7 +23,6 @@ import com.starrocks.common.io.Writable;
 import com.starrocks.persist.gson.GsonUtils;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
@@ -36,6 +35,13 @@ public class ModifyTablePropertyOperationLog implements Writable {
     private long tableId;
     @SerializedName(value = "properties")
     private Map<String, String> properties = new HashMap<>();
+    @SerializedName(value = "comment")
+    private String comment;
+
+    public ModifyTablePropertyOperationLog(long dbId, long tableId) {
+        this.dbId = dbId;
+        this.tableId = tableId;
+    }
 
     public ModifyTablePropertyOperationLog(long dbId, long tableId, Map<String, String> properties) {
         this.dbId = dbId;
@@ -55,10 +61,15 @@ public class ModifyTablePropertyOperationLog implements Writable {
         return properties;
     }
 
-    @Override
-    public void write(DataOutput out) throws IOException {
-        Text.writeString(out, GsonUtils.GSON.toJson(this));
+    public String getComment() {
+        return comment;
     }
+
+    public void setComment(String comment) {
+        this.comment = comment;
+    }
+
+
 
     public static ModifyTablePropertyOperationLog read(DataInput in) throws IOException {
         return GsonUtils.GSON.fromJson(Text.readString(in), ModifyTablePropertyOperationLog.class);

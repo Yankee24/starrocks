@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/http/rest/TableQueryPlanAction.java
 
@@ -22,25 +35,33 @@
 package com.starrocks.http.rest;
 
 import com.google.common.base.Strings;
-import com.starrocks.analysis.StatementBase;
+import com.google.common.collect.Maps;
 import com.starrocks.analysis.TableName;
+import com.starrocks.authorization.AccessDeniedException;
+import com.starrocks.authorization.PrivilegeType;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Table;
-import com.starrocks.cluster.ClusterNamespace;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.FeConstants;
 import com.starrocks.common.StarRocksHttpException;
+import com.starrocks.common.util.NetUtils;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.http.ActionController;
 import com.starrocks.http.BaseRequest;
 import com.starrocks.http.BaseResponse;
 import com.starrocks.http.IllegalArgException;
-import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.planner.PlanFragment;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.SessionVariable;
+import com.starrocks.rpc.ConfigurableSerDesFactory;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.StatementPlanner;
 import com.starrocks.sql.analyzer.AnalyzerUtils;
+import com.starrocks.sql.analyzer.Authorizer;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.SelectRelation;
+import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.SubqueryRelation;
 import com.starrocks.sql.ast.TableRelation;
 import com.starrocks.sql.plan.ExecPlan;
@@ -60,7 +81,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
-import org.codehaus.jackson.map.ObjectMapper;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -94,7 +114,7 @@ public class TableQueryPlanAction extends RestBaseAction {
 
     @Override
     protected void executeWithoutPassword(BaseRequest request, BaseResponse response)
-            throws DdlException {
+            throws DdlException, AccessDeniedException {
         // just allocate 2 slot for top holder map
         Map<String, Object> resultMap = new HashMap<>(4);
         String dbName = request.getSingleParameter(DB_KEY);
@@ -106,7 +126,6 @@ public class TableQueryPlanAction extends RestBaseAction {
                     || Strings.isNullOrEmpty(tableName)) {
                 throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST, "{database}/{table} must be selected");
             }
-            String sql;
             if (Strings.isNullOrEmpty(postContent)) {
                 throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST,
                         "POST body must contains [sql] root object");
@@ -118,7 +137,7 @@ public class TableQueryPlanAction extends RestBaseAction {
                 throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST,
                         "malformed json [ " + postContent + " ]");
             }
-            sql = jsonObject.optString("sql");
+            String sql = jsonObject.optString("sql");
             if (Strings.isNullOrEmpty(sql)) {
                 throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST,
                         "POST body must contains [sql] root object");
@@ -126,44 +145,44 @@ public class TableQueryPlanAction extends RestBaseAction {
             LOG.info("receive SQL statement [{}] from external service [ user [{}]] for database [{}] table [{}]",
                     sql, ConnectContext.get().getCurrentUserIdentity(), dbName, tableName);
 
-            String fullDbName = ClusterNamespace.getFullName(ConnectContext.get().getClusterName(), dbName);
             // check privilege for select, otherwise return HTTP 401
-            checkTblAuth(ConnectContext.get().getCurrentUserIdentity(), fullDbName, tableName, PrivPredicate.SELECT);
-            Database db = GlobalStateMgr.getCurrentState().getDb(fullDbName);
+            Authorizer.checkTableAction(ConnectContext.get().getCurrentUserIdentity(), ConnectContext.get().getCurrentRoleIds(),
+                    dbName, tableName, PrivilegeType.SELECT);
+            Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbName);
             if (db == null) {
                 throw new StarRocksHttpException(HttpResponseStatus.NOT_FOUND,
                         "Database [" + dbName + "] " + "does not exists");
             }
             // may be should acquire writeLock
-            db.readLock();
+            Locker locker = new Locker();
+            locker.lockDatabase(db.getId(), LockType.READ);
             try {
-                Table table = db.getTable(tableName);
+                Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), tableName);
                 if (table == null) {
                     throw new StarRocksHttpException(HttpResponseStatus.NOT_FOUND,
                             "Table [" + tableName + "] " + "does not exists");
                 }
-                // just only support OlapTable, ignore others such as ESTable
-                if (table.getType() != Table.TableType.OLAP) {
+                // just only support OlapTable, CloudNativeTable and MaterializedView, ignore others such as ESTable
+                if (!table.isNativeTableOrMaterializedView()) {
                     // Forbidden
                     throw new StarRocksHttpException(HttpResponseStatus.FORBIDDEN,
-                            "only support OlapTable currently, but Table [" + tableName + "] "
-                                    + "is not a OlapTable");
+                            "Only support OlapTable, CloudNativeTable and MaterializedView currently");
                 }
                 // parse/analysis/plan the sql and acquire tablet distributions
-                handleQuery(ConnectContext.get(), fullDbName, tableName, sql, resultMap);
+                handleQuery(ConnectContext.get(), db.getFullName(), tableName, sql, resultMap);
             } finally {
-                db.readUnlock();
+                locker.unLockDatabase(db.getId(), LockType.READ);
             }
         } catch (StarRocksHttpException e) {
             // status code  should conforms to HTTP semantic
             resultMap.put("status", e.getCode().code());
             resultMap.put("exception", e.getMessage());
         }
-        ObjectMapper mapper = new ObjectMapper();
+
         try {
             String result = mapper.writeValueAsString(resultMap);
             // send result with extra information
-            response.setContentType("application/json");
+            response.setContentType(JSON_CONTENT_TYPE);
             response.getContent().append(result);
             sendResult(request, response,
                     HttpResponseStatus.valueOf(Integer.parseInt(String.valueOf(resultMap.get("status")))));
@@ -193,13 +212,18 @@ public class TableQueryPlanAction extends RestBaseAction {
              * currently only used in Spark/Flink Connector
              */
             context.getSessionVariable().setSingleNodeExecPlan(true);
+            long limit = context.getSessionVariable().getSqlSelectLimit();
+            context.getSessionVariable().setSqlSelectLimit(SessionVariable.DEFAULT_SELECT_LIMIT);
             statementBase =
-                    com.starrocks.sql.parser.SqlParser.parse(sql, context.getSessionVariable().getSqlMode()).get(0);
-            execPlan = new StatementPlanner().plan(statementBase, context);
+                    com.starrocks.sql.parser.SqlParser.parse(sql, context.getSessionVariable()).get(0);
+            execPlan = StatementPlanner.plan(statementBase, context);
             context.getSessionVariable().setSingleNodeExecPlan(false);
+            context.getSessionVariable().setSqlSelectLimit(limit);
         } catch (Exception e) {
-            throw new StarRocksHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
-                    "The Sql is invalid");
+            LOG.error("Get query plan for sql[{}] error, queryId: {}", sql, context.getQueryId(), e);
+            throw new StarRocksHttpException(
+                    HttpResponseStatus.INTERNAL_SERVER_ERROR,
+                    "Invalid SQL: " + sql);
         }
 
         // only process select semantic
@@ -220,13 +244,13 @@ public class TableQueryPlanAction extends RestBaseAction {
         if (AnalyzerUtils.collectAllTable(statementBase).size() != 1) {
             if (stmt.getRelation() instanceof TableRelation) {
                 throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST,
-                        "Select statement must have only one table");
+                        "Select statement must have only one table: " + sql);
             }
         }
 
         if (stmt.getRelation() instanceof SubqueryRelation) {
             throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST,
-                    "Select statement must not embed another statement");
+                    "Select statement must not embed another statement: " + sql);
         }
 
         // check consistent http requested resource with sql referenced
@@ -234,20 +258,28 @@ public class TableQueryPlanAction extends RestBaseAction {
         TableName tableAndDb = stmt.getRelation().getResolveTableName();
         if (!(tableAndDb.getDb().equals(requestDb) && tableAndDb.getTbl().equals(requestTable))) {
             throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST,
-                    "requested database and table must consistent with sql: request [ "
-                            + requestDb + "." + requestTable + "]" + "and sql [" + tableAndDb.toString() + "]");
+                    "Requested database and table must consistent with sql: request [ "
+                            + requestDb + "." + requestTable + "]" + "and sql [" + tableAndDb + "]");
         }
 
         if (execPlan == null) {
+            LOG.error("Null exec plan for sql[{}], queryId: {}", sql, context.getQueryId());
             throw new StarRocksHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
-                    "The Sql is invalid");
+                    "Invalid SQL: " + sql);
+        }
+
+        if (execPlan.getScanNodes().isEmpty() && FeConstants.enablePruneEmptyOutputScan) {
+            result.put("partitions", Maps.newHashMap());
+            result.put("opaqued_query_plan", "");
+            result.put("status", 200);
+            return;
         }
 
         // acquire ScanNode to obtain pruned tablet
         // in this way, just retrieve only one scannode
         if (execPlan.getScanNodes().size() != 1) {
             throw new StarRocksHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
-                    "Planner should plan just only one ScanNode but found [ " + execPlan.getScanNodes().size() + "]");
+                    "Planner should plan just only 1 ScanNode but found " + execPlan.getScanNodes().size() + ", sql is " + sql);
         }
         List<TScanRangeLocations> scanRangeLocations =
                 execPlan.getScanNodes().get(0).getScanRangeLocations(0);
@@ -255,10 +287,11 @@ public class TableQueryPlanAction extends RestBaseAction {
         List<PlanFragment> fragments = execPlan.getFragments();
         if (fragments.size() != 1) {
             throw new StarRocksHttpException(HttpResponseStatus.INTERNAL_SERVER_ERROR,
-                    "Planner should plan just only one PlanFragment but found [ " + fragments.size() + "]");
+                    "Planner should plan just only 1 PlanFragment but found " + fragments.size() + ", sql is " + sql);
         }
 
         TQueryPlanInfo tQueryPlanInfo = new TQueryPlanInfo();
+        tQueryPlanInfo.output_names = execPlan.getColNames();
 
         // acquire TPlanFragment
         TPlanFragment tPlanFragment = fragments.get(0).toThrift();
@@ -284,9 +317,9 @@ public class TableQueryPlanAction extends RestBaseAction {
         tQueryPlanInfo.tablet_info = tabletInfo;
 
         // serialize TQueryPlanInfo and encode plan with Base64 to string in order to translate by json format
-        TSerializer serializer = new TSerializer();
         String opaquedQueryPlan;
         try {
+            TSerializer serializer = ConfigurableSerDesFactory.getTSerializer();
             byte[] queryPlanStream = serializer.serialize(tQueryPlanInfo);
             opaquedQueryPlan = Base64.getEncoder().encodeToString(queryPlanStream);
         } catch (TException e) {
@@ -311,7 +344,7 @@ public class TableQueryPlanAction extends RestBaseAction {
             TInternalScanRange scanRange = scanRangeLocations.scan_range.internal_scan_range;
             Node tabletRouting = new Node(Long.parseLong(scanRange.version), Integer.parseInt(scanRange.schema_hash));
             for (TNetworkAddress address : scanRange.hosts) {
-                tabletRouting.addRouting(address.hostname + ":" + address.port);
+                tabletRouting.addRouting(NetUtils.getHostPortInAccessibleFormat(address.hostname, address.port));
             }
             result.put(String.valueOf(scanRange.tablet_id), tabletRouting);
         }

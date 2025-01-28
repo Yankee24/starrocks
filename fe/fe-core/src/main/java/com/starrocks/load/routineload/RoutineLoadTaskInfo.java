@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/routineload/RoutineLoadTaskInfo.java
 
@@ -21,19 +34,24 @@
 
 package com.starrocks.load.routineload;
 
+import com.google.common.base.Joiner;
+import com.google.common.base.Objects;
 import com.google.common.collect.Lists;
-import com.starrocks.common.Config;
-import com.starrocks.common.UserException;
+import com.starrocks.common.StarRocksException;
 import com.starrocks.common.util.DebugUtil;
 import com.starrocks.common.util.TimeUtils;
+import com.starrocks.load.streamload.StreamLoadTask;
 import com.starrocks.metric.MetricRepo;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.RunMode;
+import com.starrocks.server.WarehouseManager;
 import com.starrocks.service.FrontendOptions;
 import com.starrocks.thrift.TRoutineLoadTask;
 import com.starrocks.transaction.TransactionState;
 import com.starrocks.transaction.TransactionState.TxnCoordinator;
 import com.starrocks.transaction.TransactionState.TxnSourceType;
 import com.starrocks.transaction.TransactionStatus;
+import com.starrocks.warehouse.Warehouse;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -51,11 +69,11 @@ public abstract class RoutineLoadTaskInfo {
 
     public static final long INVALID_BE_ID = -1L;
 
-    private RoutineLoadManager routineLoadManager = GlobalStateMgr.getCurrentState().getRoutineLoadManager();
+    private RoutineLoadMgr routineLoadManager = GlobalStateMgr.getCurrentState().getRoutineLoadMgr();
 
     protected UUID id;
     protected long txnId = -1L;
-    protected long jobId;
+    protected RoutineLoadJob job;
 
     private final long createTimeMs;
     // The time when the task is actually executed
@@ -83,19 +101,25 @@ public abstract class RoutineLoadTaskInfo {
     // record task schedule info
     protected String msg;
 
-    public RoutineLoadTaskInfo(UUID id, long jobId, long taskScheduleIntervalMs,
-                               long timeToExecuteMs) {
+    protected String label;
+
+    protected StreamLoadTask streamLoadTask = null;
+
+    protected long warehouseId = WarehouseManager.DEFAULT_WAREHOUSE_ID;
+
+    public RoutineLoadTaskInfo(UUID id, RoutineLoadJob job, long taskScheduleIntervalMs,
+                               long timeToExecuteMs, long taskTimeoutMs) {
         this.id = id;
-        this.jobId = jobId;
+        this.job = job;
         this.createTimeMs = System.currentTimeMillis();
         this.taskScheduleIntervalMs = taskScheduleIntervalMs;
-        this.timeoutMs = 1000 * Config.routine_load_task_timeout_second;
+        this.timeoutMs = taskTimeoutMs;
         this.timeToExecuteMs = timeToExecuteMs;
     }
 
-    public RoutineLoadTaskInfo(UUID id, long jobId, long taskSchedulerIntervalMs,
-                               long timeToExecuteMs, long previousBeId) {
-        this(id, jobId, taskSchedulerIntervalMs, timeToExecuteMs);
+    public RoutineLoadTaskInfo(UUID id, RoutineLoadJob job, long taskSchedulerIntervalMs,
+                               long timeToExecuteMs, long previousBeId, long taskTimeoutMs) {
+        this(id, job, taskSchedulerIntervalMs, timeToExecuteMs, taskTimeoutMs);
         this.previousBeId = previousBeId;
     }
 
@@ -103,8 +127,12 @@ public abstract class RoutineLoadTaskInfo {
         return id;
     }
 
+    public RoutineLoadJob getJob() {
+        return job;
+    }
+
     public long getJobId() {
-        return jobId;
+        return job.getId();
     }
 
     public void setExecuteStartTimeMs(long executeStartTimeMs) {
@@ -125,6 +153,10 @@ public abstract class RoutineLoadTaskInfo {
 
     public long getTxnId() {
         return txnId;
+    }
+
+    public String getLabel() {
+        return label;
     }
 
     public boolean isRunning() {
@@ -159,8 +191,19 @@ public abstract class RoutineLoadTaskInfo {
         return timeToExecuteMs;
     }
 
-    public void setMsg(String msg) {
+    public void setMsg(String msg, boolean isError) {
         this.msg = msg;
+        if (isError) {
+            job.setOtherMsg(String.format("[task id: %s] [txn id: %s] %s", DebugUtil.printId(id), txnId, msg));
+        }
+    }
+
+    public void setWarehouseId(long warehouseId) {
+        this.warehouseId = warehouseId;
+    }
+
+    public long getWarehouseId() {
+        return warehouseId;
     }
 
     public boolean isRunningTimeout() {
@@ -177,9 +220,9 @@ public abstract class RoutineLoadTaskInfo {
         return false;
     }
 
-    abstract TRoutineLoadTask createRoutineLoadTask() throws UserException;
+    abstract TRoutineLoadTask createRoutineLoadTask() throws StarRocksException;
 
-    abstract boolean readyToExecute() throws UserException;
+    abstract boolean readyToExecute() throws StarRocksException;
 
     public abstract boolean isProgressKeepUp(RoutineLoadProgress progress);
 
@@ -187,13 +230,42 @@ public abstract class RoutineLoadTaskInfo {
     // throw exception if unrecoverable errors happen.
     public void beginTxn() throws Exception {
         // begin a txn for task
-        RoutineLoadJob routineLoadJob = routineLoadManager.getJob(jobId);
         MetricRepo.COUNTER_LOAD_ADD.increase(1L);
-        txnId = GlobalStateMgr.getCurrentGlobalTransactionMgr().beginTransaction(
-                routineLoadJob.getDbId(), Lists.newArrayList(routineLoadJob.getTableId()), DebugUtil.printId(id), null,
+
+        //  label = job_name+job_id+task_id
+        label = Joiner.on("-").join(job.getName(), job.getId(), DebugUtil.printId(id));
+
+        txnId = GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().beginTransaction(
+                job.getDbId(), Lists.newArrayList(job.getTableId()), label, null,
                 new TxnCoordinator(TxnSourceType.FE, FrontendOptions.getLocalHostAddress()),
-                TransactionState.LoadJobSourceType.ROUTINE_LOAD_TASK, routineLoadJob.getId(),
-                timeoutMs / 1000);
+                TransactionState.LoadJobSourceType.ROUTINE_LOAD_TASK, job.getId(),
+                timeoutMs / 1000, warehouseId);
+    }
+
+    public void afterCommitted(TransactionState txnState, boolean txnOperated) throws StarRocksException {
+        // StreamLoadTask is null, if not specify session variable `enable_profile = true`
+        if (streamLoadTask != null) {
+            streamLoadTask.afterCommitted(txnState, txnOperated);
+        }
+    }
+
+    public void afterVisible(TransactionState txnState, boolean txnOperated) throws StarRocksException {
+        // StreamLoadTask is null, if not specify session variable `enable_profile = true`
+        if (streamLoadTask != null) {
+            streamLoadTask.afterVisible(txnState, txnOperated);
+        }
+    }
+
+    public void afterAborted(TransactionState txnState, boolean txnOperated, String txnStatusChangeReason) throws
+            StarRocksException {
+        // StreamLoadTask is null, if not specify session variable `enable_profile = true`
+        if (streamLoadTask != null) {
+            streamLoadTask.afterAborted(txnState, txnOperated, txnStatusChangeReason);
+        }
+    }
+
+    public void setStreamLoadTask(StreamLoadTask streamLoadTask) {
+        this.streamLoadTask = streamLoadTask;
     }
 
     public List<String> getTaskShowInfo() {
@@ -201,7 +273,7 @@ public abstract class RoutineLoadTaskInfo {
         row.add(DebugUtil.printId(id));
         row.add(String.valueOf(txnId));
         row.add(txnStatus.name());
-        row.add(String.valueOf(jobId));
+        row.add(String.valueOf(job.getId()));
         row.add(TimeUtils.longToTimeString(createTimeMs));
         if (lastScheduledTime != -1L) {
             row.add(TimeUtils.longToTimeString(lastScheduledTime));
@@ -221,10 +293,28 @@ public abstract class RoutineLoadTaskInfo {
         } else {
             row.add(msg);
         }
+
+        if (RunMode.getCurrentRunMode() == RunMode.SHARED_DATA) {
+            // add warehouse in task info
+            Warehouse warehouse = GlobalStateMgr.getCurrentState().getWarehouseMgr().getWarehouse(warehouseId);
+            if (warehouse == null) {
+                row.add("NULL");
+            } else {
+                row.add(warehouse.getName());
+            }
+        }
+
         return row;
     }
 
     abstract String getTaskDataSourceProperties();
+
+    abstract String dataSourceType();
+
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(id);
+    }
 
     @Override
     public boolean equals(Object obj) {

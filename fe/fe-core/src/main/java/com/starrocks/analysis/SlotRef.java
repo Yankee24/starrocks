@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/SlotRef.java
 
@@ -24,36 +37,54 @@ package com.starrocks.analysis;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 import com.starrocks.catalog.Column;
+import com.starrocks.catalog.ColumnId;
+import com.starrocks.catalog.StructField;
+import com.starrocks.catalog.StructType;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.io.Text;
+import com.starrocks.planner.FragmentNormalizer;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.ast.QualifiedName;
 import com.starrocks.thrift.TExprNode;
 import com.starrocks.thrift.TExprNodeType;
 import com.starrocks.thrift.TSlotRef;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.util.List;
 
-// Our new cost based query optimizer is more powerful and stable than old query optimizer,
-// The old query optimizer related codes could be deleted safely.
-// TODO: Remove old query optimizer related codes before 2021-09-30
+import static com.google.common.base.Preconditions.checkArgument;
+
 public class SlotRef extends Expr {
-    private static final Logger LOG = LogManager.getLogger(SlotRef.class);
     private TableName tblName;
-    private String col;
-    // Used in toSql
+    private String colName;
+    private ColumnId columnId;
+    //label/isBackQuoted used in toSql
     private String label;
+    private boolean isBackQuoted = false;
+
+    private QualifiedName qualifiedName;
 
     // results of analysis
     protected SlotDescriptor desc;
+
+    // Only Struct Type need this field
+    // Record access struct subfield path position
+    // Example: struct type: col: STRUCT<c1: INT, c2: STRUCT<c1: INT, c2: DOUBLE>>,
+    // We execute sql: `SELECT col FROM table`, the usedStructField value is [].
+    // We execute sql: `SELECT col.c2 FROM table`, the usedStructFieldPos value is [1].
+    // We execute sql: `SELECT col.c2.c1 FROM table`, the usedStructFieldPos value is [1, 0].
+    private ImmutableList<Integer> usedStructFieldPos;
+
+    // now it is used in Analyzer phase of creating mv to decide the field nullable of mv
+    // can not use desc because the slotId is unknown in Analyzer phase
+    private boolean nullable = true;
 
     // Only used write
     private SlotRef() {
@@ -63,15 +94,47 @@ public class SlotRef extends Expr {
     public SlotRef(TableName tblName, String col) {
         super();
         this.tblName = tblName;
-        this.col = col;
+        this.colName = col;
         this.label = "`" + col + "`";
     }
 
     public SlotRef(TableName tblName, String col, String label) {
         super();
         this.tblName = tblName;
-        this.col = col;
+        this.colName = col;
         this.label = label;
+    }
+
+    public SlotRef(QualifiedName qualifiedName) {
+        super(qualifiedName.getPos());
+        List<String> parts = qualifiedName.getParts();
+        // If parts.size() = 1, it must be a column name. Like `Select a FROM table`.
+        // If parts.size() = [2, 3, 4], it maybe a column name or specific struct subfield name.
+        checkArgument(parts.size() > 0);
+        this.qualifiedName = QualifiedName.of(qualifiedName.getParts(), qualifiedName.getPos());
+        if (parts.size() == 1) {
+            this.colName = parts.get(0);
+            this.label = parts.get(0);
+        } else if (parts.size() == 2) {
+            this.tblName = new TableName(null, null, parts.get(0), qualifiedName.getPos());
+            this.colName = parts.get(1);
+            this.label = parts.get(1);
+        } else if (parts.size() == 3) {
+            this.tblName = new TableName(null, parts.get(0), parts.get(1), qualifiedName.getPos());
+            this.colName = parts.get(2);
+            this.label = parts.get(2);
+        } else if (parts.size() == 4) {
+            this.tblName = new TableName(parts.get(0), parts.get(1), parts.get(2), qualifiedName.getPos());
+            this.colName = parts.get(3);
+            this.label = parts.get(3);
+        } else {
+            // If parts.size() > 4, it must refer to a struct subfield name, so we set SlotRef's TableName null value,
+            // set col, label a qualified name here[Of course it's a wrong value].
+            // Correct value will be parsed in Analyzer according context.
+            this.tblName = null;
+            this.colName = qualifiedName.toString();
+            this.label = qualifiedName.toString();
+        }
     }
 
     // C'tor for a "pre-analyzed" ref to slot that doesn't correspond to
@@ -79,7 +142,7 @@ public class SlotRef extends Expr {
     public SlotRef(SlotDescriptor desc) {
         super();
         this.tblName = null;
-        this.col = desc.getLabel();
+        this.colName = desc.getLabel();
         this.desc = desc;
         this.type = desc.getType();
         this.originType = desc.getOriginType();
@@ -93,14 +156,68 @@ public class SlotRef extends Expr {
     protected SlotRef(SlotRef other) {
         super(other);
         tblName = other.tblName;
-        col = other.col;
+        colName = other.colName;
+        columnId = other.columnId;
         label = other.label;
         desc = other.desc;
+        qualifiedName = other.qualifiedName;
+        usedStructFieldPos = other.usedStructFieldPos;
     }
 
     public SlotRef(String label, SlotDescriptor desc) {
         this(desc);
         this.label = label;
+    }
+
+    public SlotRef(SlotId slotId) {
+        this(new SlotDescriptor(slotId, "", Type.INVALID, false));
+    }
+
+    public void setBackQuoted(boolean isBackQuoted) {
+        this.isBackQuoted = isBackQuoted;
+    }
+
+    public boolean isBackQuoted() {
+        return isBackQuoted;
+    }
+
+    public QualifiedName getQualifiedName() {
+        return qualifiedName;
+    }
+
+    public void setQualifiedName(QualifiedName qualifiedName) {
+        this.qualifiedName = qualifiedName;
+    }
+
+    public void setUsedStructFieldPos(List<Integer> usedStructFieldPos) {
+        this.usedStructFieldPos = ImmutableList.copyOf(usedStructFieldPos);
+    }
+
+    public List<Integer> getUsedStructFieldPos() {
+        return usedStructFieldPos;
+    }
+
+    // When SlotRef is accessing struct subfield, we need to reset SlotRef's type and col name
+    // Do this is for compatible with origin SlotRef
+    public void resetStructInfo() {
+        checkArgument(type.isStructType());
+        checkArgument(usedStructFieldPos.size() > 0);
+
+        StringBuilder colStr = new StringBuilder();
+        colStr.append(colName);
+
+        setOriginType(type);
+        Type tmpType = type;
+        for (int pos : usedStructFieldPos) {
+            StructField structField = ((StructType) tmpType).getField(pos);
+            colStr.append(".");
+            colStr.append(structField.getName());
+            tmpType = structField.getType();
+        }
+        // Set type to subfield's type
+        type = tmpType;
+        // col name like a.b.c
+        colName = colStr.toString();
     }
 
     @Override
@@ -128,6 +245,10 @@ public class SlotRef extends Expr {
         }
     }
 
+    public boolean isFromLambda() {
+        return tblName != null && tblName.getTbl().equals(TableName.LAMBDA_FUNC_TABLE);
+    }
+
     public void setTblName(TableName name) {
         this.tblName = name;
     }
@@ -136,40 +257,30 @@ public class SlotRef extends Expr {
         this.desc = desc;
     }
 
-    @Override
-    public void vectorizedAnalyze(Analyzer analyzer) {
-        computeOutputColumn(analyzer);
+    public void setType(Type type) {
+        super.setType(type);
+        if (desc != null) {
+            desc.setType(type);
+        }
     }
 
-    @Override
-    public void computeOutputColumn(Analyzer analyzer) {
-        outputColumn = desc.getSlotOffset();
-        LOG.debug("SlotRef: " + debugString() + " outputColumn: " + outputColumn);
+    public void setNullable(boolean nullable) {
+        this.nullable = nullable;
+    }
+
+    public SlotDescriptor getSlotDescriptorWithoutCheck() {
+        return desc;
     }
 
     @Override
     public void analyzeImpl(Analyzer analyzer) throws AnalysisException {
-        desc = analyzer.registerColumnRef(tblName, col);
-        type = desc.getType();
-        originType = desc.getOriginType();
-        if (this.type.isChar()) {
-            this.type = Type.VARCHAR;
-        }
-        if (!type.isSupported()) {
-            throw new AnalysisException(
-                    "Unsupported type '" + type.toString() + "' in '" + toSql() + "'.");
-        }
-        numDistinctValues = desc.getStats().getNumDistinctValues();
-        if (type.isBoolean()) {
-            selectivity = DEFAULT_SELECTIVITY;
-        }
     }
 
     @Override
     public String debugString() {
         MoreObjects.ToStringHelper helper = MoreObjects.toStringHelper(this);
         helper.add("slotDesc", desc != null ? desc.debugString() : "null");
-        helper.add("col", col);
+        helper.add("col", colName);
         helper.add("label", label);
         helper.add("tblName", tblName != null ? tblName.toSql() : "null");
         return helper.toString();
@@ -178,10 +289,15 @@ public class SlotRef extends Expr {
     @Override
     public String toSqlImpl() {
         StringBuilder sb = new StringBuilder();
-        if (tblName != null) {
-            return tblName.toSql() + "." + "`" + col + "`";
+        if (tblName != null && !isFromLambda()) {
+            return tblName.toSql() + "." + "`" + colName + "`";
         } else if (label != null) {
-            return label + sb.toString();
+            if (isBackQuoted && !(label.startsWith("`") && label.endsWith("`"))) {
+                sb.append("`").append(label).append("`");
+                return sb.toString();
+            } else {
+                return label;
+            }
         } else if (desc.getSourceExprs() != null) {
             sb.append("<slot ").append(desc.getId().asInt()).append(">");
             for (Expr expr : desc.getSourceExprs()) {
@@ -190,8 +306,12 @@ public class SlotRef extends Expr {
             }
             return sb.toString();
         } else {
-            return "<slot " + desc.getId().asInt() + ">" + sb.toString();
+            return "<slot " + desc.getId().asInt() + ">";
         }
+    }
+
+    public boolean isColumnRef() {
+        return tblName != null && !isFromLambda();
     }
 
     @Override
@@ -209,20 +329,18 @@ public class SlotRef extends Expr {
 
     @Override
     public String toMySql() {
-        if (col != null) {
-            return col;
-        } else {
-            return "<slot " + Integer.toString(desc.getId().asInt()) + ">";
+        if (label == null) {
+            throw new IllegalArgumentException("should set label for cols in MySQLScanNode. SlotRef: " + debugString());
         }
+        return label;
     }
 
     @Override
-    public String toJDBCSQL(boolean isMySQL) {
-        if (col != null) {
-            return isMySQL ? "`" + col + "`" : col;
-        } else {
-            return "<slot " + Integer.toString(desc.getId().asInt()) + ">";
+    public String toJDBCSQL() {
+        if (label == null) {
+            throw new IllegalArgumentException("should set label for cols in JDBCScanNode. SlotRef: " + debugString());
         }
+        return label;
     }
 
     public TableName getTableName() {
@@ -239,11 +357,6 @@ public class SlotRef extends Expr {
     }
 
     @Override
-    public String toColumnLabel() {
-        return label;
-    }
-
-    @Override
     protected void toThrift(TExprNode msg) {
         msg.node_type = TExprNodeType.SLOT_REF;
         if (desc != null) {
@@ -255,9 +368,23 @@ public class SlotRef extends Expr {
             }
         } else {
             // slot id and tuple id are meaningless here
-            msg.slot_ref = new TSlotRef(0,0);
+            msg.slot_ref = new TSlotRef(0, 0);
         }
 
+        msg.setOutput_column(outputColumn);
+    }
+
+    @Override
+    public void toNormalForm(TExprNode msg, FragmentNormalizer normalizer) {
+        msg.node_type = TExprNodeType.SLOT_REF;
+        if (desc != null) {
+            SlotId slotId = normalizer.isNotRemappingSlotId() ? desc.getId() : normalizer.remapSlotId(desc.getId());
+            // tuple id is meaningless here
+            msg.slot_ref = new TSlotRef(slotId.asInt(), 0);
+        } else {
+            // slot id and tuple id are meaningless here
+            msg.slot_ref = new TSlotRef(0, 0);
+        }
         msg.setOutput_column(outputColumn);
     }
 
@@ -266,11 +393,19 @@ public class SlotRef extends Expr {
         if (desc != null) {
             return desc.getId().hashCode();
         }
-        return Objects.hashCode((tblName == null ? "" : tblName.toSql() + "." + label).toLowerCase());
+        if (usedStructFieldPos != null) {
+            // Means this SlotRef is going to access subfield in StructType
+            return Objects.hashCode((tblName == null ? "" : tblName.toSql() + "." + label).toLowerCase(), usedStructFieldPos);
+        } else {
+            return Objects.hashCode((tblName == null ? "" : tblName.toSql() + "." + label).toLowerCase());
+        }
     }
 
     @Override
     public boolean equals(Object obj) {
+        if (this == obj) {
+            return true;
+        }
         if (!super.equals(obj)) {
             return false;
         }
@@ -286,10 +421,14 @@ public class SlotRef extends Expr {
         if (tblName != null && !tblName.equals(other.tblName)) {
             return false;
         }
-        if ((col == null) != (other.col == null)) {
+        if ((colName == null) != (other.colName == null)) {
             return false;
         }
-        if (col != null && !col.equalsIgnoreCase(other.col)) {
+        if (colName != null && !colName.equalsIgnoreCase(other.colName)) {
+            return false;
+        }
+
+        if (usedStructFieldPos != null && !usedStructFieldPos.equals(other.usedStructFieldPos)) {
             return false;
         }
         return true;
@@ -304,12 +443,15 @@ public class SlotRef extends Expr {
         if (desc != null) {
             return desc.getIsNullable();
         }
-        return true;
+        return nullable;
     }
 
     @Override
     public boolean isBoundByTupleIds(List<TupleId> tids) {
         Preconditions.checkState(desc != null);
+        if (isFromLambda()) {
+            return true;
+        }
         for (TupleId tid : tids) {
             if (tid.equals(desc.getParent().getId())) {
                 return true;
@@ -324,18 +466,6 @@ public class SlotRef extends Expr {
         return desc.getId().equals(slotId);
     }
 
-    @Override
-    public void getIds(List<TupleId> tupleIds, List<SlotId> slotIds) {
-        Preconditions.checkState(type.isValid());
-        Preconditions.checkState(desc != null);
-        if (slotIds != null) {
-            slotIds.add(desc.getId());
-        }
-        if (tupleIds != null) {
-            tupleIds.add(desc.getParent().getId());
-        }
-    }
-
     public Table getTable() {
         Preconditions.checkState(desc != null);
         Table table = desc.getParent().getTable();
@@ -343,19 +473,27 @@ public class SlotRef extends Expr {
     }
 
     public String getColumnName() {
-        return col;
+        return colName;
     }
 
     public void setColumnName(String columnName) {
-        this.col = columnName;
+        this.colName = columnName;
     }
 
-    public void setCol(String col) {
-        this.col = col;
+    public ColumnId getColumnId() {
+        return columnId;
+    }
+
+    public void setColumnId(ColumnId columnId) {
+        this.columnId = columnId;
     }
 
     public String getLabel() {
         return label;
+    }
+
+    public void setLabel(String label) {
+        this.label = label;
     }
 
     @Override
@@ -372,7 +510,7 @@ public class SlotRef extends Expr {
             out.writeBoolean(true);
             tblName.write(out);
         }
-        Text.writeString(out, col);
+        Text.writeString(out, colName);
     }
 
     public void readFields(DataInput in) throws IOException {
@@ -380,7 +518,7 @@ public class SlotRef extends Expr {
             tblName = new TableName();
             tblName.readFields(in);
         }
-        col = Text.readString(in);
+        colName = Text.readString(in);
     }
 
     public static SlotRef read(DataInput in) throws IOException {

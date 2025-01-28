@@ -31,6 +31,8 @@ public:
     RefCountClosure() : _refs(0) {}
     ~RefCountClosure() override = default;
 
+    int count() { return _refs.load(); }
+
     void ref() { _refs.fetch_add(1); }
 
     // If unref() returns true, this object should be delete
@@ -50,5 +52,10 @@ public:
 private:
     std::atomic<int> _refs;
 };
+
+#define WARN_IF_RPC_ERROR(cntl)                                                                                   \
+    if (cntl.Failed()) {                                                                                          \
+        LOG(WARNING) << "brpc failed, error=" << berror(cntl.ErrorCode()) << ", error_text=" << cntl.ErrorText(); \
+    }
 
 } // namespace starrocks

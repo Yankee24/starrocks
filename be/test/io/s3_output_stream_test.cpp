@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "io/s3_output_stream.h"
 
@@ -13,6 +25,7 @@
 
 #include "common/config.h"
 #include "common/logging.h"
+#include "fs/fs_s3.h"
 #include "io/s3_input_stream.h"
 #include "testutil/assert.h"
 
@@ -28,7 +41,7 @@ static void destroy_s3client();
 
 class S3OutputStreamTest : public testing::Test {
 public:
-    S3OutputStreamTest() {}
+    S3OutputStreamTest() = default;
 
     ~S3OutputStreamTest() override = default;
 
@@ -54,12 +67,13 @@ void S3OutputStreamTest::TearDownTestCase() {
 }
 
 void init_s3client() {
-    Aws::Client::ClientConfiguration config;
+    Aws::Client::ClientConfiguration config = S3ClientFactory::getClientConfig();
     config.endpointOverride = config::object_storage_endpoint;
     const char* ak = config::object_storage_access_key_id.c_str();
     const char* sk = config::object_storage_secret_access_key.c_str();
     auto credentials = std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(ak, sk);
-    g_s3client = std::make_shared<Aws::S3::S3Client>(std::move(credentials), std::move(config));
+    g_s3client = std::make_shared<Aws::S3::S3Client>(std::move(credentials), std::move(config),
+                                                     Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never, false);
 }
 
 void init_bucket() {
@@ -124,7 +138,7 @@ TEST_F(S3OutputStreamTest, test_multipart_upload) {
     const char* kObjectName = "test_multipart_upload";
     delete_object(kObjectName);
     S3OutputStream os(g_s3client, kBucketName, kObjectName, 12, /*5MB=*/5 * 1024 * 1024);
-    S3InputStream is(g_s3client, kBucketName, kObjectName);
+    S3InputStream is(g_s3client, kBucketName, kObjectName, /*5MB=*/5 * 1024 * 1024);
 
     std::string s1("first line of multipart upload\n");
     std::string s2("second line of multipart upload\n");

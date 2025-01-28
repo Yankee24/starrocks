@@ -1,29 +1,42 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.common;
 
 import com.google.common.base.Joiner;
+import com.google.common.collect.Maps;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.ParseNode;
-import com.starrocks.analysis.SelectList;
 import com.starrocks.analysis.SlotRef;
-import com.starrocks.analysis.StatementBase;
 import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Table;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
-import com.starrocks.sql.analyzer.AST2SQL;
 import com.starrocks.sql.analyzer.AnalyzerUtils;
+import com.starrocks.sql.analyzer.AstToStringBuilder;
 import com.starrocks.sql.analyzer.Field;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.CTERelation;
 import com.starrocks.sql.ast.FieldReference;
+import com.starrocks.sql.ast.SelectList;
 import com.starrocks.sql.ast.SelectRelation;
+import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.TableRelation;
 import com.starrocks.sql.ast.ViewRelation;
 import com.starrocks.sql.parser.SqlParser;
-import org.spark_project.guava.collect.Maps;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -52,6 +65,7 @@ public class SqlWithIdUtils {
     /**
      * decode sql which use database id and table id
      * warning: table id must before db id e.g. <db 10001>.<table 10002>
+     *
      * @param sql
      * @return StatementBase
      */
@@ -66,7 +80,7 @@ public class SqlWithIdUtils {
             long dbId = Long.parseLong(dbStr.substring(0, dbStr.indexOf(COMMON_SUFFIX)));
             Database db = dbMap.get(dbId);
             if (db == null) {
-                db = GlobalStateMgr.getCurrentState().getDb(dbId);
+                db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbId);
                 if (db == null) {
                     throw new SemanticException("Can not find db id: %s", dbId);
                 }
@@ -76,9 +90,9 @@ public class SqlWithIdUtils {
             long tableId = Long.parseLong(tableStr.substring(7, tableStr.indexOf(COMMON_SUFFIX)));
             Table table = tableMap.get(tableId);
             if (table == null) {
-                table = db.getTable(tableId);
+                table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getId(), tableId);
                 if (table == null) {
-                    throw new SemanticException("Can not find table id: %s in db: %s", tableId, db.getFullName());
+                    throw new SemanticException("Can not find table id: %s in db: %s", tableId, db.getOriginName());
                 }
                 tableMap.put(tableId, table);
             }
@@ -92,10 +106,10 @@ public class SqlWithIdUtils {
         for (Table table : tableMap.values()) {
             sql = sql.replaceAll(TABLE_ID_PREFIX + table.getId() + COMMON_SUFFIX, table.getName());
         }
-        return SqlParser.parse(sql, context.getSessionVariable().getSqlMode()).get(0);
+        return SqlParser.parse(sql, context.getSessionVariable()).get(0);
     }
 
-    private static class SqlEncoderVisitor extends AST2SQL.SQLBuilder {
+    private static class SqlEncoderVisitor extends AstToStringBuilder.AST2StringBuilderVisitor {
 
         private final Map<TableName, Table> tableMap;
         Map<String, Database> databaseMap;
@@ -120,8 +134,8 @@ public class SqlWithIdUtils {
                 sqlBuilder.append("DISTINCT ");
             }
             List<String> selectListString = new ArrayList<>();
-            for (int i = 0; i < stmt.getOutputExpr().size(); ++i) {
-                Expr expr = stmt.getOutputExpr().get(i);
+            for (int i = 0; i < stmt.getOutputExpression().size(); ++i) {
+                Expr expr = stmt.getOutputExpression().get(i);
                 String columnName = stmt.getScope().getRelationFields().getFieldByIndex(i).getName();
 
                 if (expr instanceof FieldReference) {
@@ -168,7 +182,7 @@ public class SqlWithIdUtils {
 
             if (relation.isResolvedInFromClause()) {
                 if (relation.getAlias() != null) {
-                    sqlBuilder.append(" AS ").append(relation.getAlias());
+                    sqlBuilder.append(" AS ").append(relation.getAlias().getTbl());
                 }
                 return sqlBuilder.toString();
             }
@@ -189,7 +203,7 @@ public class SqlWithIdUtils {
             sqlBuilder.append(getTableId(node.getName()));
             if (node.getAlias() != null) {
                 sqlBuilder.append(" AS ");
-                sqlBuilder.append("`").append(node.getAlias()).append("`");
+                sqlBuilder.append("`").append(node.getAlias().getTbl()).append("`");
             }
             return sqlBuilder.toString();
         }
@@ -200,7 +214,7 @@ public class SqlWithIdUtils {
             sqlBuilder.append(getTableId(node.getName()));
             if (node.getAlias() != null) {
                 sqlBuilder.append(" AS ");
-                sqlBuilder.append("`").append(node.getAlias()).append("`");
+                sqlBuilder.append("`").append(node.getAlias().getTbl()).append("`");
             }
             return sqlBuilder.toString();
         }

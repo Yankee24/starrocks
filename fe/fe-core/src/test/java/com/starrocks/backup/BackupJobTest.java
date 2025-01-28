@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/backup/BackupJobTest.java
 
@@ -28,11 +41,15 @@ import com.starrocks.analysis.TableRef;
 import com.starrocks.backup.BackupJob.BackupJobState;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.FsBroker;
+import com.starrocks.catalog.KeysType;
 import com.starrocks.catalog.OlapTable;
+import com.starrocks.catalog.View;
 import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.common.util.UnitTestUtil;
+import com.starrocks.common.util.concurrent.lock.LockManager;
+import com.starrocks.metric.MetricRepo;
 import com.starrocks.persist.EditLog;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.task.AgentBatchTask;
@@ -46,6 +63,7 @@ import com.starrocks.thrift.TFinishTaskRequest;
 import com.starrocks.thrift.TStatus;
 import com.starrocks.thrift.TStatusCode;
 import com.starrocks.thrift.TTaskType;
+import com.starrocks.transaction.GtidGenerator;
 import mockit.Delegate;
 import mockit.Expectations;
 import mockit.Mock;
@@ -70,6 +88,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public class BackupJobTest {
 
     private BackupJob job;
+    private BackupJob jobView;
     private Database db;
 
     private long dbId = 1;
@@ -79,6 +98,7 @@ public class BackupJobTest {
     private long tabletId = 5;
     private long backendId = 10000;
     private long version = 6;
+    private long viewId = 10;
 
     private long repoId = 20000;
     private AtomicLong id = new AtomicLong(50000);
@@ -118,13 +138,15 @@ public class BackupJobTest {
     private EditLog editLog;
 
     private Repository repo = new Repository(repoId, "repo", false, "my_repo",
-            new BlobStorage("broker", Maps.newHashMap()));
+                new BlobStorage("broker", Maps.newHashMap()));
 
     @BeforeClass
     public static void start() {
         Config.tmp_dir = "./";
         File backupDir = new File(BackupHandler.BACKUP_ROOT_DIR.toString());
         backupDir.mkdirs();
+
+        MetricRepo.init();
     }
 
     @AfterClass
@@ -133,31 +155,41 @@ public class BackupJobTest {
         File backupDir = new File(BackupHandler.BACKUP_ROOT_DIR.toString());
         if (backupDir.exists()) {
             Files.walk(BackupHandler.BACKUP_ROOT_DIR,
-                            FileVisitOption.FOLLOW_LINKS).sorted(Comparator.reverseOrder()).map(Path::toFile)
-                    .forEach(File::delete);
+                                    FileVisitOption.FOLLOW_LINKS).sorted(Comparator.reverseOrder()).map(Path::toFile)
+                        .forEach(File::delete);
         }
     }
 
     @Before
     public void setUp() {
-
+        globalStateMgr = GlobalStateMgr.getCurrentState();
         repoMgr = new MockRepositoryMgr();
         backupHandler = new MockBackupHandler(globalStateMgr);
 
         // Thread is unmockable after Jmockit version 1.48, so use reflection to set field instead.
         Deencapsulation.setField(globalStateMgr, "backupHandler", backupHandler);
 
-        db = UnitTestUtil.createDb(dbId, tblId, partId, idxId, tabletId, backendId, version);
+        db = UnitTestUtil.createDb(dbId, tblId, partId, idxId, tabletId, backendId, version, KeysType.AGG_KEYS);
+        View view = UnitTestUtil.createTestView(viewId);
+        db.registerTableUnlocked(view);
+
+        LockManager lockManager = new LockManager();
 
         new Expectations(globalStateMgr) {
             {
-                globalStateMgr.getDb(anyLong);
+                globalStateMgr.getLockManager();
+                minTimes = 0;
+                result = lockManager;
+
+                globalStateMgr.getGtidGenerator();
+                minTimes = 0;
+                result = new GtidGenerator();
+
+                globalStateMgr.getLocalMetastore().getDb(anyLong);
                 minTimes = 0;
                 result = db;
 
-                GlobalStateMgr.getCurrentStateJournalVersion();
-                minTimes = 0;
-                result = FeConstants.meta_version;
+
 
                 globalStateMgr.getNextId();
                 minTimes = 0;
@@ -166,6 +198,18 @@ public class BackupJobTest {
                 globalStateMgr.getEditLog();
                 minTimes = 0;
                 result = editLog;
+
+                globalStateMgr.getLocalMetastore().getTable("testDb", "testTable");
+                minTimes = 0;
+                result = db.getTable(tblId);
+
+                globalStateMgr.getLocalMetastore().getTable("testDb", UnitTestUtil.VIEW_NAME);
+                minTimes = 0;
+                result = db.getTable(viewId);
+
+                globalStateMgr.getLocalMetastore().getTable("testDb", "unknown_tbl");
+                minTimes = 0;
+                result = null;
             }
         };
 
@@ -204,6 +248,10 @@ public class BackupJobTest {
         List<TableRef> tableRefs = Lists.newArrayList();
         tableRefs.add(new TableRef(new TableName(UnitTestUtil.DB_NAME, UnitTestUtil.TABLE_NAME), null));
         job = new BackupJob("label", dbId, UnitTestUtil.DB_NAME, tableRefs, 13600 * 1000, globalStateMgr, repo.getId());
+
+        List<TableRef> viewRefs = Lists.newArrayList();
+        viewRefs.add(new TableRef(new TableName(UnitTestUtil.DB_NAME, UnitTestUtil.VIEW_NAME), null));
+        jobView = new BackupJob("label-view", dbId, UnitTestUtil.DB_NAME, viewRefs, 13600 * 1000, globalStateMgr, repo.getId());
     }
 
     @Test
@@ -219,8 +267,8 @@ public class BackupJobTest {
         OlapTable backupTbl = (OlapTable) backupMeta.getTable(UnitTestUtil.TABLE_NAME);
         List<String> partNames = Lists.newArrayList(backupTbl.getPartitionNames());
         Assert.assertNotNull(backupTbl);
-        Assert.assertEquals(backupTbl.getSignature(BackupHandler.SIGNATURE_VERSION, partNames),
-                ((OlapTable) db.getTable(tblId)).getSignature(BackupHandler.SIGNATURE_VERSION, partNames));
+        Assert.assertEquals(backupTbl.getSignature(BackupHandler.SIGNATURE_VERSION, partNames, true),
+                ((OlapTable) db.getTable(tblId)).getSignature(BackupHandler.SIGNATURE_VERSION, partNames, true));
         Assert.assertEquals(1, AgentTaskQueue.getTaskNum());
         AgentTask task = AgentTaskQueue.getTask(backendId, TTaskType.MAKE_SNAPSHOT, tabletId);
         Assert.assertTrue(task instanceof SnapshotTask);
@@ -237,10 +285,10 @@ public class BackupJobTest {
         snapshotFiles.add("1.dat");
         snapshotFiles.add("1.idx");
         snapshotFiles.add("1.hdr");
-        TStatus task_status = new TStatus(TStatusCode.OK);
+        TStatus taskStatus = new TStatus(TStatusCode.OK);
         TBackend tBackend = new TBackend("", 0, 1);
         TFinishTaskRequest request = new TFinishTaskRequest(tBackend, TTaskType.MAKE_SNAPSHOT,
-                snapshotTask.getSignature(), task_status);
+                    snapshotTask.getSignature(), taskStatus);
         request.setSnapshot_files(snapshotFiles);
         request.setSnapshot_path(snapshotPath);
         Assert.assertTrue(job.finishTabletSnapshotTask(snapshotTask, request));
@@ -271,7 +319,7 @@ public class BackupJobTest {
         Assert.assertEquals(BackupJobState.UPLOADING, job.getState());
         Map<Long, List<String>> tabletFileMap = Maps.newHashMap();
         request = new TFinishTaskRequest(tBackend, TTaskType.UPLOAD,
-                upTask.getSignature(), task_status);
+                    upTask.getSignature(), taskStatus);
         request.setTablet_files(tabletFileMap);
 
         Assert.assertFalse(job.finishSnapshotUploadTask(upTask, request));
@@ -303,14 +351,14 @@ public class BackupJobTest {
         BackupMeta restoreMetaInfo = null;
         BackupJobInfo restoreJobInfo = null;
         try {
-            restoreMetaInfo = BackupMeta.fromFile(job.getLocalMetaInfoFilePath(), -1, -1);
+            restoreMetaInfo = BackupMeta.fromFile(job.getLocalMetaInfoFilePath(), FeConstants.STARROCKS_META_VERSION);
             Assert.assertEquals(1, restoreMetaInfo.getTables().size());
             OlapTable olapTable = (OlapTable) restoreMetaInfo.getTable(tblId);
             Assert.assertNotNull(olapTable);
             Assert.assertNotNull(restoreMetaInfo.getTable(UnitTestUtil.TABLE_NAME));
             List<String> names = Lists.newArrayList(olapTable.getPartitionNames());
-            Assert.assertEquals(((OlapTable) db.getTable(tblId)).getSignature(BackupHandler.SIGNATURE_VERSION, names),
-                    olapTable.getSignature(BackupHandler.SIGNATURE_VERSION, names));
+            Assert.assertEquals(((OlapTable) db.getTable(tblId)).getSignature(BackupHandler.SIGNATURE_VERSION, names, true),
+                    olapTable.getSignature(BackupHandler.SIGNATURE_VERSION, names, true));
 
             restoreJobInfo = BackupJobInfo.fromFile(job.getLocalJobInfoFilePath());
             Assert.assertEquals(UnitTestUtil.DB_NAME, restoreJobInfo.dbName);
@@ -328,6 +376,12 @@ public class BackupJobTest {
         job.run();
         Assert.assertEquals(Status.OK, job.getStatus());
         Assert.assertEquals(BackupJobState.FINISHED, job.getState());
+
+        try {
+            // test get backup info
+            job.getInfo();
+        } catch (Exception ignore) {
+        }
     }
 
     @Test
@@ -341,5 +395,71 @@ public class BackupJobTest {
         job.run();
         Assert.assertEquals(Status.ErrCode.NOT_FOUND, job.getStatus().getErrCode());
         Assert.assertEquals(BackupJobState.CANCELLED, job.getState());
+    }
+
+    @Test
+    public void testRunViewNormal() {
+        // 1.pending
+        Assert.assertEquals(BackupJobState.PENDING, jobView.getState());
+        jobView.run();
+        Assert.assertEquals(Status.OK, jobView.getStatus());
+        Assert.assertEquals(BackupJobState.SNAPSHOTING, jobView.getState());
+
+        BackupMeta backupMeta = jobView.getBackupMeta();
+        Assert.assertEquals(1, backupMeta.getTables().size());
+        View backupView = (View) backupMeta.getTable(UnitTestUtil.VIEW_NAME);
+        Assert.assertTrue(backupView != null);
+        Assert.assertTrue(backupView.getPartitions().isEmpty());
+
+        // 2. snapshoting finished, not snapshot needed
+        jobView.run();
+        Assert.assertEquals(Status.OK, jobView.getStatus());
+        Assert.assertEquals(BackupJobState.UPLOAD_SNAPSHOT, jobView.getState());
+
+        // 3. upload snapshots
+        jobView.run();
+        Assert.assertEquals(Status.OK, jobView.getStatus());
+        Assert.assertEquals(BackupJobState.UPLOADING, jobView.getState());
+
+        // 4. uploading
+        jobView.run();
+        Assert.assertEquals(Status.OK, jobView.getStatus());
+        Assert.assertEquals(BackupJobState.SAVE_META, jobView.getState());
+
+        // 5. save meta
+        jobView.run();
+        Assert.assertEquals(Status.OK, jobView.getStatus());
+        Assert.assertEquals(BackupJobState.UPLOAD_INFO, jobView.getState());
+        File metaInfo = new File(jobView.getLocalMetaInfoFilePath());
+        Assert.assertTrue(metaInfo.exists());
+        File jobInfo = new File(jobView.getLocalJobInfoFilePath());
+        Assert.assertTrue(jobInfo.exists());
+
+        BackupMeta restoreMetaInfo = null;
+        BackupJobInfo restoreJobInfo = null;
+        try {
+            restoreMetaInfo = BackupMeta.fromFile(jobView.getLocalMetaInfoFilePath(), FeConstants.STARROCKS_META_VERSION);
+            Assert.assertEquals(1, restoreMetaInfo.getTables().size());
+            View view = (View) restoreMetaInfo.getTable(viewId);
+            Assert.assertNotNull(view);
+            Assert.assertNotNull(restoreMetaInfo.getTable(UnitTestUtil.VIEW_NAME));
+        } catch (IOException e) {
+            e.printStackTrace();
+            Assert.fail();
+        }
+
+        Assert.assertNull(jobView.getBackupMeta());
+        Assert.assertNull(jobView.getJobInfo());
+
+        // 6. upload_info
+        jobView.run();
+        Assert.assertEquals(Status.OK, jobView.getStatus());
+        Assert.assertEquals(BackupJobState.FINISHED, jobView.getState());
+
+        try {
+            // test get backup info
+            jobView.getInfo();
+        } catch (Exception ignore) {
+        }
     }
 }

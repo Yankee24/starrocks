@@ -1,7 +1,21 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.plan;
 
+import com.starrocks.catalog.Type;
 import com.starrocks.common.ExceptionChecker;
 import com.starrocks.sql.analyzer.SemanticException;
 import org.junit.Assert;
@@ -40,18 +54,31 @@ public class JsonTypeTest extends PlanTestBase {
     @Test
     public void testJoin() {
         ExceptionChecker.expectThrowsWithMsg(SemanticException.class,
-                "Type percentile/hll/bitmap/json not support aggregation/group-by/order-by/union/join",
+                Type.NOT_SUPPORT_JOIN_ERROR_MSG,
                 () -> getFragmentPlan("select * from tjson_test t1 join tjson_test t2 using(v_json)"));
 
         ExceptionChecker.expectThrowsWithMsg(SemanticException.class,
-                "Type percentile/hll/bitmap/json not support aggregation/group-by/order-by/union/join",
+                Type.NOT_SUPPORT_JOIN_ERROR_MSG,
                 () -> getFragmentPlan("select * from tjson_test t1 join tjson_test t2 on t1.v_json = t2.v_json"));
         ExceptionChecker.expectThrowsWithMsg(SemanticException.class,
-                "Type percentile/hll/bitmap/json not support aggregation/group-by/order-by/union/join",
+                Type.NOT_SUPPORT_JOIN_ERROR_MSG,
                 () -> getFragmentPlan("select * from tjson_test t1 join tjson_test t2 on t1.v_json > t2.v_json"));
 
         ExceptionChecker.expectThrowsNoException(
                 () -> getFragmentPlan("select * from tjson_test t1 join tjson_test t2 on t1.v_id = t2.v_id"));
+
+        ExceptionChecker.expectThrowsNoException(
+                () -> getFragmentPlan("select * from tjson_test t1 join tjson_test t2 on" +
+                        " cast(t1.v_json->'a' as int) = cast(t2.v_json->'a' as int)"));
+
+        ExceptionChecker.expectThrowsNoException(
+                () -> getFragmentPlan("select * from tjson_test t1 join tjson_test t2 on" +
+                        " cast(t1.v_json->'a' as int) = cast(t2.v_json->'a' as int) and t1.v_id = t2.v_id"));
+
+        ExceptionChecker.expectThrowsWithMsg(SemanticException.class,
+                Type.NOT_SUPPORT_JOIN_ERROR_MSG,
+                () -> getFragmentPlan("select * from tjson_test t1 join tjson_test t2 on" +
+                        " t1.v_id = t2.v_id and t1.v_json = t2.v_json"));
     }
 
     /**
@@ -68,11 +95,14 @@ public class JsonTypeTest extends PlanTestBase {
         assertPlanContains("select cast(parse_json('1') -> '$.k1' as int) ",
                 "json_query(parse_json('1'), '$.k1')");
         assertPlanContains("select cast(v_json -> '$.k1' as int) from tjson_test",
-                "json_query(2: v_json, '$.k1')");
+                "CAST(get_json_int(2: v_json, '$.k1') AS INT)");
     }
 
     @Test
     public void testPredicateImplicitCast() throws Exception {
+        assertPlanContains("select parse_json('1') between 0.5 and 0.9",
+                "CAST(parse_json('1') AS DOUBLE)");
+
         List<String> operators = Arrays.asList("<", "<=", "=", ">=", "!=");
         for (String operator : operators) {
             assertPlanContains(String.format("select parse_json('1') %s 1", operator),
@@ -85,13 +115,9 @@ public class JsonTypeTest extends PlanTestBase {
                     String.format("parse_json('1') %s CAST(false AS JSON)", operator));
         }
 
-        try {
-            getFragmentPlan("select parse_json('1') in (1, 2, 3)");
-            getFragmentPlan("select parse_json('1') in (parse_json('1'), parse_json('2')");
-            Assert.fail("should throw");
-        } catch (SemanticException e) {
-            Assert.assertEquals("InPredicate of JSON is not supported", e.getMessage());
-        }
+        assertPlanContains("select parse_json('1') in (1, 2, 3)", "IN");
+        assertPlanContains("select parse_json('1') in (parse_json('1'), parse_json('2'))",
+                "parse_json('1') IN (parse_json('1'), parse_json('2'))");
     }
 
     /**
@@ -146,7 +172,7 @@ public class JsonTypeTest extends PlanTestBase {
             ExceptionChecker.expectThrowsWithMsg(
                     SemanticException.class,
                     String.format(
-                            "Invalid type cast from json to %s in sql `v_json`",
+                            "Invalid type cast from json to %s in sql `test.tjson_test.v_json`",
                             notAllowType),
                     () -> getFragmentPlan(columnCastSql)
             );
@@ -169,7 +195,7 @@ public class JsonTypeTest extends PlanTestBase {
     public void testCastJsonArray() throws Exception {
         assertPlanContains("select json_array(parse_json('1'), parse_json('2'))",
                 "json_array(parse_json('1'), parse_json('2'))");
-        assertPlanContains("select json_array(1, 1)", "json_array(3: cast, 3: cast)");
+        assertPlanContains("select json_array(1, 1)", "json_array(CAST(1 AS JSON), CAST(1 AS JSON))");
         assertPlanContains("select json_array(1, '1')", "json_array(CAST(1 AS JSON), CAST('1' AS JSON))");
         assertPlanContains("select json_array(1.1)", "json_array(CAST(1.1 AS JSON))");
         assertPlanContains("select json_array(NULL)", "NULL");
@@ -181,10 +207,57 @@ public class JsonTypeTest extends PlanTestBase {
         assertPlanContains("select json_array(1, NULL)",
                 "json_array(CAST(1 AS JSON), NULL)");
         assertPlanContains("select json_array(1, '1', true, false, 1.1, null)",
-                "json_array(CAST(1 AS JSON), CAST('1' AS JSON), CAST(TRUE AS JSON), CAST(FALSE AS JSON), CAST(1.1 AS JSON), NULL)");
+                "json_array(CAST(1 AS JSON), CAST('1' AS JSON), CAST(TRUE AS JSON), " +
+                        "CAST(FALSE AS JSON), CAST(1.1 AS JSON), NULL)");
 
         assertPlanContains(
                 "select json_array(v_smallint, v_tinyint, v_int, v_boolean, v_double, v_varchar) from tjson_test",
-                "json_array(CAST(3: v_SMALLINT AS JSON), CAST(4: v_TINYINT AS JSON), CAST(5: v_INT AS JSON), CAST(8: v_BOOLEAN AS JSON), CAST(9: v_DOUBLE AS JSON), CAST(11: v_VARCHAR AS JSON))");
+                "json_array(CAST(3: v_SMALLINT AS JSON), CAST(4: v_TINYINT AS JSON), " +
+                        "CAST(5: v_INT AS JSON), CAST(8: v_BOOLEAN AS JSON), " +
+                        "CAST(9: v_DOUBLE AS JSON), CAST(11: v_VARCHAR AS JSON))");
+    }
+
+    @Test
+    public void testCastJsonToArray() throws Exception {
+        assertPlanContains("select cast(json_array(1,2,3) as array<int>)",
+                "CAST(json_array(CAST(1 AS JSON), CAST(2 AS JSON), CAST(3 AS JSON)) AS ARRAY<INT>)");
+        assertPlanContains("select cast(json_array(1,2,3) as array<varchar>)",
+                "CAST(json_array(CAST(1 AS JSON), CAST(2 AS JSON), CAST(3 AS JSON)) AS ARRAY<VARCHAR>)");
+        assertPlanContains("select cast(json_array(1,2,3) as array<JSON>)",
+                "CAST(json_array(CAST(1 AS JSON), CAST(2 AS JSON), CAST(3 AS JSON)) AS ARRAY<JSON>)");
+
+        // Multi-dimension array casting is not supported
+        assertExceptionMsgContains("select cast(json_array(1,2,3) as array<array<int>>)",
+                "Getting analyzing error from line 1, column 7 to line 1, column 50. Detail message: " +
+                        "Invalid type cast from json to array<array<int(11)>> in sql `json_array(1, 2, 3)`.");
+    }
+
+    @Test
+    public void testFlatJsonMeta() throws Exception {
+        String sql = "select flat_json_meta(v_json) from tjson_test[_META_]";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "  1:AGGREGATE (update serialize)\n" +
+                "  |  STREAMING\n" +
+                "  |  group by: flat_json_meta");
+
+        sql = "select flat_json_meta(v_json), count(1) from tjson_test[_META_]";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "  1:AGGREGATE (update serialize)\n" +
+                "  |  STREAMING\n" +
+                "  |  output: count(1)\n" +
+                "  |  group by: flat_json_meta");
+
+        sql = "select array_join(flat_json_meta(v_json), ', '), count(1) from tjson_test[_META_]";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "array_join(14: flat_json_meta, ', ')");
+
+        Assert.assertThrows(SemanticException.class, () -> getFragmentPlan(
+                "select flat_json_meta(12) from tjson_test[_META_]"));
+
+        Assert.assertThrows(SemanticException.class, () -> getFragmentPlan(
+                "select flat_json_meta(v_json) from tjson_test[_META_] group by v_INT"));
+
+        Assert.assertThrows(SemanticException.class, () -> getFragmentPlan(
+                "select flat_json_meta(json_query(v_json, '$.v1')) from tjson_test[_META_]"));
     }
 }

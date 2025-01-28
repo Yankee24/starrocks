@@ -1,196 +1,131 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "formats/parquet/column_reader.h"
 
-#include "column/array_column.h"
-#include "exec/vectorized/hdfs_scanner.h"
-#include "formats/parquet/stored_column_reader.h"
-#include "util/runtime_profile.h"
+#include <glog/logging.h>
 
-namespace starrocks {
-class RandomAccessFile;
-}
+#include <algorithm>
+#include <ostream>
+#include <unordered_map>
+#include <utility>
+
+#include "column/chunk.h"
+#include "column/column_helper.h"
+#include "column/nullable_column.h"
+#include "common/compiler_util.h"
+#include "exec/exec_node.h"
+#include "exec/hdfs_scanner.h"
+#include "formats/parquet/scalar_column_reader.h"
+#include "formats/utils.h"
+#include "gen_cpp/parquet_types.h"
+#include "simd/batch_run_counter.h"
+#include "storage/column_or_predicate.h"
+#include "storage/column_predicate.h"
 
 namespace starrocks::parquet {
 
-template <typename TOffset, typename TIsNull>
-static void def_rep_to_offset(const LevelInfo& level_info, const level_t* def_levels, const level_t* rep_levels,
-                              size_t num_levels, TOffset* offsets, TIsNull* is_nulls, size_t* num_offsets,
-                              bool* has_null) {
-    size_t offset_pos = 0;
-    for (int i = 0; i < num_levels; ++i) {
-        // when def_level is less than immediate_repeated_ancestor_def_level, it means that level
-        // will affect its ancestor.
-        // when rep_level is greater than max_rep_level, this means that level affects its
-        // descendants.
-        // So we can skip this levels
-        if (def_levels[i] < level_info.immediate_repeated_ancestor_def_level ||
-            rep_levels[i] > level_info.max_rep_level) {
-            continue;
+Status ColumnDictFilterContext::rewrite_conjunct_ctxs_to_predicate(StoredColumnReader* reader,
+                                                                   bool* is_group_filtered) {
+    // create dict value chunk for evaluation.
+    ColumnPtr dict_value_column = ColumnHelper::create_column(TypeDescriptor(TYPE_VARCHAR), true);
+    RETURN_IF_ERROR(reader->get_dict_values(dict_value_column.get()));
+    // append a null value to check if null is ok or not.
+    dict_value_column->append_default();
+
+    ColumnPtr result_column = dict_value_column;
+    for (int32_t i = sub_field_path.size() - 1; i >= 0; i--) {
+        if (!result_column->is_nullable()) {
+            result_column =
+                    NullableColumn::create(std::move(result_column), NullColumn::create(result_column->size(), 0));
         }
-        if (rep_levels[i] == level_info.max_rep_level) {
-            offsets[offset_pos]++;
-            continue;
-        }
-
-        offset_pos++;
-        offsets[offset_pos] = offsets[offset_pos - 1];
-        if (def_levels[i] >= level_info.max_def_level) {
-            offsets[offset_pos]++;
-        }
-
-        // when def_level equals with max_def_level, this is a non null element or a required element
-        // when def_level equals with (max_def_level - 1), this indicates an empty array
-        // when def_level less than (max_def_level - 1) it means this array is null
-        if (def_levels[i] >= level_info.max_def_level - 1) {
-            is_nulls[offset_pos - 1] = 0;
-        } else {
-            is_nulls[offset_pos - 1] = 1;
-            *has_null = true;
-        }
-    }
-    *num_offsets = offset_pos;
-}
-
-class ScalarColumnReader : public ColumnReader {
-public:
-    explicit ScalarColumnReader(ColumnReaderOptions opts) : _opts(std::move(opts)) {}
-    ~ScalarColumnReader() override = default;
-
-    Status init(int chunk_size, RandomAccessFile* file, const ParquetField* field,
-                const tparquet::ColumnChunk* chunk_metadata, const TypeDescriptor& col_type) {
-        StoredColumnReaderOptions opts;
-        opts.stats = _opts.stats;
-
-        RETURN_IF_ERROR(ColumnConverterFactory::create_converter(*field, col_type, _opts.timezone, &converter));
-
-        return StoredColumnReader::create(file, field, chunk_metadata, opts, chunk_size, &_reader);
+        Columns columns;
+        columns.emplace_back(result_column);
+        std::vector<std::string> field_names;
+        field_names.emplace_back(sub_field_path[i]);
+        result_column = StructColumn::create(std::move(columns), std::move(field_names));
     }
 
-    Status prepare_batch(size_t* num_records, ColumnContentType content_type, vectorized::Column* dst) override {
-        if (!converter->need_convert) {
-            return _reader->read_records(num_records, content_type, dst);
-        } else {
-            SCOPED_RAW_TIMER(&_opts.stats->column_convert_ns);
-            auto column = converter->create_src_column();
+    ChunkPtr dict_value_chunk = std::make_shared<Chunk>();
+    dict_value_chunk->append_column(result_column, slot_id);
+    Filter filter(dict_value_column->size(), 1);
+    int dict_values_after_filter = 0;
+    ASSIGN_OR_RETURN(dict_values_after_filter,
+                     ExecNode::eval_conjuncts_into_filter(conjunct_ctxs, dict_value_chunk.get(), &filter));
 
-            Status status = _reader->read_records(num_records, content_type, column.get());
-            if (!status.ok() && !status.is_end_of_file()) {
-                return status;
-            }
-
-            RETURN_IF_ERROR(converter->convert(column, dst));
-
-            return Status::OK();
-        }
-    }
-
-    Status finish_batch() override { return Status::OK(); }
-
-    void get_levels(level_t** def_levels, level_t** rep_levels, size_t* num_levels) override {
-        _reader->get_levels(def_levels, rep_levels, num_levels);
-    }
-
-    Status get_dict_values(vectorized::Column* column) override { return _reader->get_dict_values(column); }
-
-    Status get_dict_values(const std::vector<int32_t>& dict_codes, vectorized::Column* column) override {
-        return _reader->get_dict_values(dict_codes, column);
-    }
-
-    Status get_dict_codes(const std::vector<Slice>& dict_values, std::vector<int32_t>* dict_codes) override {
-        return _reader->get_dict_codes(dict_values, dict_codes);
-    }
-
-private:
-    ColumnReaderOptions _opts;
-
-    std::unique_ptr<StoredColumnReader> _reader;
-};
-
-class ListColumnReader : public ColumnReader {
-public:
-    explicit ListColumnReader(ColumnReaderOptions opts) : _opts(std::move(opts)) {}
-    ~ListColumnReader() override = default;
-
-    Status init(const ParquetField* field, std::unique_ptr<ColumnReader> element_reader) {
-        _field = field;
-        _element_reader = std::move(element_reader);
+    // dict column is empty after conjunct eval, file group can be skipped
+    if (dict_values_after_filter == 0) {
+        *is_group_filtered = true;
         return Status::OK();
     }
 
-    Status prepare_batch(size_t* num_records, ColumnContentType content_type, vectorized::Column* dst) override {
-        vectorized::NullableColumn* nullable_column = nullptr;
-        vectorized::ArrayColumn* array_column = nullptr;
-        if (_field->is_nullable) {
-            DCHECK(dst->is_nullable());
-            nullable_column = down_cast<vectorized::NullableColumn*>(dst);
-            DCHECK(nullable_column->mutable_data_column()->is_array());
-            array_column = down_cast<vectorized::ArrayColumn*>(nullable_column->mutable_data_column());
+    // ---------
+    // get dict codes according to dict values pos.
+    std::vector<int32_t> dict_codes;
+    BatchRunCounter<32> batch_run(filter.data(), 0, filter.size() - 1);
+    BatchCount batch = batch_run.next_batch();
+    int index = 0;
+    while (batch.length > 0) {
+        if (batch.AllSet()) {
+            for (int32_t i = 0; i < batch.length; i++) {
+                dict_codes.emplace_back(index + i);
+            }
+        } else if (batch.NoneSet()) {
+            // do nothing
         } else {
-            DCHECK(dst->is_array());
-            array_column = down_cast<vectorized::ArrayColumn*>(dst);
+            for (int32_t i = 0; i < batch.length; i++) {
+                if (filter[index + i]) {
+                    dict_codes.emplace_back(index + i);
+                }
+            }
         }
-        auto* child_column = array_column->elements_column().get();
-        auto st = _element_reader->prepare_batch(num_records, content_type, child_column);
-
-        level_t* def_levels = nullptr;
-        level_t* rep_levels = nullptr;
-        size_t num_levels = 0;
-        _element_reader->get_levels(&def_levels, &rep_levels, &num_levels);
-
-        auto& offsets = array_column->offsets_column()->get_data();
-        offsets.resize(num_levels + 1);
-        vectorized::NullColumn null_column(num_levels);
-        auto& is_nulls = null_column.get_data();
-        size_t num_offsets = 0;
-        bool has_null = false;
-        def_rep_to_offset(_field->level_info, def_levels, rep_levels, num_levels, &offsets[0], &is_nulls[0],
-                          &num_offsets, &has_null);
-        offsets.resize(num_offsets + 1);
-        is_nulls.resize(num_offsets);
-
-        if (_field->is_nullable) {
-            DCHECK(dst->is_nullable());
-            DCHECK(nullable_column != nullptr);
-            nullable_column->mutable_null_column()->swap_column(null_column);
-            nullable_column->set_has_null(has_null);
-        }
-
-        return st;
+        index += batch.length;
+        batch = batch_run.next_batch();
     }
 
-    Status finish_batch() override { return Status::OK(); }
+    bool null_is_ok = filter[filter.size() - 1] == 1;
 
-    void get_levels(level_t** def_levels, level_t** rep_levels, size_t* num_levels) override {
-        _element_reader->get_levels(def_levels, rep_levels, num_levels);
-    }
-
-private:
-    ColumnReaderOptions _opts;
-
-    const ParquetField* _field = nullptr;
-    std::unique_ptr<ColumnReader> _element_reader;
-};
-
-Status ColumnReader::create(RandomAccessFile* file, const ParquetField* field, const tparquet::RowGroup& row_group,
-                            const TypeDescriptor& col_type, const ColumnReaderOptions& opts, int chunk_size,
-                            std::unique_ptr<ColumnReader>* output) {
-    if (field->type.type == TYPE_MAP || field->type.type == TYPE_STRUCT) {
-        return Status::InternalError("not supported type");
-    }
-    if (field->type.type == TYPE_ARRAY) {
-        std::unique_ptr<ColumnReader> child_reader;
-        RETURN_IF_ERROR(ColumnReader::create(file, &field->children[0], row_group, col_type.children[0], opts,
-                                             chunk_size, &child_reader));
-        std::unique_ptr<ListColumnReader> reader(new ListColumnReader(opts));
-        RETURN_IF_ERROR(reader->init(field, std::move(child_reader)));
-        *output = std::move(reader);
+    // eq predicate is faster than in predicate
+    // TODO: improve not eq and not in
+    if (dict_codes.size() == 0) {
+        predicate = nullptr;
+    } else if (dict_codes.size() == 1) {
+        predicate = obj_pool.add(
+                new_column_eq_predicate(get_type_info(kDictCodeFieldType), slot_id, std::to_string(dict_codes[0])));
     } else {
-        std::unique_ptr<ScalarColumnReader> reader(new ScalarColumnReader(opts));
-        RETURN_IF_ERROR(
-                reader->init(chunk_size, file, field, &row_group.columns[field->physical_column_index], col_type));
-        *output = std::move(reader);
+        predicate = obj_pool.add(new_dictionary_code_in_predicate(get_type_info(kDictCodeFieldType), slot_id,
+                                                                  dict_codes, dict_value_column->size()));
     }
+
+    // deal with if NULL works or not.
+    if (null_is_ok) {
+        ColumnPredicate* result = nullptr;
+        ColumnPredicate* is_null_pred =
+                obj_pool.add(new_column_null_predicate(get_type_info(kDictCodeFieldType), slot_id, true));
+
+        if (predicate != nullptr) {
+            ColumnOrPredicate* or_pred =
+                    obj_pool.add(new ColumnOrPredicate(get_type_info(kDictCodeFieldType), slot_id));
+            or_pred->add_child(predicate);
+            or_pred->add_child(is_null_pred);
+            result = or_pred;
+        } else {
+            result = is_null_pred;
+        }
+        predicate = result;
+    }
+
     return Status::OK();
 }
 

@@ -55,13 +55,17 @@ bool BufferedOutputStream::Next(void** buffer, int* size) {
 
 void BufferedOutputStream::BackUp(int count) {
     if (count >= 0) {
-        uint64_t unsignedCount = static_cast<uint64_t>(count);
+        auto unsignedCount = static_cast<uint64_t>(count);
         if (unsignedCount <= dataBuffer->size()) {
             dataBuffer->resize(dataBuffer->size() - unsignedCount);
         } else {
             throw std::logic_error("Can't backup that much!");
         }
     }
+}
+
+void BufferedOutputStream::finishStream() {
+    // PASS
 }
 
 google::protobuf::int64 BufferedOutputStream::ByteCount() const {
@@ -91,6 +95,10 @@ uint64_t BufferedOutputStream::flush() {
     outputStream->write(dataBuffer->data(), dataSize);
     dataBuffer->resize(0);
     return dataSize;
+}
+
+void BufferedOutputStream::suppress() {
+    dataBuffer->resize(0);
 }
 
 void AppendOnlyBufferedStream::write(const char* data, size_t size) {
@@ -123,7 +131,7 @@ uint64_t AppendOnlyBufferedStream::flush() {
 
 void AppendOnlyBufferedStream::recordPosition(PositionRecorder* recorder) const {
     uint64_t flushedSize = outStream->getSize();
-    uint64_t unflushedSize = static_cast<uint64_t>(bufferOffset);
+    auto unflushedSize = static_cast<uint64_t>(bufferOffset);
     if (outStream->isCompressed()) {
         // start of the compression chunk in the stream
         recorder->add(flushedSize);

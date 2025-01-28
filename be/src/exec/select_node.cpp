@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/exec/select_node.cpp
 
@@ -25,14 +38,12 @@
 #include "exec/pipeline/pipeline_builder.h"
 #include "exec/pipeline/select_operator.h"
 #include "exprs/expr.h"
-#include "gen_cpp/PlanNodes_types.h"
-#include "runtime/raw_value.h"
 #include "runtime/runtime_state.h"
 
 namespace starrocks {
 
 SelectNode::SelectNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs)
-        : ExecNode(pool, tnode, descs), _child_eos(false) {}
+        : ExecNode(pool, tnode, descs) {}
 
 SelectNode::~SelectNode() {
     if (runtime_state() != nullptr) {
@@ -40,11 +51,21 @@ SelectNode::~SelectNode() {
     }
 }
 
+Status SelectNode::init(const TPlanNode& tnode, RuntimeState* state) {
+    RETURN_IF_ERROR(ExecNode::init(tnode, state));
+    if (tnode.__isset.select_node && tnode.select_node.__isset.common_slot_map) {
+        for (const auto& [key, val] : tnode.select_node.common_slot_map) {
+            ExprContext* context;
+            RETURN_IF_ERROR(Expr::create_expr_tree(_pool, val, &context, state, true));
+            _common_expr_ctxs.insert({key, context});
+        }
+    }
+    return Status::OK();
+}
+
 Status SelectNode::prepare(RuntimeState* state) {
     RETURN_IF_ERROR(ExecNode::prepare(state));
-    if (use_vectorized()) {
-        _conjunct_evaluate_timer = ADD_TIMER(_runtime_profile, "ConjunctEvaluateTime");
-    }
+    _conjunct_evaluate_timer = ADD_TIMER(_runtime_profile, "ConjunctEvaluateTime");
     return Status::OK();
 }
 
@@ -87,11 +108,11 @@ Status SelectNode::get_next(RuntimeState* state, ChunkPtr* chunk, bool* eos) {
     return Status::OK();
 }
 
-Status SelectNode::close(RuntimeState* state) {
+void SelectNode::close(RuntimeState* state) {
     if (is_closed()) {
-        return Status::OK();
+        return;
     }
-    return ExecNode::close(state);
+    ExecNode::close(state);
 }
 
 pipeline::OpFactories SelectNode::decompose_to_pipeline(pipeline::PipelineBuilderContext* context) {
@@ -99,8 +120,8 @@ pipeline::OpFactories SelectNode::decompose_to_pipeline(pipeline::PipelineBuilde
 
     OpFactories operators = _children[0]->decompose_to_pipeline(context);
 
-    operators.emplace_back(
-            std::make_shared<SelectOperatorFactory>(context->next_operator_id(), id(), std::move(_conjunct_ctxs)));
+    operators.emplace_back(std::make_shared<SelectOperatorFactory>(
+            context->next_operator_id(), id(), std::move(_conjunct_ctxs), std::move(_common_expr_ctxs)));
 
     // Create a shared RefCountedRuntimeFilterCollector
     auto&& rc_rf_probe_collector = std::make_shared<RcRfProbeCollector>(1, std::move(this->runtime_filter_collector()));

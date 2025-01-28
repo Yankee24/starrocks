@@ -1,15 +1,26 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021 StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "util/json.h"
 
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <vector>
 
-#include "column/column.h"
 #include "common/status.h"
 #include "common/statusor.h"
-#include "gutil/strings/escaping.h"
-#include "gutil/strings/substitute.h"
 #include "simdjson.h"
 #include "util/json_converter.h"
 #include "velocypack/ValueType.h"
@@ -17,22 +28,55 @@
 
 namespace starrocks {
 
-Status JsonValue::parse(const Slice& src, JsonValue* out) {
+static bool is_json_start_char(char ch) {
+    return ch == '{' || ch == '[' || ch == '"';
+}
+
+StatusOr<JsonValue> JsonValue::parse_json_or_string(const Slice& src) {
+    if (src.size > kJSONLengthLimit) {
+        return Status::NotSupported("JSON string exceed maximum length 16MB");
+    }
     try {
         if (src.empty()) {
-            *out = JsonValue(noneJsonSlice());
-            return Status::OK();
+            return JsonValue(emptyStringJsonSlice());
         }
-        auto b = vpack::Parser::fromJson(src.get_data(), src.get_size());
-        out->assign(*b);
+        // Check the first character for its type
+        auto end = src.get_data() + src.get_size();
+        auto iter = std::find_if_not(src.get_data(), end, std::iswspace);
+        if (iter != end && is_json_start_char(*iter)) {
+            // Parse it as an object or array
+            auto b = vpack::Parser::fromJson(src.get_data(), src.get_size());
+            JsonValue res;
+            res.assign(*b);
+            return res;
+        } else {
+            // Consider it as a sub-type string
+            return from_string(src);
+        }
     } catch (const vpack::Exception& e) {
         return fromVPackException(e);
     }
     return Status::OK();
 }
 
+Status JsonValue::parse(const Slice& src, JsonValue* out) {
+    ASSIGN_OR_RETURN(auto json_value, parse_json_or_string(src));
+    *out = std::move(json_value);
+    return {};
+}
+
+StatusOr<JsonValue> JsonValue::parse(const Slice& src) {
+    JsonValue json;
+    RETURN_IF_ERROR(parse(src, &json));
+    return json;
+}
+
 JsonValue JsonValue::from_null() {
     return JsonValue(nullJsonSlice());
+}
+
+JsonValue JsonValue::from_none() {
+    return JsonValue(noneJsonSlice());
 }
 
 JsonValue JsonValue::from_int(int64_t value) {
@@ -71,12 +115,6 @@ StatusOr<JsonValue> JsonValue::from_simdjson(simdjson::ondemand::value* value) {
 
 StatusOr<JsonValue> JsonValue::from_simdjson(simdjson::ondemand::object* obj) {
     return convert_from_simdjson(*obj);
-}
-
-StatusOr<JsonValue> JsonValue::parse(const Slice& src) {
-    JsonValue json;
-    RETURN_IF_ERROR(parse(src, &json));
-    return json;
 }
 
 size_t JsonValue::serialize(uint8_t* dst) const {
@@ -138,18 +176,18 @@ static int sliceCompare(const vpack::Slice& left, const vpack::Slice& right) {
                 return 1;
             }
         }
-        return 0;
+        return left.length() - right.length();
     } else if (left.isArray() && right.isArray()) {
-        int idx = 0;
-        for (auto it : vpack::ArrayIterator(left)) {
-            auto sub = right.at(idx);
-            if (!sub.isNone()) {
-                int x = sliceCompare(it, sub);
-                if (x != 0) {
-                    return x;
-                }
+        if (left.length() != right.length()) {
+            return left.length() - right.length();
+        }
+        for (size_t i = 0; i < left.length(); i++) {
+            auto left_item = left.at(i);
+            auto right_item = right.at(i);
+            int x = sliceCompare(left_item, right_item);
+            if (x != 0) {
+                return x;
             }
-            idx++;
         }
         return 0;
     } else if (vpack::valueTypeGroup(left.type()) == vpack::valueTypeGroup(right.type())) {
@@ -254,8 +292,27 @@ StatusOr<Slice> JsonValue::get_string() const {
     });
 }
 
+StatusOr<JsonValue> JsonValue::get_obj(const std::string& key) const {
+    return callVPack<JsonValue>([this, &key]() {
+        auto ss = to_vslice().get(key);
+        return JsonValue(ss);
+    });
+}
+
 bool JsonValue::is_null() const {
     return to_vslice().isNull();
+}
+
+bool JsonValue::is_none() const {
+    return to_vslice().isNone();
+}
+
+bool JsonValue::is_null_or_none() const {
+    return is_null() || is_none();
+}
+
+bool JsonValue::is_invalid() const {
+    return binary_.empty();
 }
 
 std::ostream& operator<<(std::ostream& os, const JsonValue& json) {

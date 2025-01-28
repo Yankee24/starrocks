@@ -1,196 +1,383 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.statistic;
 
 import com.google.common.base.Preconditions;
+import com.google.common.base.Stopwatch;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
-import com.starrocks.analysis.StatementBase;
-import com.starrocks.catalog.Column;
+import com.starrocks.catalog.ColumnId;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.catalog.OlapTable;
-import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Table;
-import com.starrocks.cluster.ClusterNamespace;
-import com.starrocks.common.DdlException;
+import com.starrocks.catalog.Type;
+import com.starrocks.common.AuditLog;
+import com.starrocks.common.Config;
+import com.starrocks.common.FeConstants;
 import com.starrocks.common.Pair;
 import com.starrocks.common.Status;
+import com.starrocks.common.util.DebugUtil;
+import com.starrocks.common.util.UUIDUtil;
+import com.starrocks.connector.RemoteFilesSampleStrategy;
+import com.starrocks.connector.statistics.StatisticsUtils;
+import com.starrocks.planner.ScanNode;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.qe.Coordinator;
-import com.starrocks.qe.OriginStatement;
-import com.starrocks.qe.QeProcessorImpl;
-import com.starrocks.qe.QueryState;
-import com.starrocks.qe.RowBatch;
 import com.starrocks.qe.StmtExecutor;
 import com.starrocks.server.GlobalStateMgr;
-import com.starrocks.sql.analyzer.Analyzer;
-import com.starrocks.sql.analyzer.AnalyzerUtils;
-import com.starrocks.sql.ast.QueryStatement;
-import com.starrocks.sql.optimizer.OptExpression;
-import com.starrocks.sql.optimizer.Optimizer;
-import com.starrocks.sql.optimizer.base.ColumnRefFactory;
-import com.starrocks.sql.optimizer.base.ColumnRefSet;
-import com.starrocks.sql.optimizer.base.PhysicalPropertySet;
-import com.starrocks.sql.optimizer.transformer.LogicalPlan;
-import com.starrocks.sql.optimizer.transformer.RelationTransformer;
+import com.starrocks.sql.StatementPlanner;
+import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.common.ErrorType;
+import com.starrocks.sql.common.MetaUtils;
+import com.starrocks.sql.common.StarRocksPlannerException;
+import com.starrocks.sql.parser.SqlParser;
 import com.starrocks.sql.plan.ExecPlan;
-import com.starrocks.sql.plan.PlanFragmentBuilder;
+import com.starrocks.thrift.THdfsFileFormat;
+import com.starrocks.thrift.THdfsScanRange;
 import com.starrocks.thrift.TResultBatch;
+import com.starrocks.thrift.TResultSinkType;
 import com.starrocks.thrift.TStatisticData;
-import org.apache.commons.lang.StringUtils;
+import com.starrocks.thrift.TStatusCode;
+import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.ListUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.thrift.TDeserializer;
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TCompactProtocol;
-import org.apache.velocity.VelocityContext;
-import org.apache.velocity.app.VelocityEngine;
+import org.jetbrains.annotations.NotNull;
 
-import java.io.StringWriter;
 import java.nio.ByteBuffer;
-import java.nio.charset.CharsetDecoder;
-import java.nio.charset.StandardCharsets;
-import java.text.MessageFormat;
+import java.time.LocalDateTime;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 public class StatisticExecutor {
     private static final Logger LOG = LogManager.getLogger(StatisticExecutor.class);
+    private static final Set<THdfsFileFormat> SUPPORTED_FORMAT = ImmutableSet.of(THdfsFileFormat.PARQUET);
 
-    private static final int STATISTIC_DATA_VERSION = 1;
-    private static final int STATISTIC_DICT_VERSION = 101;
+    private static final Predicate<THdfsScanRange> FORMAT_CHECKER = x -> x.isSetFile_format() &&
+            SUPPORTED_FORMAT.contains(x.getFile_format());
 
-    private static final String QUERY_STATISTIC_TEMPLATE =
-            "SELECT cast(" + STATISTIC_DATA_VERSION + " as INT), update_time, db_id, table_id, column_name,"
-                    + " row_count, data_size, distinct_count, null_count, max, min"
-                    + " FROM " + Constants.StatisticsTableName
-                    + " WHERE 1 = 1";
-
-    private static final String INSERT_STATISTIC_TEMPLATE = "INSERT INTO " + Constants.StatisticsTableName;
-
-    private static final String INSERT_SELECT_FULL_TEMPLATE =
-            "SELECT $tableId, '$columnName', $dbId, '$tableName', '$dbName', COUNT(1), "
-                    + "$dataSize, $countDistinctFunction, $countNullFunction, $maxFunction, $minFunction, NOW() "
-                    + "FROM $tableName";
-
-    private static final String INSERT_SELECT_METRIC_SAMPLE_TEMPLATE =
-            "SELECT $tableId, '$columnName', $dbId, '$tableName', '$dbName', COUNT(1) * $ratio, "
-                    + "$dataSize * $ratio, 0, 0, '', '', NOW() "
-                    + "FROM (SELECT `$columnName` FROM $tableName $hints ) as t";
-
-    private static final String INSERT_SELECT_TYPE_SAMPLE_TEMPLATE =
-            "SELECT $tableId, '$columnName', $dbId, '$tableName', '$dbName', IFNULL(SUM(t1.count), 0) * $ratio, "
-                    + "       $dataSize * $ratio, $countDistinctFunction, "
-                    + "       IFNULL(SUM(IF(t1.`$columnName` IS NULL, t1.count, 0)), 0) * $ratio, "
-                    + "       IFNULL(MAX(t1.`$columnName`), ''), IFNULL(MIN(t1.`$columnName`), ''), NOW() "
-                    + "FROM ( "
-                    + "    SELECT t0.`$columnName`, COUNT(1) as count "
-                    + "    FROM (SELECT `$columnName` FROM $tableName $hints) as t0 "
-                    + "    GROUP BY t0.`$columnName` "
-                    + ") as t1";
-
-    private static final String DELETE_TEMPLATE = "DELETE FROM " + Constants.StatisticsTableName + " WHERE ";
-
-    private static final String SELECT_EXPIRE_TABLE_TEMPLATE =
-            "SELECT DISTINCT table_id" + " FROM " + Constants.StatisticsTableName + " WHERE 1 = 1 ";
-
-    private static final VelocityEngine DEFAULT_VELOCITY_ENGINE;
-
-    static {
-        DEFAULT_VELOCITY_ENGINE = new VelocityEngine();
-        // close velocity log
-        DEFAULT_VELOCITY_ENGINE.setProperty(VelocityEngine.RUNTIME_LOG_REFERENCE_LOG_INVALID, false);
-        DEFAULT_VELOCITY_ENGINE.setProperty(VelocityEngine.RUNTIME_LOG_LOGSYSTEM_CLASS,
-                "org.apache.velocity.runtime.log.Log4JLogChute");
-        DEFAULT_VELOCITY_ENGINE.setProperty("runtime.log.logsystem.log4j.logger", "velocity");
+    public List<TStatisticData> queryStatisticSync(ConnectContext context, String tableUUID, Table table,
+                                                   List<String> columnNames) {
+        if (table == null) {
+            // Statistical information query is an unlocked operation,
+            // so it is possible for the table to be deleted while the code is running
+            return Collections.emptyList();
+        }
+        List<Type> columnTypes = Lists.newArrayList();
+        for (String colName : columnNames) {
+            columnTypes.add(StatisticUtils.getQueryStatisticsColumnType(table, colName));
+        }
+        String sql = StatisticSQLBuilder.buildQueryExternalFullStatisticsSQL(tableUUID, columnNames, columnTypes);
+        return executeStatisticDQL(context, sql);
     }
 
-    public List<TStatisticData> queryStatisticSync(Long dbId, Long tableId, List<String> columnNames) throws Exception {
-        String sql = buildQuerySQL(dbId, tableId, columnNames);
-        Map<String, Database> dbs = Maps.newHashMap();
-
-        ConnectContext context = StatisticUtils.buildConnectContext();
-        StatementBase parsedStmt;
-        try {
-            parsedStmt = parseSQL(sql, context);
-            if (parsedStmt instanceof QueryStatement) {
-                dbs = AnalyzerUtils.collectAllDatabase(context, parsedStmt);
-            }
-        } catch (Exception e) {
-            LOG.warn("Parse statistic table query fail.", e);
-            throw e;
+    public List<TStatisticData> queryStatisticSync(ConnectContext context, Long dbId, Long tableId,
+                                                   List<String> columnNames) {
+        BasicStatsMeta meta = GlobalStateMgr.getCurrentState().getAnalyzeMgr().getTableBasicStatsMeta(tableId);
+        // TODO: remove this hack
+        Table table = lookupTable(dbId, tableId);
+        if (table == null) {
+            // Statistical information query is an unlocked operation,
+            // so it is possible for the table to be deleted while the code is running
+            return Collections.emptyList();
         }
 
-        try {
-            ExecPlan execPlan = getExecutePlan(dbs, context, parsedStmt, true, true);
-            List<TResultBatch> sqlResult = executeStmt(context, execPlan).first;
-            return deserializerStatisticData(sqlResult);
-        } catch (Exception e) {
-            LOG.warn("Execute statistic table query fail.", e);
-            throw e;
+        Map<String, ColumnStatsMeta> analyzedColumns = meta != null ? meta.getAnalyzedColumns() : Maps.newHashMap();
+        List<ColumnStatsMeta> columnStatsMetaList = Lists.newArrayList();
+        for (String name : columnNames) {
+            if (meta == null || !analyzedColumns.containsKey(name)) {
+                columnStatsMetaList.add(
+                        new ColumnStatsMeta(name, StatsConstants.AnalyzeType.SAMPLE, LocalDateTime.MIN));
+            } else {
+                columnStatsMetaList.add(analyzedColumns.get(name));
+            }
+        }
+
+        return queryColumnStats(context, dbId, tableId, columnStatsMetaList, table);
+    }
+
+    private static Table lookupTable(Long dbId, Long tableId) {
+        Table table = null;
+        if (dbId == null) {
+            List<Long> dbIds = GlobalStateMgr.getCurrentState().getLocalMetastore().getDbIds();
+            for (Long id : dbIds) {
+                Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(id);
+                if (db == null) {
+                    continue;
+                }
+                table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getId(), tableId);
+                if (table == null) {
+                    continue;
+                }
+                break;
+            }
+        } else {
+            Database database = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbId);
+            table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(database.getId(), tableId);
+        }
+        return table;
+    }
+
+    private @NotNull List<TStatisticData> queryColumnStats(ConnectContext context, Long dbId, Long tableId,
+                                                           List<ColumnStatsMeta> columnStatsMetaList,
+                                                           Table table) {
+        List<ColumnStatsMeta> columnWithFullStats =
+                columnStatsMetaList.stream()
+                        .filter(x -> x.getType() == StatsConstants.AnalyzeType.FULL)
+                        .collect(Collectors.toList());
+        List<ColumnStatsMeta> columnWithSampleStats =
+                columnStatsMetaList.stream()
+                        .filter(x -> x.getType() == StatsConstants.AnalyzeType.SAMPLE)
+                        .collect(Collectors.toList());
+
+        List<TStatisticData> columnStats = Lists.newArrayList();
+        if (CollectionUtils.isNotEmpty(columnWithFullStats)) {
+            List<String> columnNamesForStats = columnWithFullStats.stream().map(ColumnStatsMeta::getColumnName)
+                    .collect(Collectors.toList());
+            List<Type> columnTypesForStats = columnWithFullStats.stream()
+                            .map(x -> StatisticUtils.getQueryStatisticsColumnType(table, x.getColumnName()))
+                            .collect(Collectors.toList());
+
+            String statsSql = StatisticSQLBuilder.buildQueryFullStatisticsSQL(tableId, columnNamesForStats, columnTypesForStats);
+            List<TStatisticData> tStatisticData = executeStatisticDQL(context, statsSql);
+            columnStats.addAll(tStatisticData);
+        }
+        if (CollectionUtils.isNotEmpty(columnWithSampleStats)) {
+            List<String> columnNamesForStats = columnWithSampleStats.stream().map(ColumnStatsMeta::getColumnName)
+                    .collect(Collectors.toList());
+            if (Config.statistic_use_meta_statistics) {
+                List<Type> columnTypesForStats = columnWithSampleStats.stream()
+                        .map(x -> StatisticUtils.getQueryStatisticsColumnType(table, x.getColumnName()))
+                        .collect(Collectors.toList());
+                String statsSql = StatisticSQLBuilder.buildQueryFullStatisticsSQL(
+                        tableId, columnNamesForStats, columnTypesForStats);
+                List<TStatisticData> tStatisticData = executeStatisticDQL(context, statsSql);
+                columnStats.addAll(tStatisticData);
+            } else {
+                String statsSql = StatisticSQLBuilder.buildQuerySampleStatisticsSQL(dbId, tableId, columnNamesForStats);
+                List<TStatisticData> tStatisticData = executeStatisticDQL(context, statsSql);
+                columnStats.addAll(tStatisticData);
+            }
+        }
+        return columnStats;
+    }
+
+    public void dropTableStatistics(ConnectContext statsConnectCtx, Long tableIds,
+                                    StatsConstants.AnalyzeType analyzeType) {
+        String sql = StatisticSQLBuilder.buildDropStatisticsSQL(tableIds, analyzeType);
+        LOG.debug("Expire statistic SQL: {}", sql);
+
+        boolean result = executeDML(statsConnectCtx, sql);
+        if (!result) {
+            LOG.warn("Execute statistic table expire fail.");
+        }
+    }
+
+    public void dropExternalTableStatistics(ConnectContext statsConnectCtx, String tableUUID) {
+        String sql = StatisticSQLBuilder.buildDropExternalStatSQL(tableUUID);
+        LOG.debug("Expire external statistic SQL: {}", sql);
+
+        boolean result = executeDML(statsConnectCtx, sql);
+        if (!result) {
+            LOG.warn("Execute statistic table expire fail.");
+        }
+    }
+
+    public void dropExternalTableStatistics(ConnectContext statsConnectCtx, String catalogName, String dbName, String tableName) {
+        String sql = StatisticSQLBuilder.buildDropExternalStatSQL(catalogName, dbName, tableName);
+        LOG.debug("Expire external statistic SQL: {}", sql);
+
+        boolean result = executeDML(statsConnectCtx, sql);
+        if (!result) {
+            LOG.warn("Execute statistic table expire fail.");
+        }
+    }
+
+    public boolean dropPartitionStatistics(ConnectContext statsConnectCtx, List<Long> pids) {
+        String sql = StatisticSQLBuilder.buildDropPartitionSQL(pids);
+        LOG.debug("Expire partition statistic SQL: {}", sql);
+        return executeDML(statsConnectCtx, sql);
+    }
+
+    public boolean dropTableInvalidPartitionStatistics(ConnectContext statsConnectCtx, List<Long> tables,
+                                                       List<Long> pids) {
+        String sql = StatisticSQLBuilder.buildDropTableInvalidPartitionSQL(tables, pids);
+        LOG.debug("Expire invalid partition statistic SQL: {}", sql);
+        return executeDML(statsConnectCtx, sql);
+    }
+
+    public List<TStatisticData> queryHistogram(ConnectContext statsConnectCtx, Long tableId, List<String> columnNames) {
+        String sql = StatisticSQLBuilder.buildQueryHistogramStatisticsSQL(tableId, columnNames);
+        return executeStatisticDQL(statsConnectCtx, sql);
+    }
+
+    public List<TStatisticData> queryHistogram(ConnectContext statsConnectCtx, String tableUUID, List<String> columnNames) {
+        String sql = StatisticSQLBuilder.buildQueryConnectorHistogramStatisticsSQL(tableUUID, columnNames);
+        return executeStatisticDQL(statsConnectCtx, sql);
+    }
+
+    public List<TStatisticData> queryMCV(ConnectContext statsConnectCtx, String sql) {
+        return executeStatisticDQL(statsConnectCtx, sql);
+    }
+
+    public void dropHistogram(ConnectContext statsConnectCtx, Long tableId, List<String> columnNames) {
+        String sql = StatisticSQLBuilder.buildDropHistogramSQL(tableId, columnNames);
+        boolean result = executeDML(statsConnectCtx, sql);
+        if (!result) {
+            LOG.warn("Execute statistic table expire fail.");
+        }
+    }
+
+    public void dropExternalHistogram(ConnectContext statsConnectCtx, String tableUUID, List<String> columnNames) {
+        String sql = StatisticSQLBuilder.buildDropExternalHistogramSQL(tableUUID, columnNames);
+        boolean result = executeDML(statsConnectCtx, sql);
+        if (!result) {
+            LOG.warn("Execute external histogram statistic table expire fail.");
+        }
+    }
+
+    public void dropExternalHistogram(ConnectContext statsConnectCtx, String catalogName, String dbName, String tableName,
+                                      List<String> columnNames) {
+        String sql = StatisticSQLBuilder.buildDropExternalHistogramSQL(catalogName, dbName, tableName, columnNames);
+        boolean result = executeDML(statsConnectCtx, sql);
+        if (!result) {
+            LOG.warn("Execute external histogram statistic table expire fail.");
         }
     }
 
     // If you call this function, you must ensure that the db lock is added
-    public static Pair<List<TStatisticData>, Status> queryDictSync(Long dbId, Long tableId, String column)
+    public static Pair<List<TStatisticData>, Status> queryDictSync(Long dbId, Long tableId, ColumnId columnId)
             throws Exception {
         if (dbId == -1) {
             return Pair.create(Collections.emptyList(), Status.OK);
         }
 
-        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
-        Table table = db.getTable(tableId);
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbId);
+        if (db == null) {
+            throw new SemanticException("Database %s is not found", dbId);
+        }
+
+        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getId(), tableId);
+        if (table == null) {
+            throw new SemanticException("Table %s is not found", tableId);
+        }
+
+        if (!(table.isOlapOrCloudNativeTable() || table.isMaterializedView())) {
+            throw new SemanticException("Table '%s' is not a OLAP table or LAKE table or Materialize View",
+                    table.getName());
+        }
 
         OlapTable olapTable = (OlapTable) table;
-        long version = olapTable.getPartitions().stream().map(Partition::getVisibleVersionTime)
+        long version = olapTable.getPartitions().stream().map(p -> p.getDefaultPhysicalPartition().getVisibleVersionTime())
                 .max(Long::compareTo).orElse(0L);
-        String dbName = ClusterNamespace.getNameFromFullName(db.getFullName());
-        String tableName = db.getTable(tableId).getName();
+        String columnName = MetaUtils.getColumnNameByColumnId(dbId, tableId, columnId);
         String catalogName = InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME;
-
-        String sql = "select cast(" + STATISTIC_DICT_VERSION + " as Int), " +
+        String sql = "select cast(" + StatsConstants.STATISTIC_DICT_VERSION + " as Int), " +
                 "cast(" + version + " as bigint), " +
-                "dict_merge(" + "`" + column +
-                "`) as _dict_merge_" + column +
-                " from " + catalogName + "." + dbName + "." + tableName + " [_META_]";
+                "dict_merge(" + StatisticUtils.quoting(columnName) + ") as _dict_merge_" + columnName +
+                " from " + StatisticUtils.quoting(catalogName, db.getOriginName(), table.getName()) + " [_META_]";
 
-        Map<String, Database> dbs = Maps.newHashMap();
+        return executeStatisticDQLWithoutContext(sql);
+    }
+
+    private static Pair<List<TStatisticData>, Status> executeStatisticDQLWithoutContext(String sql) throws TException {
+        RemoteFilesSampleStrategy strategy = new RemoteFilesSampleStrategy();
+        return executeStatisticDQLWithSample(sql, strategy);
+    }
+
+    private static Pair<List<TStatisticData>, Status> executeStatisticDQLWithSample(
+            String sql, RemoteFilesSampleStrategy strategy) throws TException {
         ConnectContext context = StatisticUtils.buildConnectContext();
-        StatementBase parsedStmt;
-        try {
-            parsedStmt = parseSQL(sql, context);
-            if (parsedStmt instanceof QueryStatement) {
-                dbs = AnalyzerUtils.collectAllDatabase(context, parsedStmt);
-            }
-            Preconditions.checkState(dbs.size() == 1);
-        } catch (Exception e) {
-            LOG.warn("Parse statistic dict query {} fail.", sql, e);
-            throw e;
-        }
+        // The parallelism degree of low-cardinality dict collect task is uniformly set to 1 to
+        // prevent collection tasks from occupying a large number of be execution threads and scan threads.
+        context.getSessionVariable().setPipelineDop(1);
+        context.setThreadLocalInfo();
+        StatementBase parsedStmt = SqlParser.parseOneWithStarRocksDialect(sql, context.getSessionVariable());
 
-        try {
-            ExecPlan execPlan = getExecutePlan(dbs, context, parsedStmt, true, false);
-            Pair<List<TResultBatch>, Status> sqlResult = executeStmt(context, execPlan);
-            if (!sqlResult.second.ok()) {
-                return Pair.create(Collections.emptyList(), sqlResult.second);
-            } else {
-                return Pair.create(deserializerStatisticData(sqlResult.first), sqlResult.second);
-            }
-        } catch (Exception e) {
-            LOG.warn("Execute statistic dict query {} fail.", sql, e);
-            throw e;
+        ExecPlan execPlan = StatementPlanner.plan(parsedStmt, context, TResultSinkType.STATISTIC);
+
+        assert execPlan != null;
+        ScanNode scanNode = execPlan.getScanNodes().get(0);
+        scanNode.setScanSampleStrategy(strategy);
+
+        StmtExecutor executor = StmtExecutor.newInternalExecutor(context, parsedStmt);
+        Pair<List<TResultBatch>, Status> sqlResult = executor.executeStmtWithExecPlan(context, execPlan);
+        if (!sqlResult.second.ok()) {
+            return Pair.create(Collections.emptyList(), sqlResult.second);
+        } else {
+            return Pair.create(deserializerStatisticData(sqlResult.first), sqlResult.second);
         }
+    }
+
+    public static Pair<List<TStatisticData>, Status> queryDictSync(String tableUUID, String columnName)
+            throws Exception {
+        return queryDictSync(tableUUID, columnName, new RemoteFilesSampleStrategy(5, FORMAT_CHECKER));
+    }
+
+    public static Pair<List<TStatisticData>, Status> queryDictSync(String tableUUID, String columnName,
+                                                                   RemoteFilesSampleStrategy strategy)
+            throws TException {
+        List<String> names = StatisticsUtils.getTableNameByUUID(tableUUID);
+        if (names.size() < 3) {
+            return Pair.create(Collections.emptyList(), new Status(TStatusCode.GLOBAL_DICT_ERROR,
+                    "tableUUID " + tableUUID + " error for collecting dict"));
+        }
+        String sql = "select cast(" + StatsConstants.STATISTIC_DICT_VERSION + " as Int), " +
+                "cast(0 as bigint), " +
+                "dict_merge(" + StatisticUtils.quoting(columnName) + ") from " +
+                StatisticUtils.quoting(names.get(0), names.get(1), names.get(2));
+
+        return executeStatisticDQLWithSample(sql, strategy);
+    }
+
+    public static Pair<List<TStatisticData>, Status> queryDictSync(String tableUUID, String columnName, String fileName)
+            throws TException {
+        RemoteFilesSampleStrategy strategy = new RemoteFilesSampleStrategy(fileName);
+        return queryDictSync(tableUUID, columnName, strategy);
+    }
+
+    public List<TStatisticData> queryTableStats(ConnectContext context, Long tableId, List<Long> partitions) {
+        String sql = StatisticSQLBuilder.buildQueryTableStatisticsSQL(tableId, partitions);
+        return executeStatisticDQL(context, sql);
+    }
+
+    public List<TStatisticData> queryTableStats(ConnectContext context, Long tableId, Long partitionId) {
+        String sql = StatisticSQLBuilder.buildQueryTableStatisticsSQL(tableId, partitionId);
+        return executeStatisticDQL(context, sql);
+    }
+
+    public List<TStatisticData> queryPartitionLevelColumnNDV(ConnectContext context, long tableId,
+                                                             List<Long> partitions, List<String> columns) {
+        String sql = StatisticSQLBuilder.buildQueryPartitionStatisticsSQL(tableId, partitions, columns);
+        return executeStatisticDQL(context, sql);
     }
 
     private static List<TStatisticData> deserializerStatisticData(List<TResultBatch> sqlResult) throws TException {
         List<TStatisticData> statistics = Lists.newArrayList();
 
-        if (sqlResult.size() < 1) {
+        if (sqlResult.isEmpty()) {
             return statistics;
         }
 
@@ -199,7 +386,7 @@ public class StatisticExecutor {
             return statistics;
         }
 
-        if (version == STATISTIC_DATA_VERSION || version == STATISTIC_DICT_VERSION) {
+        if (StatsConstants.STATISTIC_SUPPORTED_VERSION.contains(version)) {
             TDeserializer deserializer = new TDeserializer(new TCompactProtocol.Factory());
             for (TResultBatch resultBatch : sqlResult) {
                 for (ByteBuffer bb : resultBatch.rows) {
@@ -210,379 +397,217 @@ public class StatisticExecutor {
                     statistics.add(sd);
                 }
             }
+        } else {
+            throw new StarRocksPlannerException("Unknown statistics type " + version, ErrorType.INTERNAL_ERROR);
         }
 
         return statistics;
     }
 
-    public void fullCollectStatisticSync(Long dbId, Long tableId, List<String> columnNames) throws Exception {
-        collectStatisticSync(dbId, tableId, columnNames, false, 0);
-    }
+    public AnalyzeStatus collectStatistics(ConnectContext statsConnectCtx,
+                                           StatisticsCollectJob statsJob,
+                                           AnalyzeStatus analyzeStatus,
+                                           boolean refreshAsync) {
+        Database db = statsJob.getDb();
+        Table table = statsJob.getTable();
 
-    public void sampleCollectStatisticSync(Long dbId, Long tableId, List<String> columnNames, long rows)
-            throws Exception {
-        collectStatisticSync(dbId, tableId, columnNames, true, rows);
-    }
-
-    public void collectStatisticSync(Long dbId, Long tableId, List<String> columnNames, boolean isSample, long rows)
-            throws Exception {
-        // split column
-        for (List<String> list : Lists.partition(columnNames, splitColumnsByRows(dbId, tableId, rows, isSample))) {
-            String sql;
-            if (isSample) {
-                sql = buildSampleInsertSQL(dbId, tableId, list, rows);
-            } else {
-                sql = buildFullInsertSQL(dbId, tableId, list);
-            }
-
-            LOG.debug("Collect statistic SQL: {}", sql);
-
-            ConnectContext context = StatisticUtils.buildConnectContext();
-            StatementBase parsedStmt = parseSQL(sql, context);
-            StmtExecutor executor = new StmtExecutor(context, parsedStmt);
-            executor.execute();
-
-            if (context.getState().getStateType() == QueryState.MysqlStateType.ERR) {
-                throw new DdlException(context.getState().getErrorMessage());
-            }
-        }
-    }
-
-    public void expireStatisticSync(List<String> tableIds) {
-        StringBuilder sql = new StringBuilder(DELETE_TEMPLATE);
-        sql.append(" table_id IN (").append(StringUtils.join(tableIds, ",")).append(")");
-        LOG.debug("Expire statistic SQL: {}", sql);
-
-        ConnectContext context = StatisticUtils.buildConnectContext();
-        StatementBase parsedStmt;
         try {
-            parsedStmt = parseSQL(sql.toString(), context);
-            StmtExecutor executor = new StmtExecutor(context, parsedStmt);
-            executor.execute();
+            Stopwatch watch = Stopwatch.createStarted();
+            statsConnectCtx.getSessionVariable().setEnableProfile(Config.enable_statistics_collect_profile);
+            GlobalStateMgr.getCurrentState().getAnalyzeMgr().registerConnection(analyzeStatus.getId(), statsConnectCtx);
+            // Only update running status without edit log, make restart job status is failed
+            analyzeStatus.setStatus(StatsConstants.ScheduleStatus.RUNNING);
+            GlobalStateMgr.getCurrentState().getAnalyzeMgr().replayAddAnalyzeStatus(analyzeStatus);
+
+            statsConnectCtx.setStatisticsConnection(true);
+            statsJob.collect(statsConnectCtx, analyzeStatus);
+            LOG.info("execute statistics job successfully, duration={}, job={}", watch.toString(), statsJob);
         } catch (Exception e) {
-            LOG.warn("Execute statistic table expire fail.", e);
+            LOG.warn("execute statistics job failed: {}", statsJob, e);
+            analyzeStatus.setStatus(StatsConstants.ScheduleStatus.FAILED);
+            analyzeStatus.setEndTime(LocalDateTime.now());
+            analyzeStatus.setReason(e.getMessage());
+            GlobalStateMgr.getCurrentState().getAnalyzeMgr().addAnalyzeStatus(analyzeStatus);
+            return analyzeStatus;
+        } finally {
+            GlobalStateMgr.getCurrentState().getAnalyzeMgr().unregisterConnection(analyzeStatus.getId(), false);
+        }
+
+        analyzeStatus.setStatus(StatsConstants.ScheduleStatus.FINISH);
+        analyzeStatus.setEndTime(LocalDateTime.now());
+        GlobalStateMgr.getCurrentState().getAnalyzeMgr().addAnalyzeStatus(analyzeStatus);
+
+        // update StatisticsCache
+        statsConnectCtx.setStatisticsConnection(false);
+        if (statsJob.getType().equals(StatsConstants.AnalyzeType.HISTOGRAM)) {
+            if (table.isNativeTableOrMaterializedView()) {
+                for (String columnName : statsJob.getColumnNames()) {
+                    HistogramStatsMeta histogramStatsMeta = new HistogramStatsMeta(db.getId(),
+                            table.getId(), columnName, statsJob.getType(), analyzeStatus.getEndTime(),
+                            statsJob.getProperties());
+                    GlobalStateMgr.getCurrentState().getAnalyzeMgr().addHistogramStatsMeta(histogramStatsMeta);
+                    GlobalStateMgr.getCurrentState().getAnalyzeMgr().refreshHistogramStatisticsCache(
+                            histogramStatsMeta.getDbId(), histogramStatsMeta.getTableId(),
+                            Lists.newArrayList(histogramStatsMeta.getColumn()), refreshAsync);
+                }
+            } else {
+                for (String columnName : statsJob.getColumnNames()) {
+                    ExternalHistogramStatsMeta histogramStatsMeta = new ExternalHistogramStatsMeta(
+                            statsJob.getCatalogName(), db.getFullName(), table.getName(), columnName,
+                            statsJob.getType(), analyzeStatus.getEndTime(), statsJob.getProperties());
+
+                    GlobalStateMgr.getCurrentState().getAnalyzeMgr().addExternalHistogramStatsMeta(histogramStatsMeta);
+                    GlobalStateMgr.getCurrentState().getAnalyzeMgr().refreshConnectorTableHistogramStatisticsCache(
+                            statsJob.getCatalogName(), db.getFullName(), table.getName(),
+                            Lists.newArrayList(histogramStatsMeta.getColumn()), refreshAsync);
+                }
+            }
+        } else {
+            AnalyzeMgr analyzeMgr = GlobalStateMgr.getCurrentState().getAnalyzeMgr();
+            if (table.isNativeTableOrMaterializedView()) {
+                BasicStatsMeta basicStatsMeta = analyzeMgr.getTableBasicStatsMeta(table.getId());
+                if (basicStatsMeta == null) {
+                    long existUpdateRows = analyzeMgr.getExistUpdateRows(table.getId());
+                    basicStatsMeta = new BasicStatsMeta(db.getId(), table.getId(),
+                            statsJob.getColumnNames(), statsJob.getType(), analyzeStatus.getEndTime(),
+                            statsJob.getProperties(), existUpdateRows);
+                } else {
+                    basicStatsMeta = basicStatsMeta.clone();
+                    basicStatsMeta.setUpdateTime(analyzeStatus.getEndTime());
+                    basicStatsMeta.setProperties(statsJob.getProperties());
+                    basicStatsMeta.setAnalyzeType(statsJob.getType());
+                    basicStatsMeta.resetDeltaRows();
+                }
+
+                for (String column : ListUtils.emptyIfNull(statsJob.getColumnNames())) {
+                    ColumnStatsMeta meta =
+                            new ColumnStatsMeta(column, statsJob.getType(), analyzeStatus.getEndTime());
+                    basicStatsMeta.addColumnStatsMeta(meta);
+                }
+                analyzeMgr.addBasicStatsMeta(basicStatsMeta);
+                analyzeMgr.refreshBasicStatisticsCache(
+                        basicStatsMeta.getDbId(), basicStatsMeta.getTableId(), basicStatsMeta.getColumns(),
+                        refreshAsync);
+            } else {
+                // for external table
+                ExternalBasicStatsMeta externalBasicStatsMeta = analyzeMgr.getExternalTableBasicStatsMeta(
+                        statsJob.getCatalogName(), db.getFullName(), table.getName());
+                if (externalBasicStatsMeta == null) {
+                    externalBasicStatsMeta = new ExternalBasicStatsMeta(statsJob.getCatalogName(), db.getFullName(),
+                            table.getName(), Lists.newArrayList(statsJob.getColumnNames()), statsJob.getType(),
+                            analyzeStatus.getEndTime(), statsJob.getProperties());
+                } else {
+                    externalBasicStatsMeta = externalBasicStatsMeta.clone();
+                    externalBasicStatsMeta.setUpdateTime(analyzeStatus.getEndTime());
+                    externalBasicStatsMeta.setProperties(statsJob.getProperties());
+                    externalBasicStatsMeta.setAnalyzeType(statsJob.getType());
+                    // set columns to the latest collect job's columns
+                    externalBasicStatsMeta.setColumns(Lists.newArrayList(statsJob.getColumnNames()));
+                }
+
+                Set<Long> sampledPartitions = new HashSet<>();
+                int allPartitionSize = -1;
+                if (statsJob.getType() == StatsConstants.AnalyzeType.SAMPLE) {
+                    ExternalSampleStatisticsCollectJob sampleStatsJob = (ExternalSampleStatisticsCollectJob) statsJob;
+                    sampledPartitions = sampleStatsJob.getSampledPartitionsHashValue();
+                    allPartitionSize = sampleStatsJob.getAllPartitionSize();
+                }
+                for (String column : ListUtils.emptyIfNull(statsJob.getColumnNames())) {
+                    // merge sampled partitions
+                    if (externalBasicStatsMeta.getColumnStatsMetaMap().containsKey(column)) {
+                        sampledPartitions.addAll(externalBasicStatsMeta.getColumnStatsMeta(column).
+                                getSampledPartitionsHashValue());
+                    }
+                    ColumnStatsMeta meta =
+                            new ColumnStatsMeta(column, statsJob.getType(), analyzeStatus.getEndTime(),
+                                    sampledPartitions, allPartitionSize);
+                    externalBasicStatsMeta.addColumnStatsMeta(meta);
+                }
+                GlobalStateMgr.getCurrentState().getAnalyzeMgr().addExternalBasicStatsMeta(externalBasicStatsMeta);
+                GlobalStateMgr.getCurrentState().getAnalyzeMgr()
+                        .refreshConnectorTableBasicStatisticsCache(statsJob.getCatalogName(),
+                                db.getFullName(), table.getName(), statsJob.getColumnNames(), refreshAsync);
+            }
+        }
+        return analyzeStatus;
+    }
+
+    public List<TStatisticData> executeStatisticDQL(ConnectContext context, String sql) {
+        List<TResultBatch> sqlResult = executeDQL(context, sql);
+        try {
+            return deserializerStatisticData(sqlResult);
+        } catch (TException e) {
+            throw new SemanticException(e.getMessage());
         }
     }
 
-    public List<String> queryExpireTableSync(List<Long> tableIds) throws Exception {
-        if (null == tableIds || tableIds.isEmpty()) {
+    /**
+     * In case of INSERT-OVERWRITE, the partition-id would change but the statistics would not. So we need to update
+     * the partition id of the statistics. Since PRIMARY-KEY tables doesn't really support update key columns, we
+     * choose to copy existing row but change the id of it,  then delete existing row.
+     * If the second step failed before finish, the statistics cleanup procedure will handle it.
+     */
+    public static void overwritePartitionStatistics(ConnectContext context,
+                                                    long dbId,
+                                                    long tableId,
+                                                    long sourcePartition,
+                                                    long targetPartition) {
+        List<String> sqlList =
+                FullStatisticsCollectJob.buildOverwritePartitionSQL(tableId, sourcePartition, targetPartition);
+        Preconditions.checkState(sqlList.size() == 2);
+
+        // copy
+        executeDML(context, sqlList.get(0));
+
+        // delete
+        executeDML(context, sqlList.get(1));
+
+        // NOTE: why don't we refresh the statistics cache ?
+        // OVERWRITE will create a new partition and delete the existing one, so next time when consulting the stats
+        // cache, it would get a cache-miss so reload the cache. and also the cache of deleted partition would be
+        // vacuumed by background job. so to conclude we don't need to refresh the stats cache manually
+        GlobalStateMgr.getCurrentState().getStatisticStorage().overwritePartitionStatistics(
+                tableId, sourcePartition, targetPartition);
+    }
+
+    private List<TResultBatch> executeDQL(ConnectContext context, String sql) {
+        context.setQueryId(UUIDUtil.genUUID());
+        if (Config.enable_print_sql) {
+            LOG.info("Begin to execute sql, type: Statistics collect，query id:{}, sql:{}", context.getQueryId(), sql);
+        }
+        if (FeConstants.enableUnitStatistics) {
             return Collections.emptyList();
         }
+        StatementBase parsedStmt = SqlParser.parseOneWithStarRocksDialect(sql, context.getSessionVariable());
+        ExecPlan execPlan = StatementPlanner.plan(parsedStmt, context, TResultSinkType.STATISTIC);
+        StmtExecutor executor = StmtExecutor.newInternalExecutor(context, parsedStmt);
+        context.setExecutor(executor);
+        context.getSessionVariable().setEnableMaterializedViewRewrite(false);
+        Pair<List<TResultBatch>, Status> sqlResult = executor.executeStmtWithExecPlan(context, execPlan);
+        if (!sqlResult.second.ok()) {
+            throw new SemanticException("Statistics query fail | Error Message [%s] | QueryId [%s] | SQL [%s]",
+                    context.getState().getErrorMessage(), DebugUtil.printId(context.getQueryId()), sql);
+        } else {
+            AuditLog.getStatisticAudit().info("statistic execute query | QueryId [{}] | SQL: {}",
+                    DebugUtil.printId(context.getQueryId()), sql);
+            return sqlResult.first;
+        }
+    }
 
-        StringBuilder sql = new StringBuilder(SELECT_EXPIRE_TABLE_TEMPLATE);
-        sql.append(" AND table_id NOT IN (").append(StringUtils.join(tableIds, ",")).append(")");
-        LOG.debug("Query expire statistic SQL: {}", sql);
-
-        Map<String, Database> dbs = Maps.newHashMap();
-        ConnectContext context = StatisticUtils.buildConnectContext();
+    private static boolean executeDML(ConnectContext context, String sql) {
         StatementBase parsedStmt;
         try {
-            parsedStmt = parseSQL(sql.toString(), context);
-            if (parsedStmt instanceof QueryStatement) {
-                dbs = AnalyzerUtils.collectAllDatabase(context, parsedStmt);
-            }
+            parsedStmt = SqlParser.parseOneWithStarRocksDialect(sql, context.getSessionVariable());
+            StmtExecutor executor = StmtExecutor.newInternalExecutor(context, parsedStmt);
+            context.setExecutor(executor);
+            context.setQueryId(UUIDUtil.genUUID());
+            executor.execute();
+            AuditLog.getStatisticAudit().info("statistic execute DML | QueryId [{}] | SQL: {}",
+                    DebugUtil.printId(context.getQueryId()), sql);
+            return true;
         } catch (Exception e) {
-            LOG.warn("Parse statistic table query fail. SQL: " + sql, e);
-            throw e;
-        }
-
-        try {
-            ExecPlan execPlan = getExecutePlan(dbs, context, parsedStmt, false, true);
-            List<TResultBatch> sqlResult = executeStmt(context, execPlan).first;
-
-            CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder();
-
-            List<String> result = Lists.newArrayList();
-            for (TResultBatch batch : sqlResult) {
-                for (ByteBuffer byteBuffer : batch.getRows()) {
-                    result.add(decoder.decode(byteBuffer).toString().substring(1));
-                }
-            }
-
-            return result;
-        } catch (Exception e) {
-            LOG.warn("Execute statistic table query fail.", e);
-            throw e;
-        }
-    }
-
-    private static ExecPlan getExecutePlan(Map<String, Database> dbs, ConnectContext context,
-                                           StatementBase parsedStmt, boolean isStatistic, boolean isLockDb) {
-        ExecPlan execPlan;
-        try {
-            if (isLockDb) {
-                lock(dbs);
-            }
-
-            Analyzer.analyze(parsedStmt, context);
-
-            ColumnRefFactory columnRefFactory = new ColumnRefFactory();
-            LogicalPlan logicalPlan = new RelationTransformer(columnRefFactory, context).transform(
-                    ((QueryStatement) parsedStmt).getQueryRelation());
-
-            Optimizer optimizer = new Optimizer();
-            OptExpression optimizedPlan = optimizer.optimize(
-                    context,
-                    logicalPlan.getRoot(),
-                    new PhysicalPropertySet(),
-                    new ColumnRefSet(logicalPlan.getOutputColumn()),
-                    columnRefFactory);
-
-            execPlan = new PlanFragmentBuilder()
-                    .createStatisticPhysicalPlan(optimizedPlan, context, logicalPlan.getOutputColumn(),
-                            columnRefFactory, isStatistic);
-        } finally {
-            if (isLockDb) {
-                unLock(dbs);
-            }
-        }
-        return execPlan;
-    }
-
-    private String buildQuerySQL(Long dbId, Long tableId, List<String> columnNames) {
-        StringBuilder where = new StringBuilder(QUERY_STATISTIC_TEMPLATE);
-        if (null != dbId) {
-            where.append(" AND db_id = ").append(dbId);
-        }
-
-        if (null != tableId) {
-            where.append(" AND table_id = ").append(tableId);
-        }
-
-        if (null == columnNames || columnNames.isEmpty()) {
-            return where.toString();
-        }
-
-        where.append(" AND column_name");
-        if (columnNames.size() == 1) {
-            where.append(" = '").append(columnNames.get(0)).append("'");
-        } else {
-            where.append(" IN (");
-            where.append(columnNames.stream().map(s -> "'" + s + "'").collect(Collectors.joining(",")));
-            where.append(")");
-        }
-
-        return where.toString();
-    }
-
-    public static StatementBase parseSQL(String sql, ConnectContext context) {
-        StatementBase parsedStmt = com.starrocks.sql.parser.SqlParser.parse(sql,
-                context.getSessionVariable().getSqlMode()).get(0);
-        parsedStmt.setOrigStmt(new OriginStatement(sql, 0));
-        return parsedStmt;
-    }
-
-    private static Pair<List<TResultBatch>, Status> executeStmt(ConnectContext context, ExecPlan plan)
-            throws Exception {
-        Coordinator coord =
-                new Coordinator(context, plan.getFragments(), plan.getScanNodes(), plan.getDescTbl().toThrift());
-        QeProcessorImpl.INSTANCE.registerQuery(context.getExecutionId(), coord);
-        List<TResultBatch> sqlResult = Lists.newArrayList();
-        try {
-            coord.exec();
-            RowBatch batch;
-            do {
-                batch = coord.getNext();
-                if (batch.getBatch() != null) {
-                    sqlResult.add(batch.getBatch());
-                }
-            } while (!batch.isEos());
-        } catch (Exception e) {
-            LOG.warn(e);
-        } finally {
-            QeProcessorImpl.INSTANCE.unregisterQuery(context.getExecutionId());
-        }
-        return Pair.create(sqlResult, coord.getExecStatus());
-    }
-
-    private int splitColumnsByRows(Long dbId, Long tableId, long rows, boolean isSample) {
-        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
-        OlapTable table = (OlapTable) db.getTable(tableId);
-
-        long count =
-                table.getPartitions().stream().map(p -> p.getBaseIndex().getRowCount()).reduce(Long::sum).orElse(1L);
-        if (isSample) {
-            count = Math.min(count, rows);
-        }
-        count = Math.max(count, 1L);
-
-        // 500w data per query
-        return (int) (5000000L / count + 1);
-    }
-
-    private String buildFullInsertSQL(Long dbId, Long tableId, List<String> columnNames) {
-        StringBuilder builder = new StringBuilder(INSERT_STATISTIC_TEMPLATE).append(" ");
-
-        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
-        OlapTable table = (OlapTable) db.getTable(tableId);
-
-        for (String name : columnNames) {
-            VelocityContext context = new VelocityContext();
-            Column column = table.getColumn(name);
-
-            context.put("dbId", dbId);
-            context.put("tableId", tableId);
-            context.put("columnName", name);
-            context.put("dbName", db.getFullName());
-            context.put("tableName", ClusterNamespace.getNameFromFullName(db.getFullName()) + "." + table.getName());
-            context.put("dataSize", getDataSize(column, false));
-
-            if (!column.getType().canStatistic()) {
-                context.put("countDistinctFunction", "0");
-                context.put("countNullFunction", "0");
-                context.put("maxFunction", "''");
-                context.put("minFunction", "''");
-            } else {
-                context.put("countDistinctFunction", "approx_count_distinct(`" + name + "`)");
-                context.put("countNullFunction", "COUNT(1) - COUNT(`" + name + "`)");
-                context.put("maxFunction", "IFNULL(MAX(`" + name + "`), '')");
-                context.put("minFunction", "IFNULL(MIN(`" + name + "`), '')");
-            }
-
-            StringWriter sw = new StringWriter();
-            DEFAULT_VELOCITY_ENGINE.evaluate(context, sw, "", INSERT_SELECT_FULL_TEMPLATE);
-
-            builder.append(sw);
-            builder.append(" UNION ALL ");
-        }
-
-        return builder.substring(0, builder.length() - "UNION ALL ".length());
-    }
-
-    private String buildSampleInsertSQL(Long dbId, Long tableId, List<String> columnNames, long rows) {
-        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
-        OlapTable table = (OlapTable) db.getTable(tableId);
-
-        long hitRows = 1;
-        long totalRows = 0;
-        long totalTablet = 0;
-        Set<String> randomTablets = Sets.newHashSet();
-        rows = Math.max(rows, 1);
-
-        // calculate the number of tablets by each partition
-        // simpleTabletNums = simpleRows / partitionNums / (actualPartitionRows / actualTabletNums)
-        long avgRowsPerPartition = rows / Math.max(table.getPartitions().size(), 1);
-
-        for (Partition p : table.getPartitions()) {
-            List<Long> ids = p.getBaseIndex().getTabletIdsInOrder();
-
-            if (ids.isEmpty()) {
-                continue;
-            }
-
-            if (p.getBaseIndex().getRowCount() < (avgRowsPerPartition / 2)) {
-                continue;
-            }
-
-            long avgRowsPerTablet = Math.max(p.getBaseIndex().getRowCount() / ids.size(), 1);
-            long tabletCounts = Math.max(avgRowsPerPartition / avgRowsPerTablet, 1);
-            tabletCounts = Math.min(tabletCounts, ids.size());
-
-            for (int i = 0; i < tabletCounts; i++) {
-                randomTablets.add(String.valueOf(ids.get(i)));
-            }
-
-            hitRows += avgRowsPerTablet * tabletCounts;
-            totalRows += p.getBaseIndex().getRowCount();
-            totalTablet += ids.size();
-        }
-
-        long ratio = Math.max(totalRows / Math.min(hitRows, rows), 1);
-        // all hit, direct full
-        String hintTablets;
-        if (randomTablets.isEmpty() || totalRows < rows) {
-            // can't fill full sample rows
-            return buildFullInsertSQL(dbId, tableId, columnNames);
-        } else if (randomTablets.size() == totalTablet) {
-            hintTablets = " LIMIT " + rows;
-        } else {
-            hintTablets = " Tablet(" + String.join(", ", randomTablets) + ")" + " LIMIT " + rows;
-        }
-
-        StringBuilder builder = new StringBuilder(INSERT_STATISTIC_TEMPLATE).append(" ");
-
-        Set<String> lowerDistributeColumns =
-                table.getDistributionColumnNames().stream().map(String::toLowerCase).collect(Collectors.toSet());
-
-        for (String name : columnNames) {
-            VelocityContext context = new VelocityContext();
-            Column column = table.getColumn(name);
-
-            context.put("dbId", dbId);
-            context.put("tableId", tableId);
-            context.put("columnName", name);
-            context.put("dbName", db.getFullName());
-            context.put("tableName", ClusterNamespace.getNameFromFullName(db.getFullName()) + "." + table.getName());
-            context.put("dataSize", getDataSize(column, true));
-            context.put("ratio", ratio);
-            context.put("hints", hintTablets);
-
-            // countDistinctFunction
-            if (lowerDistributeColumns.size() == 1 && lowerDistributeColumns.contains(name.toLowerCase())) {
-                context.put("countDistinctFunction", "COUNT(1) * " + ratio);
-            } else {
-                // From PostgreSQL: n*d / (n - f1 + f1*n/N)
-                // (https://github.com/postgres/postgres/blob/master/src/backend/commands/analyze.c)
-                // and paper: ESTIMATING THE NUMBER OF CLASSES IN A FINITE POPULATION
-                // (http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.93.8637&rep=rep1&type=pdf)
-                // sample_row * count_distinct / ( sample_row - once_count + once_count * sample_row / total_row)
-                String sampleRows = "SUM(t1.count)";
-                String onceCount = "SUM(IF(t1.count = 1, 1, 0))";
-                String countDistinct = "COUNT(1)";
-
-                String fn = MessageFormat.format("{0} * {1} / ({0} - {2} + {2} * {0} / {3})", sampleRows,
-                        countDistinct, onceCount, String.valueOf(totalRows));
-                context.put("countDistinctFunction", "IFNULL(" + fn + ", COUNT(1))");
-            }
-
-            StringWriter sw = new StringWriter();
-
-            if (!column.getType().canStatistic()) {
-                DEFAULT_VELOCITY_ENGINE.evaluate(context, sw, "", INSERT_SELECT_METRIC_SAMPLE_TEMPLATE);
-            } else {
-                DEFAULT_VELOCITY_ENGINE.evaluate(context, sw, "", INSERT_SELECT_TYPE_SAMPLE_TEMPLATE);
-            }
-
-            builder.append(sw);
-            builder.append(" UNION ALL ");
-        }
-
-        return builder.substring(0, builder.length() - "UNION ALL ".length());
-    }
-
-    private String getDataSize(Column column, boolean isSample) {
-        if (column.getPrimitiveType().isCharFamily() || column.getPrimitiveType().isJsonType()) {
-            if (isSample) {
-                return "IFNULL(SUM(CHAR_LENGTH(`" + column.getName() + "`) * t1.count), 0)";
-            }
-            return "IFNULL(SUM(CHAR_LENGTH(`" + column.getName() + "`)), 0)";
-        }
-
-        long typeSize = column.getType().getTypeSize();
-
-        if (isSample && column.getType().canStatistic()) {
-            return "IFNULL(SUM(t1.count), 0) * " + typeSize;
-        }
-        return "COUNT(1) * " + typeSize;
-    }
-
-    // Lock all database before analyze
-    private static void lock(Map<String, Database> dbs) {
-        if (dbs == null) {
-            return;
-        }
-        for (Database db : dbs.values()) {
-            db.readLock();
-        }
-    }
-
-    // unLock all database after analyze
-    private static void unLock(Map<String, Database> dbs) {
-        if (dbs == null) {
-            return;
-        }
-        for (Database db : dbs.values()) {
-            db.readUnlock();
+            LOG.warn("statistic DML fail | {} | SQL {}", DebugUtil.printId(context.getQueryId()), sql, e);
+            return false;
         }
     }
 }

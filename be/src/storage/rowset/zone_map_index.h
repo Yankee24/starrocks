@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/rowset/segment_v2/zone_map_index.h
 
@@ -30,8 +43,8 @@
 #include "gen_cpp/segment.pb.h"
 #include "runtime/mem_pool.h"
 #include "runtime/mem_tracker.h"
-#include "storage/field.h"
 #include "storage/rowset/binary_plain_page.h"
+#include "util/once.h"
 #include "util/slice.h"
 
 namespace starrocks {
@@ -45,7 +58,7 @@ class WritableFile;
 // reader can prune an entire segment without reading pages.
 class ZoneMapIndexWriter {
 public:
-    static std::unique_ptr<ZoneMapIndexWriter> create(starrocks::Field* field);
+    static std::unique_ptr<ZoneMapIndexWriter> create(TypeInfo* type_info);
 
     virtual ~ZoneMapIndexWriter() = default;
 
@@ -63,7 +76,8 @@ public:
 
 class ZoneMapIndexReader {
 public:
-    ZoneMapIndexReader() : _state(kUnloaded) {}
+    ZoneMapIndexReader();
+    ~ZoneMapIndexReader();
 
     // load all page zone maps into memory.
     //
@@ -73,30 +87,24 @@ public:
     //
     // Return true if the index data was successfully loaded by the caller, false if
     // the data was loaded by another caller.
-    StatusOr<bool> load(FileSystem* fs, const std::string& filename, const ZoneMapIndexPB& meta, bool use_page_cache,
-                        bool kept_in_memory);
+    StatusOr<bool> load(const IndexReadOptions& opts, const ZoneMapIndexPB& meta);
 
     // REQUIRES: the index data has been successfully `load()`ed into memory.
     const std::vector<ZoneMapPB>& page_zone_maps() const { return _page_zone_maps; }
 
     // REQUIRES: the index data has been successfully `load()`ed into memory.
-    int32_t num_pages() const { return _page_zone_maps.size(); }
+    int32_t num_pages() const { return static_cast<int32_t>(_page_zone_maps.size()); }
+
+    bool loaded() const { return invoked(_load_once); }
 
     size_t mem_usage() const;
 
-    bool loaded() const { return _state.load(std::memory_order_acquire) == kLoaded; }
-
 private:
-    enum State : int {
-        kUnloaded = 0, // data has not been loaded into memory
-        kLoading = 1,  // loading in process
-        kLoaded = 2,   // data was successfully loaded in memory
-    };
+    void _reset() { std::vector<ZoneMapPB>{}.swap(_page_zone_maps); }
 
-    Status do_load(FileSystem* fs, const std::string& filename, const ZoneMapIndexPB& meta, bool use_page_cache,
-                   bool kept_in_memory);
+    Status _do_load(const IndexReadOptions& opts, const ZoneMapIndexPB& meta);
 
-    std::atomic<State> _state;
+    OnceFlag _load_once;
     std::vector<ZoneMapPB> _page_zone_maps;
 };
 

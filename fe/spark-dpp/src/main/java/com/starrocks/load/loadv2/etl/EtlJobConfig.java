@@ -437,11 +437,13 @@ public class EtlJobConfig implements Serializable {
 
     public static class EtlPartition implements Serializable {
         @SerializedName(value = "partitionId")
-        public long partitionId;
+        public long physicalPartitionId;
         @SerializedName(value = "startKeys")
         public List<Object> startKeys;
         @SerializedName(value = "endKeys")
         public List<Object> endKeys;
+        @SerializedName(value = "inKeys")
+        public List<List<Object>> inKeys;
         @SerializedName(value = "isMinPartition")
         public boolean isMinPartition;
         @SerializedName(value = "isMaxPartition")
@@ -449,9 +451,9 @@ public class EtlJobConfig implements Serializable {
         @SerializedName(value = "bucketNum")
         public int bucketNum;
 
-        public EtlPartition(long partitionId, List<Object> startKeys, List<Object> endKeys,
+        public EtlPartition(long physicalPartitionId, List<Object> startKeys, List<Object> endKeys,
                             boolean isMinPartition, boolean isMaxPartition, int bucketNum) {
-            this.partitionId = partitionId;
+            this.physicalPartitionId = physicalPartitionId;
             this.startKeys = startKeys;
             this.endKeys = endKeys;
             this.isMinPartition = isMinPartition;
@@ -459,10 +461,16 @@ public class EtlJobConfig implements Serializable {
             this.bucketNum = bucketNum;
         }
 
+        public EtlPartition(long physicalPartitionId, List<List<Object>> inKeys, int bucketNum) {
+            this.physicalPartitionId = physicalPartitionId;
+            this.inKeys = inKeys;
+            this.bucketNum = bucketNum;
+        }
+
         @Override
         public String toString() {
             return "EtlPartition{" +
-                    "partitionId=" + partitionId +
+                    "partitionId=" + physicalPartitionId +
                     ", startKeys=" + startKeys +
                     ", endKeys=" + endKeys +
                     ", isMinPartition=" + isMinPartition +

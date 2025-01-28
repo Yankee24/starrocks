@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/util/memcmp.h
 
@@ -43,10 +56,11 @@ inline int compare(T lhs, T rhs) {
     }
 }
 
-// mem_equal is used to optimize the comparastion between the two strings.
+// memequal is used to optimize the comparison between the two strings.
 //  1. If the length is equal and larger than 16, use SSE4.1
 //  2. If the length is small than 16, convert the address to int16/int32/int64
-//     to comparasion
+//     to comparison
+// so it does not need to consider extra padding bytes for SIMD, which is required by memequal_padded().
 // TODO: If know the size in advance, call the function by constant parameter
 //       like memequal(p1, 10, p2, 10) is efficient
 
@@ -140,7 +154,7 @@ inline int memcompare(const char* p1, size_t size1, const char* p2, size_t size2
     size_t min_size = std::min(size1, size2);
     auto res = memcmp(p1, p2, min_size);
     if (res != 0) {
-        return res;
+        return res > 0 ? 1 : -1;
     }
     return compare(size1, size2);
 }

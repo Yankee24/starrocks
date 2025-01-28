@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/gensrc/thrift/Types.thrift
 
@@ -45,6 +58,7 @@ typedef i64 TPartitionId
 enum TStorageType {
     ROW,
     COLUMN,
+    COLUMN_WITH_ROW
 }
 
 enum TStorageMedium {
@@ -54,7 +68,8 @@ enum TStorageMedium {
 
 enum TVarType {
     SESSION,
-    GLOBAL
+    GLOBAL,
+    VERBOSE
 }
 
 enum TPrimitiveType {
@@ -83,7 +98,9 @@ enum TPrimitiveType {
   DECIMAL32,
   DECIMAL64,
   DECIMAL128,
-  JSON
+  JSON,
+  FUNCTION,
+  VARBINARY
 }
 
 enum TTypeNodeType {
@@ -107,8 +124,13 @@ struct TScalarType {
 // Represents a field in a STRUCT type.
 // TODO: Model column stats for struct fields.
 struct TStructField {
-    1: required string name
+    1: optional string name
     2: optional string comment
+    3: optional i32 id
+    // physical_name is used to store the physical name of the field in the storage layer.
+    // for example, the physical name of a struct field in a parquet file.
+    // used in delta lake column mapping name mode
+    4: optional string physical_name
 }
 
 struct TTypeNode {
@@ -119,6 +141,9 @@ struct TTypeNode {
 
     // only used for structs; has struct_fields.size() corresponding child types
     3: optional list<TStructField> struct_fields
+
+    // only used for structs; for output use
+    4: optional bool is_named
 }
 
 // A flattened representation of a tree of column types obtained by depth-first
@@ -142,7 +167,8 @@ enum TAggregationType {
     NONE,
     BITMAP_UNION,
     REPLACE_IF_NOT_NULL,
-    PERCENTILE_UNION
+    PERCENTILE_UNION,
+    AGG_STATE_UNION
 }
 
 enum TPushType {
@@ -157,7 +183,7 @@ enum TPushType {
 enum TTaskType {
     CREATE,
     DROP,
-    PUSH,
+    PUSH, // Deprecated
     CLONE,
     STORAGE_MEDIUM_MIGRATE,
     ROLLUP, // Deprecated
@@ -182,6 +208,12 @@ enum TTaskType {
     INSTALL_PLUGIN,
     UNINSTALL_PLUGIN,
     // this use for calculate enum count
+    DROP_AUTO_INCREMENT_MAP,
+    COMPACTION,
+    REMOTE_SNAPSHOT,
+    REPLICATE_SNAPSHOT,
+    UPDATE_SCHEMA,
+    COMPACTION_CONTROL,
     NUM_TASK_TYPE
 }
 
@@ -252,7 +284,10 @@ enum TFunctionBinaryType {
   IR,
 
   // StarRocks customized UDF in jar.
-  SRJAR
+  SRJAR,
+  
+  // 
+  PYTHON
 }
 
 // Represents a fully qualified function name.
@@ -283,11 +318,27 @@ struct TAggregateFunction {
   9: optional string remove_fn_symbol
   10: optional bool is_analytic_only_fn = false
   11: optional string symbol
+  // used for agg_func(a order by b, c) like array_agg, group_concat
+  12: optional list<bool> is_asc_order
+  // Indicates, for each expr, if nulls should be listed first or last. This is
+  // independent of is_asc_order.
+  13: optional list<bool> nulls_first
+  14: optional bool is_distinct = false
 }
 
 struct TTableFunction {
   1: required list<TTypeDesc> ret_types
   2: optional string symbol
+  // Table function left join
+  3: optional bool is_left_join
+}
+
+struct TAggStateDesc {
+    1: optional string agg_func_name
+    2: optional list<TTypeDesc> arg_types
+    3: optional TTypeDesc ret_type
+    4: optional bool result_nullable
+    5: optional i32 func_version
 }
 
 // Represents a function in the Catalog.
@@ -310,7 +361,7 @@ struct TFunction {
   // Optional comment to attach to the function
   6: optional string comment
 
-  7: optional string signature
+  7: optional string signature // Deprecated
 
   // HDFS path for the function binary. This binary must exist at the time the
   // function is created.
@@ -322,6 +373,7 @@ struct TFunction {
 
   11: optional i64 id
   12: optional string checksum
+  13: optional TAggStateDesc agg_state_desc
 
   // Builtin Function id, used to mark the function in the vectorization engine,
   // and it's different with `id` because `id` is use for serialized and cache
@@ -329,6 +381,12 @@ struct TFunction {
   30: optional i64 fid
   31: optional TTableFunction table_fn
   32: optional bool could_apply_dict_optimize
+
+  // Ignore nulls
+  33: optional bool ignore_nulls
+  34: optional bool isolated
+  35: optional string input_type
+  36: optional string content
 }
 
 enum TLoadJobState {
@@ -357,8 +415,21 @@ enum TTableType {
     ICEBERG_TABLE,
     HUDI_TABLE,
     JDBC_TABLE,
+    PAIMON_TABLE,
     VIEW = 20,
-    MATERIALIZED_VIEW
+    MATERIALIZED_VIEW,
+    FILE_TABLE,
+    DELTALAKE_TABLE,
+    TABLE_FUNCTION_TABLE,
+    ODPS_TABLE,
+    LOGICAL_ICEBERG_METADATA_TABLE,
+    ICEBERG_REFS_TABLE,
+    ICEBERG_HISTORY_TABLE,
+    ICEBERG_METADATA_LOG_ENTRIES_TABLE,
+    ICEBERG_SNAPSHOTS_TABLE,
+    ICEBERG_MANIFESTS_TABLE,
+    ICEBERG_FILES_TABLE,
+    ICEBERG_PARTITIONS_TABLE
 }
 
 enum TKeysType {
@@ -402,6 +473,12 @@ struct TTabletCommitInfo {
     2: required i64 backendId
     3: optional list<string> invalid_dict_cache_columns
     4: optional list<string> valid_dict_cache_columns
+    5: optional list<i64> valid_dict_collected_versions
+}
+
+struct TTabletFailInfo {
+    1: optional i64 tabletId
+    2: optional i64 backendId
 }
 
 enum TLoadType {
@@ -413,6 +490,7 @@ enum TLoadType {
 enum TLoadSourceType {
     RAW,
     KAFKA,
+    PULSAR
 }
 
 enum TOpType {
@@ -420,11 +498,17 @@ enum TOpType {
     DELETE,
 }
 
+struct TUserRoles {
+    1: optional list<i64> role_id_list
+}
+
 // represent a user identity
 struct TUserIdentity {
     1: optional string username
     2: optional string host
     3: optional bool is_domain
+    4: optional bool is_ephemeral
+    5: optional TUserRoles current_role_ids
 }
 
 const i32 TSNAPSHOT_REQ_VERSION1 = 3; // corresponding to alpha rowset
@@ -445,4 +529,83 @@ enum TCompressionType {
     DEFLATE = 9;
     BZIP2 = 10;
     LZO = 11; // Deprecated
+    BROTLI = 12;
+    AUTO = 13;
+}
+
+enum TWriteQuorumType {
+    ONE = 0;
+    MAJORITY = 1;
+    ALL = 2;
+}
+
+enum StreamSourceType {
+    BINLOG,
+    KAFKA, // NOT IMPLEMENTED
+}
+
+struct TBinlogOffset {
+    1: optional TTabletId tablet_id
+    2: optional TVersion version
+    3: optional i64 lsn
+}
+
+enum TPartialUpdateMode {
+    UNKNOWN_MODE = 0;
+    ROW_MODE = 1;
+    COLUMN_UPSERT_MODE = 2;
+    AUTO_MODE = 3;
+    COLUMN_UPDATE_MODE = 4;
+}
+
+enum TRunMode {
+    SHARED_NOTHING = 0;
+    SHARED_DATA = 1;
+    HYBRID = 2;
+}
+
+struct TIcebergColumnStats {
+    1: optional map<i32, i64> column_sizes
+    2: optional map<i32, i64> value_counts
+    3: optional map<i32, i64> null_value_counts
+    4: optional map<i32, i64> nan_value_counts
+    5: optional map<i32, binary> lower_bounds;
+    6: optional map<i32, binary> upper_bounds;
+}
+
+struct TIcebergDataFile {
+    1: optional string path
+    2: optional string format
+    3: optional i64 record_count
+    4: optional i64 file_size_in_bytes
+    5: optional string partition_path;
+    6: optional list<i64> split_offsets;
+    7: optional TIcebergColumnStats column_stats;
+}
+
+struct THiveFileInfo {
+    1: optional string file_name
+    2: optional string partition_path
+    4: optional i64 record_count
+    5: optional i64 file_size_in_bytes
+}
+
+struct TSinkCommitInfo {
+    1: optional TIcebergDataFile iceberg_data_file
+    2: optional THiveFileInfo hive_file_info
+    // ... for other tables sink commit info
+
+    100: optional bool is_overwrite;
+    101: optional string staging_dir
+}
+
+struct TSnapshotInfo {
+    1: optional TBackend backend
+    2: optional string snapshot_path
+    3: optional bool incremental_snapshot
+}
+
+enum TTxnType {
+    TXN_NORMAL = 0,
+    TXN_REPLICATION = 1
 }

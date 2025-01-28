@@ -1,20 +1,31 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include <utility>
 
 #include "column/column.h"
-#include "column/hash_set.h"
 #include "column/nullable_column.h"
 #include "gutil/casts.h"
+#include "storage/column_predicate.h"
 #include "storage/in_predicate_utils.h"
 #include "storage/rowset/bitmap_index_reader.h"
-#include "storage/vectorized_column_predicate.h"
 #include "util/string_parser.hpp"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
-template <FieldType field_type>
-class ColumnNotInPredicate : public ColumnPredicate {
+template <LogicalType field_type>
+class ColumnNotInPredicate final : public ColumnPredicate {
     using ValueType = typename CppTypeTraits<field_type>::CppType;
 
 public:
@@ -80,8 +91,23 @@ public:
 
     bool zone_map_filter(const ZoneMapDetail& detail) const override { return true; }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return false; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         return Status::Cancelled("not-equal predicate not support bitmap index");
+    }
+
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::EQUAL_QUERY;
+        roaring::Roaring indices;
+        for (auto value : _values) {
+            roaring::Roaring index;
+            RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &value, query_type, &index));
+            indices |= index;
+        }
+        *row_bitmap -= indices;
+        return Status::OK();
     }
 
     PredicateType type() const override { return PredicateType::kNotInList; }
@@ -105,7 +131,7 @@ public:
             return Status::OK();
         }
 
-        if (to_type == OLAP_FIELD_TYPE_DECIMAL128) {
+        if (to_type == TYPE_DECIMAL128) {
             std::vector<std::string> strs;
             const auto type_info = this->type_info();
             for (ValueType value : _values) {
@@ -114,7 +140,7 @@ public:
             *output = obj_pool->add(new_column_not_in_predicate(target_type_info, _column_id, strs));
             return Status::OK();
         }
-        if constexpr (field_type == OLAP_FIELD_TYPE_DECIMAL128) {
+        if constexpr (field_type == TYPE_DECIMAL128) {
             std::vector<std::string> strs;
             for (ValueType value : _values) {
                 strs.emplace_back(DecimalV3Cast::to_string<ValueType>(value, 27, 9));
@@ -131,13 +157,27 @@ public:
         return Status::OK();
     }
 
+    std::string debug_string() const override {
+        std::stringstream ss;
+        ss << "((columnId=" << _column_id << ")NOT IN(";
+        int i = 0;
+        for (auto& item : _values) {
+            if (i++ != 0) {
+                ss << ",";
+            }
+            ss << this->type_info()->to_string(&item);
+        }
+        ss << "))";
+        return ss.str();
+    }
+
 private:
     ItemHashSet<ValueType> _values;
 };
 
 // Template specialization for binary column
-template <FieldType field_type>
-class BinaryColumnNotInPredicate : public ColumnPredicate {
+template <LogicalType field_type>
+class BinaryColumnNotInPredicate final : public ColumnPredicate {
 public:
     BinaryColumnNotInPredicate(const TypeInfoPtr& type_info, ColumnId id, std::vector<std::string> strings)
             : ColumnPredicate(type_info, id), _zero_padded_strs(std::move(strings)) {
@@ -220,8 +260,24 @@ public:
 
     bool zone_map_filter(const ZoneMapDetail& detail) const override { return true; }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return false; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         return Status::Cancelled("not-equal predicate not support bitmap index");
+    }
+
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::EQUAL_QUERY;
+        roaring::Roaring indices;
+        for (const std::string& s : _zero_padded_strs) {
+            Slice padded_value(s);
+            roaring::Roaring index;
+            RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &padded_value, query_type, &index));
+            indices |= index;
+        }
+        *row_bitmap -= indices;
+        return Status::OK();
     }
 
     bool can_vectorized() const override { return false; }
@@ -268,75 +324,80 @@ ColumnPredicate* new_column_not_in_predicate(const TypeInfoPtr& type_info, Colum
                                              const std::vector<std::string>& strs) {
     auto type = type_info->type();
     switch (type) {
-    case OLAP_FIELD_TYPE_BOOL:
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_BOOL>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_TINYINT:
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_TINYINT>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_SMALLINT:
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_SMALLINT>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_INT:
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_INT>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_BIGINT:
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_BIGINT>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_LARGEINT:
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_LARGEINT>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_DECIMAL:
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_DECIMAL>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_DECIMAL_V2:
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_DECIMAL_V2>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_DECIMAL32: {
+    case TYPE_BOOLEAN:
+        return new ColumnNotInPredicate<TYPE_BOOLEAN>(type_info, id, strs);
+    case TYPE_TINYINT:
+        return new ColumnNotInPredicate<TYPE_TINYINT>(type_info, id, strs);
+    case TYPE_SMALLINT:
+        return new ColumnNotInPredicate<TYPE_SMALLINT>(type_info, id, strs);
+    case TYPE_INT:
+        return new ColumnNotInPredicate<TYPE_INT>(type_info, id, strs);
+    case TYPE_BIGINT:
+        return new ColumnNotInPredicate<TYPE_BIGINT>(type_info, id, strs);
+    case TYPE_LARGEINT:
+        return new ColumnNotInPredicate<TYPE_LARGEINT>(type_info, id, strs);
+    case TYPE_DECIMAL:
+        return new ColumnNotInPredicate<TYPE_DECIMAL>(type_info, id, strs);
+    case TYPE_DECIMALV2:
+        return new ColumnNotInPredicate<TYPE_DECIMALV2>(type_info, id, strs);
+    case TYPE_DECIMAL32: {
         const auto scale = type_info->scale();
-        using SetType = ItemHashSet<CppTypeTraits<OLAP_FIELD_TYPE_DECIMAL32>::CppType>;
-        SetType values = predicate_internal::strings_to_decimal_set<OLAP_FIELD_TYPE_DECIMAL32>(scale, strs);
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_DECIMAL32>(type_info, id, std::move(values));
+        using SetType = ItemHashSet<CppTypeTraits<TYPE_DECIMAL32>::CppType>;
+        SetType values = predicate_internal::strings_to_decimal_set<TYPE_DECIMAL32>(scale, strs);
+        return new ColumnNotInPredicate<TYPE_DECIMAL32>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_DECIMAL64: {
+    case TYPE_DECIMAL64: {
         const auto scale = type_info->scale();
-        using SetType = ItemHashSet<CppTypeTraits<OLAP_FIELD_TYPE_DECIMAL64>::CppType>;
-        SetType values = predicate_internal::strings_to_decimal_set<OLAP_FIELD_TYPE_DECIMAL64>(scale, strs);
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_DECIMAL64>(type_info, id, std::move(values));
+        using SetType = ItemHashSet<CppTypeTraits<TYPE_DECIMAL64>::CppType>;
+        SetType values = predicate_internal::strings_to_decimal_set<TYPE_DECIMAL64>(scale, strs);
+        return new ColumnNotInPredicate<TYPE_DECIMAL64>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_DECIMAL128: {
+    case TYPE_DECIMAL128: {
         const auto scale = type_info->scale();
-        using SetType = ItemHashSet<CppTypeTraits<OLAP_FIELD_TYPE_DECIMAL128>::CppType>;
-        SetType values = predicate_internal::strings_to_decimal_set<OLAP_FIELD_TYPE_DECIMAL128>(scale, strs);
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_DECIMAL128>(type_info, id, std::move(values));
+        using SetType = ItemHashSet<CppTypeTraits<TYPE_DECIMAL128>::CppType>;
+        SetType values = predicate_internal::strings_to_decimal_set<TYPE_DECIMAL128>(scale, strs);
+        return new ColumnNotInPredicate<TYPE_DECIMAL128>(type_info, id, std::move(values));
     }
-    case OLAP_FIELD_TYPE_CHAR:
-        return new BinaryColumnNotInPredicate<OLAP_FIELD_TYPE_CHAR>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_VARCHAR:
-        return new BinaryColumnNotInPredicate<OLAP_FIELD_TYPE_VARCHAR>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_DATE:
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_DATE>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_DATE_V2:
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_DATE_V2>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_DATETIME:
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_DATETIME>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_TIMESTAMP:
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_TIMESTAMP>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_FLOAT:
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_FLOAT>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_DOUBLE:
-        return new ColumnNotInPredicate<OLAP_FIELD_TYPE_DOUBLE>(type_info, id, strs);
-    case OLAP_FIELD_TYPE_UNSIGNED_TINYINT:
-    case OLAP_FIELD_TYPE_UNSIGNED_SMALLINT:
-    case OLAP_FIELD_TYPE_UNSIGNED_INT:
-    case OLAP_FIELD_TYPE_UNSIGNED_BIGINT:
-    case OLAP_FIELD_TYPE_DISCRETE_DOUBLE:
-    case OLAP_FIELD_TYPE_STRUCT:
-    case OLAP_FIELD_TYPE_ARRAY:
-    case OLAP_FIELD_TYPE_MAP:
-    case OLAP_FIELD_TYPE_UNKNOWN:
-    case OLAP_FIELD_TYPE_NONE:
-    case OLAP_FIELD_TYPE_HLL:
-    case OLAP_FIELD_TYPE_OBJECT:
-    case OLAP_FIELD_TYPE_PERCENTILE:
-    case OLAP_FIELD_TYPE_JSON:
-    case OLAP_FIELD_TYPE_MAX_VALUE:
+    case TYPE_CHAR:
+        return new BinaryColumnNotInPredicate<TYPE_CHAR>(type_info, id, strs);
+    case TYPE_VARCHAR:
+        return new BinaryColumnNotInPredicate<TYPE_VARCHAR>(type_info, id, strs);
+    case TYPE_DATE_V1:
+        return new ColumnNotInPredicate<TYPE_DATE_V1>(type_info, id, strs);
+    case TYPE_DATE:
+        return new ColumnNotInPredicate<TYPE_DATE>(type_info, id, strs);
+    case TYPE_DATETIME_V1:
+        return new ColumnNotInPredicate<TYPE_DATETIME_V1>(type_info, id, strs);
+    case TYPE_DATETIME:
+        return new ColumnNotInPredicate<TYPE_DATETIME>(type_info, id, strs);
+    case TYPE_FLOAT:
+        return new ColumnNotInPredicate<TYPE_FLOAT>(type_info, id, strs);
+    case TYPE_DOUBLE:
+        return new ColumnNotInPredicate<TYPE_DOUBLE>(type_info, id, strs);
+    case TYPE_UNSIGNED_TINYINT:
+    case TYPE_UNSIGNED_SMALLINT:
+    case TYPE_UNSIGNED_INT:
+    case TYPE_UNSIGNED_BIGINT:
+    case TYPE_DISCRETE_DOUBLE:
+    case TYPE_STRUCT:
+    case TYPE_ARRAY:
+    case TYPE_MAP:
+    case TYPE_UNKNOWN:
+    case TYPE_NONE:
+    case TYPE_HLL:
+    case TYPE_OBJECT:
+    case TYPE_PERCENTILE:
+    case TYPE_JSON:
+    case TYPE_NULL:
+    case TYPE_FUNCTION:
+    case TYPE_TIME:
+    case TYPE_BINARY:
+    case TYPE_MAX_VALUE:
+    case TYPE_VARBINARY:
         return nullptr;
         // No default to ensure newly added enumerator will be handled.
     }
     return nullptr;
 }
 
-} //namespace starrocks::vectorized
+} //namespace starrocks

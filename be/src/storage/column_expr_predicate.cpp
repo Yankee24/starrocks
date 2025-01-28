@@ -1,29 +1,44 @@
-
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
-
 #include "storage/column_expr_predicate.h"
 
+#include <utility>
+
 #include "column/column_helper.h"
+#include "common/status.h"
+#include "common/statusor.h"
+#include "exprs/binary_predicate.h"
+#include "exprs/cast_expr.h"
+#include "exprs/column_ref.h"
 #include "exprs/expr.h"
 #include "exprs/expr_context.h"
-#include "exprs/vectorized/binary_predicate.h"
-#include "exprs/vectorized/cast_expr.h"
-#include "exprs/vectorized/column_ref.h"
+#include "exprs/function_call_expr.h"
+#include "exprs/literal.h"
 #include "runtime/current_thread.h"
 #include "runtime/descriptors.h"
-#include "runtime/primitive_type.h"
 #include "runtime/runtime_state.h"
-#include "storage/vectorized_column_predicate.h"
+#include "storage/column_predicate.h"
+#include "types/logical_type.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 ColumnExprPredicate::ColumnExprPredicate(TypeInfoPtr type_info, ColumnId column_id, RuntimeState* state,
-                                         ExprContext* expr_ctx, const SlotDescriptor* slot_desc)
-        : ColumnPredicate(type_info, column_id), _state(state), _slot_desc(slot_desc), _monotonic(true) {
+                                         const SlotDescriptor* slot_desc)
+        : ColumnPredicate(std::move(type_info), column_id), _state(state), _slot_desc(slot_desc), _monotonic(true) {
+    _is_expr_predicate = true;
+}
+
+StatusOr<ColumnExprPredicate*> ColumnExprPredicate::make_column_expr_predicate(TypeInfoPtr type_info,
+                                                                               ColumnId column_id, RuntimeState* state,
+                                                                               ExprContext* expr_ctx,
+                                                                               const SlotDescriptor* slot_desc) {
+    auto* expr_predicate = new ColumnExprPredicate(std::move(type_info), column_id, state, slot_desc);
     // note: conjuncts would be shared by multiple scanners
     // so here we have to clone one to keep thread safe.
-    _add_expr_ctx(expr_ctx);
-    _is_expr_predicate = true;
+    expr_predicate->_add_expr_ctx(expr_ctx);
+    // passed by FE
+    if (expr_ctx != nullptr) {
+        expr_predicate->set_index_filter_only(expr_ctx->is_index_only_filter());
+    }
+    return expr_predicate;
 }
 
 ColumnExprPredicate::~ColumnExprPredicate() {
@@ -32,7 +47,7 @@ ColumnExprPredicate::~ColumnExprPredicate() {
     }
 }
 
-void ColumnExprPredicate::_add_expr_ctxs(std::vector<ExprContext*> expr_ctxs) {
+void ColumnExprPredicate::_add_expr_ctxs(const std::vector<ExprContext*>& expr_ctxs) {
     for (auto& expr : expr_ctxs) {
         _add_expr_ctx(expr);
     }
@@ -42,7 +57,7 @@ void ColumnExprPredicate::_add_expr_ctx(std::unique_ptr<ExprContext> expr_ctx) {
     if (expr_ctx != nullptr) {
         DCHECK(expr_ctx->opened());
         // Transfer the ownership to object pool
-        auto* ctx = _state->obj_pool()->add(expr_ctx.release());
+        auto* ctx = _pool.add(expr_ctx.release());
         _expr_ctxs.emplace_back(ctx);
         _monotonic &= ctx->root()->is_monotonic();
     }
@@ -52,7 +67,7 @@ void ColumnExprPredicate::_add_expr_ctx(ExprContext* expr_ctx) {
     if (expr_ctx != nullptr) {
         DCHECK(expr_ctx->opened());
         ExprContext* ctx = nullptr;
-        DCHECK_IF_ERROR(expr_ctx->clone(_state, &ctx));
+        DCHECK_IF_ERROR(expr_ctx->clone(_state, &_pool, &ctx));
         _expr_ctxs.emplace_back(ctx);
         _monotonic &= ctx->root()->is_monotonic();
     }
@@ -93,7 +108,7 @@ Status ColumnExprPredicate::evaluate(const Column* column, uint8_t* selection, u
 
     // deal with nullable.
     if (bits->is_nullable()) {
-        NullableColumn* null_column = ColumnHelper::as_raw_column<NullableColumn>(bits);
+        auto* null_column = ColumnHelper::as_raw_column<NullableColumn>(bits);
         uint8_t* null_value = null_column->null_column_data().data();
         uint8_t* data_value = ColumnHelper::get_cpp_data<TYPE_BOOLEAN>(null_column->data_column());
         for (uint16_t i = from; i < to; i++) {
@@ -156,7 +171,10 @@ bool ColumnExprPredicate::zone_map_filter(const ZoneMapDetail& detail) const {
         size += 2;
     }
     // if all of them are evaluated to false, we don't need this zone.
-    evaluate(col.get(), selection, 0, size);
+    if (!evaluate(col.get(), selection, 0, size).ok()) {
+        return true;
+    }
+
     for (uint16_t i = 0; i < size; i++) {
         if (selection[i] != 0) {
             return true;
@@ -164,6 +182,11 @@ bool ColumnExprPredicate::zone_map_filter(const ZoneMapDetail& detail) const {
     }
     VLOG_FILE << "ColumnExprPredicate: zone_map_filter succeeded. # of skipped rows = " << detail.num_rows();
     return false;
+}
+
+bool ColumnExprPredicate::ngram_bloom_filter(const BloomFilter* bf,
+                                             const NgramBloomFilterReaderOptions& reader_options) const {
+    return _expr_ctxs[0]->ngram_bloom_filter(bf, reader_options);
 }
 
 Status ColumnExprPredicate::convert_to(const ColumnPredicate** output, const TypeInfoPtr& target_type_info,
@@ -179,8 +202,9 @@ Status ColumnExprPredicate::convert_to(const ColumnPredicate** output, const Typ
     RETURN_IF_ERROR(cast_expr_ctx->prepare(_state));
     RETURN_IF_ERROR(cast_expr_ctx->open(_state));
 
-    ColumnExprPredicate* pred =
-            obj_pool->add(new ColumnExprPredicate(target_type_info, _column_id, _state, nullptr, _slot_desc));
+    ASSIGN_OR_RETURN(auto pred, ColumnExprPredicate::make_column_expr_predicate(target_type_info, _column_id, _state,
+                                                                                nullptr, _slot_desc));
+
     pred->_add_expr_ctxs(_expr_ctxs);
     pred->_add_expr_ctx(std::move(cast_expr_ctx));
     *output = pred;
@@ -214,7 +238,7 @@ Status ColumnExprPredicate::try_to_rewrite_for_zone_map_filter(starrocks::Object
         }
         if (root->get_child(0)->is_monotonic() && root->get_child(1)->is_monotonic()) {
             // rewrite = to >= and <=
-            auto build_binary_predicate_func = [this, pool, root](TExprOpcode::type new_op) {
+            auto build_binary_predicate_func = [pool, root](TExprOpcode::type new_op) {
                 TExprNode node;
                 node.node_type = TExprNodeType::BINARY_PRED;
                 node.type = root->type().to_thrift();
@@ -247,9 +271,9 @@ Status ColumnExprPredicate::try_to_rewrite_for_zone_map_filter(starrocks::Object
         auto expr_rewrite = std::make_unique<ExprContext>(expr);
         RETURN_IF_ERROR(expr_rewrite->prepare(_state));
         RETURN_IF_ERROR(expr_rewrite->open(_state));
-
-        ColumnExprPredicate* new_pred =
-                pool->add(new ColumnExprPredicate(_type_info, _column_id, _state, nullptr, _slot_desc));
+        ASSIGN_OR_RETURN(ColumnExprPredicate * new_pred, ColumnExprPredicate::make_column_expr_predicate(
+                                                                 _type_info, _column_id, _state, nullptr, _slot_desc));
+        new_pred = pool->add(new_pred);
         new_pred->_add_expr_ctx(std::move(expr_rewrite));
         for (int i = 1; i < _expr_ctxs.size(); i++) {
             new_pred->_add_expr_ctx(_expr_ctxs[i]);
@@ -257,6 +281,73 @@ Status ColumnExprPredicate::try_to_rewrite_for_zone_map_filter(starrocks::Object
         output->emplace_back(new_pred);
     }
 
+    return Status::OK();
+}
+Status ColumnExprPredicate::seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                                                roaring::Roaring* row_bitmap) const {
+    // Only support simple (NOT) LIKE/MATCH predicate for now
+    // Root must be (NOT) LIKE/MATCH, and left child must be ColumnRef, which satisfy simple (NOT) LIKE/MATCH predicate
+    // format as: col (NOT) LIKE/MATCH xxx, xxx must be string literal
+    // For the untokenized mode, LIKE and MATCH are both available.
+    // Otherwise, only MATCH is available.
+    bool vaild_pred = false;
+    bool vaild_like = false;
+    bool vaild_match = false;
+    bool with_not = false;
+
+    with_not = _expr_ctxs[0]->root()->node_type() == TExprNodeType::COMPOUND_PRED &&
+               _expr_ctxs[0]->root()->op() == TExprOpcode::COMPOUND_NOT;
+    DCHECK((with_not && _expr_ctxs[0]->root()->get_num_children() == 1) || !with_not);
+
+    Expr* expr = with_not ? _expr_ctxs[0]->root()->get_child(0) : _expr_ctxs[0]->root();
+
+    auto* vectorized_function_call =
+            expr->node_type() == TExprNodeType::FUNCTION_CALL ? down_cast<VectorizedFunctionCallExpr*>(expr) : nullptr;
+
+    // check if satisfy vaild LIKE format
+    vaild_like = vectorized_function_call != nullptr &&
+                 LIKE_FN_NAME == boost::to_lower_copy(vectorized_function_call->get_function_desc()->name) &&
+                 expr->get_num_children() == 2 && expr->get_child(0)->node_type() == TExprNodeType::SLOT_REF &&
+                 expr->get_child(1)->node_type() == TExprNodeType::STRING_LITERAL;
+
+    // check if satisfy vaild MATCH format
+    vaild_match = vectorized_function_call == nullptr && expr->node_type() == TExprNodeType::MATCH_EXPR &&
+                  expr->get_num_children() == 2 && expr->get_child(0)->node_type() == TExprNodeType::SLOT_REF &&
+                  expr->get_child(1)->node_type() == TExprNodeType::STRING_LITERAL;
+
+    vaild_pred = iterator->is_untokenized() ? (vaild_like || vaild_match) : vaild_match;
+
+    if (!vaild_pred) {
+        std::stringstream ss;
+        ss << "Not supported function call in inverted index, expr predicate: "
+           << (_expr_ctxs[0]->root() != nullptr ? _expr_ctxs[0]->root()->debug_string() : "");
+        LOG(WARNING) << ss.str();
+        return Status::NotSupported(ss.str());
+    }
+
+    auto* like_target = dynamic_cast<VectorizedLiteral*>(expr->get_child(1));
+    DCHECK(like_target != nullptr);
+    ASSIGN_OR_RETURN(auto literal_col, like_target->evaluate_checked(_expr_ctxs[0], nullptr));
+    Slice padded_value(literal_col->get(0).get_slice());
+    // MATCH a empty string should always return empty set.
+    if (padded_value.empty()) {
+        *row_bitmap -= *row_bitmap;
+        return Status::OK();
+    }
+    std::string str_v = padded_value.to_string();
+    InvertedIndexQueryType query_type = InvertedIndexQueryType::UNKNOWN_QUERY;
+    if (str_v.find('*') == std::string::npos && str_v.find('%') == std::string::npos) {
+        query_type = InvertedIndexQueryType::EQUAL_QUERY;
+    } else {
+        query_type = InvertedIndexQueryType::MATCH_WILDCARD_QUERY;
+    }
+    roaring::Roaring roaring;
+    RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &padded_value, query_type, &roaring));
+    if (with_not) {
+        *row_bitmap -= roaring;
+    } else {
+        *row_bitmap &= roaring;
+    }
     return Status::OK();
 }
 
@@ -282,4 +373,4 @@ std::string ColumnTruePredicate::debug_string() const {
     return "(ColumnTruePredicate)";
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

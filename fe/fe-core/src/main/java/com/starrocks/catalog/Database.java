@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/Database.java
 
@@ -25,46 +38,45 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.catalog.Table.TableType;
+import com.starrocks.catalog.system.information.InfoSchemaDb;
+import com.starrocks.catalog.system.sys.SysDb;
 import com.starrocks.cluster.ClusterNamespace;
-import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.FeConstants;
-import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.Pair;
-import com.starrocks.common.UserException;
+import com.starrocks.common.StarRocksException;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.common.util.DebugUtil;
-import com.starrocks.common.util.QueryableReentrantReadWriteLock;
-import com.starrocks.common.util.Util;
-import com.starrocks.persist.CreateTableInfo;
+import com.starrocks.common.util.concurrent.LockUtils.SlowLockLogStats;
+import com.starrocks.common.util.concurrent.QueryableReentrantReadWriteLock;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.persist.DropInfo;
+import com.starrocks.server.CatalogMgr;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.statistic.StatsConstants;
 import com.starrocks.system.SystemInfoService;
-import com.starrocks.task.AgentBatchTask;
-import com.starrocks.task.AgentTask;
-import com.starrocks.task.AgentTaskExecutor;
-import org.apache.hadoop.util.ThreadUtil;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.io.UnsupportedEncodingException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 import java.util.zip.Adler32;
 
 /**
@@ -82,36 +94,49 @@ import java.util.zip.Adler32;
  */
 public class Database extends MetaObject implements Writable {
     private static final Logger LOG = LogManager.getLogger(Database.class);
-
     // empirical value.
     // assume that the time a lock is held by thread is less than 100ms
     public static final long TRY_LOCK_TIMEOUT_MS = 100L;
-    public static final long SLOW_LOCK_MS = 3000L;
-    public static final long SLOW_LOCK_LOG_EVERY_MS = 3000L;
 
+    @SerializedName(value = "i")
     private long id;
+    @SerializedName(value = "n")
     private String fullQualifiedName;
-    private String clusterName;
-    private QueryableReentrantReadWriteLock rwLock;
-
-    // table family group map
-    private Map<Long, Table> idToTable;
-    private Map<String, Table> nameToTable;
-
     // user define function
-    private ConcurrentMap<String, ImmutableList<Function>> name2Function = Maps.newConcurrentMap();
-
+    @SerializedName(value = "f")
+    private ConcurrentMap<String, List<Function>> name2Function = Maps.newConcurrentMap();
+    @SerializedName(value = "d")
     private volatile long dataQuotaBytes;
-
+    @SerializedName(value = "r")
     private volatile long replicaQuotaSize;
 
-    private long lastSlowLockLogTime = 0;
+    private final Map<String, Table> nameToTable;
+    private final Map<Long, Table> idToTable;
+
+    // catalogName is set if the database comes from an external catalog
+    private String catalogName;
+
+    private final QueryableReentrantReadWriteLock rwLock;
+    private SlowLockLogStats slowLockLogStats = new SlowLockLogStats();
+
+    // This param is used to make sure db not dropped when leader node writes wal,
+    // so this param does not need to be persisted,
+    // and this param maybe not right when the db is dropped and the catalog has done a checkpoint,
+    // but that's ok to meet our needs.
+    private volatile boolean exist = true;
+
+    // For external database location like hdfs://name_node:9000/user/hive/warehouse/test.db/
+    private String location;
 
     public Database() {
         this(0, null);
     }
 
     public Database(long id, String name) {
+        this(id, name, "");
+    }
+
+    public Database(long id, String name, String location) {
         this.id = id;
         this.fullQualifiedName = name;
         if (this.fullQualifiedName == null) {
@@ -120,114 +145,71 @@ public class Database extends MetaObject implements Writable {
         this.rwLock = new QueryableReentrantReadWriteLock(true);
         this.idToTable = new ConcurrentHashMap<>();
         this.nameToTable = new ConcurrentHashMap<>();
-        this.dataQuotaBytes = FeConstants.default_db_data_quota_bytes;
-        this.replicaQuotaSize = FeConstants.default_db_replica_quota_size;
-        this.clusterName = "";
+        this.dataQuotaBytes = FeConstants.DEFAULT_DB_DATA_QUOTA_BYTES;
+        this.replicaQuotaSize = FeConstants.DEFAULT_DB_REPLICA_QUOTA_SIZE;
+        this.location = location;
     }
 
-    public void readLock() {
-        long startMs = System.nanoTime() / 1000000;
-        this.rwLock.readLock().lock();
-        long endMs = System.nanoTime() / 1000000;
-        if (endMs - startMs > SLOW_LOCK_MS && endMs > lastSlowLockLogTime + SLOW_LOCK_LOG_EVERY_MS) {
-            lastSlowLockLogTime = endMs;
-            LOG.warn("slow read lock db:" + id + " " + fullQualifiedName + " " + (endMs - startMs) + "ms",
-                    new Exception());
-        }
+    /**
+     * Database rwLock will be deleted later, please do not use this interface directly.
+     * Use Locker.lockDatabase to obtain db lock
+     */
+    @Deprecated
+    public QueryableReentrantReadWriteLock getRwLock() {
+        return rwLock;
     }
 
-    public boolean tryReadLock(long timeout, TimeUnit unit) {
-        try {
-            if (!this.rwLock.readLock().tryLock(timeout, unit)) {
-                Thread owner = rwLock.getOwner();
-                if (owner != null) {
-                    LOG.warn("database lock is held by: {}", Util.dumpThread(owner, 50));
-                }
-                return false;
-            }
-            return true;
-        } catch (InterruptedException e) {
-            LOG.warn("failed to try read lock at db[" + id + "]", e);
-            return false;
-        }
-    }
-
-    public void readUnlock() {
-        this.rwLock.readLock().unlock();
-    }
-
-    public void writeLock() {
-        long startMs = System.nanoTime() / 1000000;
-        this.rwLock.writeLock().lock();
-        long endMs = System.nanoTime() / 1000000;
-        if (endMs - startMs > SLOW_LOCK_MS && endMs > lastSlowLockLogTime + SLOW_LOCK_LOG_EVERY_MS) {
-            lastSlowLockLogTime = endMs;
-            LOG.warn("slow write lock db:" + id + " " + fullQualifiedName + " " + (endMs - startMs) + "ms",
-                    new Exception());
-        }
-    }
-
-    public boolean tryWriteLock(long timeout, TimeUnit unit) {
-        try {
-            if (!this.rwLock.writeLock().tryLock(timeout, unit)) {
-                Thread owner = rwLock.getOwner();
-                if (owner != null) {
-                    LOG.warn("database lock is held by: {}", Util.dumpThread(owner, 50));
-                }
-                return false;
-            }
-            return true;
-        } catch (InterruptedException e) {
-            LOG.warn("failed to try write lock at db[" + id + "]", e);
-            return false;
-        }
-    }
-
-    public void writeUnlock() {
-        this.rwLock.writeLock().unlock();
-    }
-
-    public boolean isWriteLockHeldByCurrentThread() {
-        return this.rwLock.writeLock().isHeldByCurrentThread();
+    public SlowLockLogStats getSlowLockLogStats() {
+        return slowLockLogStats;
     }
 
     public long getId() {
         return id;
     }
 
+    /**
+     * Get the unique id of database in string format, since we already ensure
+     * the uniqueness of id for internal database, we just convert it to string
+     * and return.
+     * Note: for external database, we use database name as the privilege entry
+     * id, not the uuid returned by this interface.
+     *
+     * @return unique id of database in string format
+     */
+    public String getUUID() {
+        if (CatalogMgr.isExternalCatalog(catalogName)) {
+            return catalogName + "." + fullQualifiedName;
+        }
+        return Long.toString(id);
+    }
+
+    public String getOriginName() {
+        return fullQualifiedName;
+    }
+
     public String getFullName() {
         return fullQualifiedName;
     }
 
-    public void setNameWithLock(String newName) {
-        writeLock();
-        try {
-            this.fullQualifiedName = newName;
-        } finally {
-            writeUnlock();
-        }
+    public String getLocation() {
+        return location;
     }
 
-    public void setDataQuotaWithLock(long newQuota) {
+    public Database setLocation(String location) {
+        this.location = location;
+        return this;
+    }
+
+    public void setDataQuota(long newQuota) {
         Preconditions.checkArgument(newQuota >= 0L);
         LOG.info("database[{}] set quota from {} to {}", fullQualifiedName, dataQuotaBytes, newQuota);
-        writeLock();
-        try {
-            this.dataQuotaBytes = newQuota;
-        } finally {
-            writeUnlock();
-        }
+        this.dataQuotaBytes = newQuota;
     }
 
-    public void setReplicaQuotaWithLock(long newQuota) {
+    public void setReplicaQuota(long newQuota) {
         Preconditions.checkArgument(newQuota >= 0L);
         LOG.info("database[{}] set replica quota from {} to {}", fullQualifiedName, replicaQuotaSize, newQuota);
-        writeLock();
-        try {
-            this.replicaQuotaSize = newQuota;
-        } finally {
-            writeUnlock();
-        }
+        this.replicaQuotaSize = newQuota;
     }
 
     public long getDataQuota() {
@@ -240,10 +222,11 @@ public class Database extends MetaObject implements Writable {
 
     public long getUsedDataQuotaWithLock() {
         long usedDataQuota = 0;
-        readLock();
+        Locker locker = new Locker();
+        locker.lockDatabase(id, LockType.READ);
         try {
             for (Table table : this.idToTable.values()) {
-                if (table.getType() != TableType.OLAP) {
+                if (!table.isOlapTableOrMaterializedView()) {
                     continue;
                 }
 
@@ -252,27 +235,7 @@ public class Database extends MetaObject implements Writable {
             }
             return usedDataQuota;
         } finally {
-            readUnlock();
-        }
-    }
-
-    public long getReplicaQuotaLeftWithLock() {
-        long usedReplicaQuota = 0;
-        readLock();
-        try {
-            for (Table table : this.idToTable.values()) {
-                if (table.getType() != TableType.OLAP) {
-                    continue;
-                }
-
-                OlapTable olapTable = (OlapTable) table;
-                usedReplicaQuota = usedReplicaQuota + olapTable.getReplicaCount();
-            }
-
-            long leftReplicaQuota = replicaQuotaSize - usedReplicaQuota;
-            return Math.max(leftReplicaQuota, 0L);
-        } finally {
-            readUnlock();
+            locker.unLockDatabase(id, LockType.READ);
         }
     }
 
@@ -290,18 +253,34 @@ public class Database extends MetaObject implements Writable {
         LOG.info("database[{}] data quota: left bytes: {} / total: {}",
                 fullQualifiedName, readableLeftQuota, readableQuota);
 
-        if (leftDataQuota <= 0L) {
+        if (leftDataQuota == 0L) {
             throw new DdlException("Database[" + fullQualifiedName
                     + "] data size exceeds quota[" + readableQuota + "]");
         }
     }
 
     public void checkReplicaQuota() throws DdlException {
-        long leftReplicaQuota = getReplicaQuotaLeftWithLock();
+        long usedReplicaQuota = 0;
+        Locker locker = new Locker();
+        locker.lockDatabase(id, LockType.READ);
+        try {
+            for (Table table : this.idToTable.values()) {
+                if (!table.isOlapTableOrMaterializedView()) {
+                    continue;
+                }
+
+                OlapTable olapTable = (OlapTable) table;
+                usedReplicaQuota = usedReplicaQuota + olapTable.getReplicaCount();
+            }
+        } finally {
+            locker.unLockDatabase(id, LockType.READ);
+        }
+
+        long leftReplicaQuota = Math.max(replicaQuotaSize - usedReplicaQuota, 0L);
         LOG.info("database[{}] replica quota: left number: {} / total: {}",
                 fullQualifiedName, leftReplicaQuota, replicaQuotaSize);
 
-        if (leftReplicaQuota <= 0L) {
+        if (leftReplicaQuota == 0L) {
             throw new DdlException("Database[" + fullQualifiedName
                     + "] replica number exceeds quota[" + replicaQuotaSize + "]");
         }
@@ -312,183 +291,166 @@ public class Database extends MetaObject implements Writable {
         checkReplicaQuota();
     }
 
-    // return false if table already exists
-    public boolean createTableWithLock(Table table, boolean isReplay) {
-        writeLock();
-        try {
+    public boolean registerTableUnlocked(Table table) {
+        if (table == null) {
+            return false;
+        }
+        if (table.isTemporaryTable()) {
+            long tableId = table.getId();
+            if (idToTable.containsKey(tableId)) {
+                return false;
+            }
+            idToTable.put(tableId, table);
+        } else {
             String tableName = table.getName();
             if (nameToTable.containsKey(tableName)) {
                 return false;
-            } else {
-                idToTable.put(table.getId(), table);
-                nameToTable.put(table.getName(), table);
-
-                if (!isReplay) {
-                    // Write edit log
-                    CreateTableInfo info = new CreateTableInfo(fullQualifiedName, table);
-                    GlobalStateMgr.getCurrentState().getEditLog().logCreateTable(info);
-                }
-
-                table.onCreate();
             }
-            return true;
-        } finally {
-            writeUnlock();
-        }
-    }
-
-    public boolean createTable(Table table) {
-        boolean result = true;
-        String tableName = table.getName();
-        if (nameToTable.containsKey(tableName)) {
-            result = false;
-        } else {
             idToTable.put(table.getId(), table);
             nameToTable.put(table.getName(), table);
         }
-        return result;
+        return true;
+    }
+
+    public void unRegisterTableUnlocked(Table table) {
+        if (table == null) {
+            return;
+        }
+
+        idToTable.remove(table.getId());
+        if (!table.isTemporaryTable()) {
+            nameToTable.remove(table.getName());
+        }
     }
 
     public void dropTable(String tableName, boolean isSetIfExists, boolean isForce) throws DdlException {
         Table table;
-        HashMap<Long, AgentBatchTask> batchTaskMap;
-        writeLock();
+        Locker locker = new Locker();
+        locker.lockDatabase(id, LockType.WRITE);
         try {
-            table = getTable(tableName);
-            // double check because the table may be dropped
+            table = nameToTable.get(tableName);
+            if (table == null && isSetIfExists) {
+                return;
+            }
             if (table == null) {
-                if (isSetIfExists) {
-                    LOG.info("drop table[{}] which does not exist", tableName);
-                    return;
-                } else {
-                    ErrorReport.reportDdlException(ErrorCode.ERR_BAD_TABLE_ERROR, tableName);
-                }
+                ErrorReport.reportDdlException(ErrorCode.ERR_BAD_TABLE_ERROR, tableName);
+                return;
             }
-            if (!isForce) {
-                if (GlobalStateMgr.getCurrentState().getGlobalTransactionMgr()
-                        .existCommittedTxns(id, table.getId(), null)) {
-                    throw new DdlException(
-                            "There are still some transactions in the COMMITTED state waiting to be completed. " +
-                                    "The table [" + table.getName() +
-                                    "] cannot be dropped. If you want to forcibly drop(cannot be recovered)," +
-                                    " please use \"DROP table FORCE\".");
-                }
+            if (!isForce &&
+                    GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().existCommittedTxns(id, table.getId(), null)) {
+                throw new DdlException("There are still some transactions in the COMMITTED state waiting to be completed. " +
+                        "The table [" + table.getName() +
+                        "] cannot be dropped. If you want to forcibly drop(cannot be recovered)," +
+                        " please use \"DROP TABLE <table> FORCE\".");
             }
-            batchTaskMap = unprotectDropTable(table.getId(), isForce, false);
+            unprotectDropTable(table.getId(), isForce, false);
             DropInfo info = new DropInfo(id, table.getId(), -1L, isForce);
             GlobalStateMgr.getCurrentState().getEditLog().logDropTable(info);
         } finally {
-            writeUnlock();
+            locker.unLockDatabase(id, LockType.WRITE);
         }
-        sendDropTabletTasks(batchTaskMap);
-        LOG.info("finished dropping table: {}, type:{} from db: {}, is force: {}",
-                table.getName(), table.getType(), fullQualifiedName, isForce);
+
+        if (isForce) {
+            table.delete(getId(), false);
+        }
+
+        LOG.info("Finished log drop table '{}' from database '{}'. tableId: {} tableType: {} force: {}",
+                tableName, fullQualifiedName, table.getId(), table.getType(), isForce);
     }
 
-    public HashMap<Long, AgentBatchTask> unprotectDropTable(long tableId, boolean isForceDrop,
-                                                            boolean isReplay) {
-        HashMap<Long, AgentBatchTask> batchTaskMap = new HashMap<>();
-        Table table = getTable(tableId);
-        // delete from db meta
-        if (table == null) {
-            return batchTaskMap;
-        }
-
-        table.onDrop();
-
-        dropTable(table.getName());
-        if (!isForceDrop) {
-            Table oldTable = GlobalStateMgr.getCurrentState().getRecycleBin().recycleTable(id, table);
-            if (oldTable != null && oldTable.getType() == Table.TableType.OLAP) {
-                batchTaskMap = GlobalStateMgr.getCurrentState().onEraseOlapTable((OlapTable) oldTable, false);
-            }
-        } else {
-            if (table.getType() == Table.TableType.OLAP) {
-                batchTaskMap = GlobalStateMgr.getCurrentState().onEraseOlapTable((OlapTable) table, isReplay);
-            }
-        }
-
-        LOG.info("finished dropping table[{}] in db[{}], tableId: {}", table.getName(), getFullName(),
-                table.getId());
-        return batchTaskMap;
-    }
-
-    public void sendDropTabletTasks(HashMap<Long, AgentBatchTask> batchTaskMap) {
-        int numDropTaskPerBe = Config.max_agent_tasks_send_per_be;
-        for (Map.Entry<Long, AgentBatchTask> entry : batchTaskMap.entrySet()) {
-            AgentBatchTask originTasks = entry.getValue();
-            if (originTasks.getTaskNum() > numDropTaskPerBe) {
-                AgentBatchTask partTask = new AgentBatchTask();
-                List<AgentTask> allTasks = originTasks.getAllTasks();
-                int curTask = 1;
-                for (AgentTask task : allTasks) {
-                    partTask.addTask(task);
-                    if (curTask++ > numDropTaskPerBe) {
-                        AgentTaskExecutor.submit(partTask);
-                        curTask = 1;
-                        partTask = new AgentBatchTask();
-                        ThreadUtil.sleepAtLeastIgnoreInterrupts(1000);
-                    }
-                }
-                if (partTask.getAllTasks().size() > 0) {
-                    AgentTaskExecutor.submit(partTask);
-                }
-            } else {
-                AgentTaskExecutor.submit(originTasks);
-            }
-        }
-    }
-
-    public void dropTableWithLock(String tableName) {
-        writeLock();
+    public void dropTemporaryTable(long tableId, String tableName, boolean isSetIfExists, boolean isForce) throws DdlException {
+        Table table;
+        Locker locker = new Locker();
+        locker.lockDatabase(id, LockType.WRITE);
         try {
-            Table table = this.nameToTable.get(tableName);
-            if (table != null) {
-                this.nameToTable.remove(tableName);
-                this.idToTable.remove(table.getId());
+            table = idToTable.get(tableId);
+            if (table == null) {
+                if (isSetIfExists) {
+                    return;
+                }
+                ErrorReport.reportDdlException(ErrorCode.ERR_BAD_TABLE_ERROR, tableName);
             }
+            unprotectDropTemporaryTable(tableId, isForce, false);
+            DropInfo info = new DropInfo(id, table.getId(), -1L, isForce);
+            GlobalStateMgr.getCurrentState().getEditLog().logDropTable(info);
         } finally {
-            writeUnlock();
+            locker.unLockDatabase(id, LockType.WRITE);
         }
     }
 
-    public void dropTable(String tableName) {
+
+    /**
+     * Drop a table from this database.
+     *
+     * <p>
+     * Note: Prefer to modify {@link Table#onDrop(Database, boolean, boolean)} and
+     * {@link Table#delete(long, boolean)} rather than this function.
+     *
+     * @param tableId the id of the table to be dropped
+     * @param isForceDrop is this a force drop
+     * @param isReplay is this a log replay operation
+     * @return The dropped table
+     */
+    public Table unprotectDropTable(long tableId, boolean isForceDrop, boolean isReplay) {
+        Table table = dropTable(tableId);
+        if (table != null) {
+            table.onDrop(this, isForceDrop, isReplay);
+            if (!isForceDrop) {
+                GlobalStateMgr.getCurrentState().getRecycleBin().recycleTable(id, table, true);
+            }
+            LOG.info("Finished drop table '{}' from database '{}'. tableId: {} force: {} replay: {}",
+                    table.getName(), getOriginName(), tableId, isForceDrop, isReplay);
+        }
+        return table;
+    }
+
+    public Table unprotectDropTemporaryTable(long tableId, boolean isForceDrop, boolean isReplay) {
+        Table table = dropTemporaryTable(tableId);
+        if (table != null) {
+            table.onDrop(this, isForceDrop, isReplay);
+            LOG.info("Finished drop temporary table '{}' from database '{}', tableId: {}, sessionId: {}",
+                    table.getName(), getOriginName(), tableId, ((OlapTable) table).getSessionId());
+        }
+        return table;
+    }
+
+    public Table dropTable(long tableId) {
+        Table table = this.idToTable.get(tableId);
+        if (table != null) {
+            this.nameToTable.remove(table.getName());
+            this.idToTable.remove(tableId);
+        }
+        return table;
+    }
+
+    public Table dropTable(String tableName) {
         Table table = this.nameToTable.get(tableName);
         if (table != null) {
             this.nameToTable.remove(tableName);
             this.idToTable.remove(table.getId());
         }
+        return table;
     }
 
-    public boolean createMaterializedWithLock(MaterializedView materializedView, boolean isReplay) {
-        writeLock();
-        try {
-            String mvName = materializedView.getName();
-            if (nameToTable.containsKey(mvName)) {
-                return false;
-            } else {
-                idToTable.put(materializedView.getId(), materializedView);
-                nameToTable.put(materializedView.getName(), materializedView);
-                // ref base table with mv
-                Set<Long> baseTableIds = materializedView.getBaseTableIds();
-                for (Long baseTableId : baseTableIds) {
-                    ((OlapTable) idToTable.get(baseTableId)).addRelatedMaterializedView(materializedView.getId());
-                }
-                if (!isReplay) {
-                    // Write edit log
-                    CreateTableInfo info = new CreateTableInfo(fullQualifiedName, materializedView);
-                    GlobalStateMgr.getCurrentState().getEditLog().logCreateMaterializedView(info);
-                }
-                materializedView.onCreate();
-            }
-            return true;
-        } finally {
-            writeUnlock();
+    public Table dropTemporaryTable(long tableId) {
+        Table table = this.idToTable.get(tableId);
+        if (table != null) {
+            Preconditions.checkArgument(table.isTemporaryTable(), "table should be temporary table");
+            this.idToTable.remove(tableId);
         }
+        return table;
     }
 
     public List<Table> getTables() {
-        return new ArrayList<Table>(idToTable.values());
+        return new ArrayList<>(idToTable.values());
+    }
+
+    public int getTableNumber() {
+        return idToTable.size();
+    }
+
+    public List<Table> getTemporaryTables() {
+        return idToTable.values().stream().filter(t -> t.isTemporaryTable()).collect(Collectors.toList());
     }
 
     public List<Table> getViews() {
@@ -501,60 +463,63 @@ public class Database extends MetaObject implements Writable {
         return views;
     }
 
-    public List<Table> getMaterializedViews() {
-        List<Table> materializedViews = new ArrayList<>();
-        for (Table table : idToTable.values()) {
-            if (TableType.MATERIALIZED_VIEW == table.getType()) {
-                materializedViews.add(table);
-            }
-        }
-        return materializedViews;
+    public List<MaterializedView> getMaterializedViews() {
+        return idToTable.values().stream()
+                .filter(Table::isMaterializedView)
+                .map(x -> (MaterializedView) x)
+                .collect(Collectors.toList());
     }
 
-    public Set<String> getTableNamesWithLock() {
-        readLock();
+    public Set<String> getTableNamesViewWithLock() {
+        Locker locker = new Locker();
+        locker.lockDatabase(id, LockType.READ);
         try {
-            return new HashSet<>(this.nameToTable.keySet());
+            return Collections.unmodifiableSet(this.nameToTable.keySet());
         } finally {
-            readUnlock();
+            locker.unLockDatabase(id, LockType.READ);
         }
-    }
-
-    public Table getTable(String tableName) {
-        if (nameToTable.containsKey(tableName)) {
-            return nameToTable.get(tableName);
-        }
-        return null;
     }
 
     /**
      * This is a thread-safe method when idToTable is a concurrent hash map
-     *
-     * @param tableId
-     * @return
      */
     public Table getTable(long tableId) {
         return idToTable.get(tableId);
     }
 
-    public static Database read(DataInput in) throws IOException {
-        Database db = new Database();
-        db.readFields(in);
-        return db;
+    public Table getTable(String tableName) {
+        return nameToTable.get(tableName);
+    }
+
+    public Pair<Table, MaterializedIndexMeta> getMaterializedViewIndex(String mvName) {
+        // TODO: add an index to speed it up.
+        for (Table table : idToTable.values()) {
+            if (table instanceof OlapTable) {
+                OlapTable olapTable = (OlapTable) table;
+                for (MaterializedIndexMeta mvMeta : olapTable.getVisibleIndexMetas()) {
+                    String indexName = olapTable.getIndexNameById(mvMeta.getIndexId());
+                    if (indexName == null) {
+                        continue;
+                    }
+                    if (indexName.equals(mvName)) {
+                        return Pair.create(table, mvMeta);
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     @Override
     public int getSignature(int signatureVersion) {
         Adler32 adler32 = new Adler32();
         adler32.update(signatureVersion);
-        String charsetName = "UTF-8";
-        try {
-            adler32.update(this.fullQualifiedName.getBytes(charsetName));
-        } catch (UnsupportedEncodingException e) {
-            LOG.error("encoding error", e);
-            return -1;
-        }
+        adler32.update(this.fullQualifiedName.getBytes(StandardCharsets.UTF_8));
         return Math.abs((int) adler32.getValue());
+    }
+
+    public boolean isExist() {
+        return exist;
     }
 
     @Override
@@ -562,7 +527,12 @@ public class Database extends MetaObject implements Writable {
         super.write(out);
 
         out.writeLong(id);
-        Text.writeString(out, fullQualifiedName);
+        // compatible with old version
+        if (fullQualifiedName.isEmpty()) {
+            Text.writeString(out, fullQualifiedName);
+        } else {
+            Text.writeString(out, ClusterNamespace.getFullName(fullQualifiedName));
+        }
         // write tables
         int numTables = nameToTable.size();
         out.writeInt(numTables);
@@ -571,7 +541,7 @@ public class Database extends MetaObject implements Writable {
         }
 
         out.writeLong(dataQuotaBytes);
-        Text.writeString(out, clusterName);
+        Text.writeString(out, SystemInfoService.DEFAULT_CLUSTER);
         // compatible for dbState
         Text.writeString(out, "NORMAL");
         // NOTE: compatible attachDbName
@@ -579,7 +549,7 @@ public class Database extends MetaObject implements Writable {
 
         // write functions
         out.writeInt(name2Function.size());
-        for (Entry<String, ImmutableList<Function>> entry : name2Function.entrySet()) {
+        for (Entry<String, List<Function>> entry : name2Function.entrySet()) {
             Text.writeString(out, entry.getKey());
             out.writeInt(entry.getValue().size());
             for (Function function : entry.getValue()) {
@@ -590,54 +560,9 @@ public class Database extends MetaObject implements Writable {
         out.writeLong(replicaQuotaSize);
     }
 
-    public void readFields(DataInput in) throws IOException {
-        super.readFields(in);
-
-        id = in.readLong();
-        if (GlobalStateMgr.getCurrentStateJournalVersion() < FeMetaVersion.VERSION_30) {
-            fullQualifiedName = ClusterNamespace.getFullName(SystemInfoService.DEFAULT_CLUSTER, Text.readString(in));
-        } else {
-            fullQualifiedName = Text.readString(in);
-        }
-        // read groups
-        int numTables = in.readInt();
-        for (int i = 0; i < numTables; ++i) {
-            Table table = Table.read(in);
-            nameToTable.put(table.getName(), table);
-            idToTable.put(table.getId(), table);
-        }
-
-        // read quota
-        dataQuotaBytes = in.readLong();
-        if (GlobalStateMgr.getCurrentStateJournalVersion() < FeMetaVersion.VERSION_30) {
-            clusterName = SystemInfoService.DEFAULT_CLUSTER;
-        } else {
-            clusterName = Text.readString(in);
-            // Compatible for dbState
-            Text.readString(in);
-            // Compatible for attachDbName
-            Text.readString(in);
-        }
-
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_47) {
-            int numEntries = in.readInt();
-            for (int i = 0; i < numEntries; ++i) {
-                String name = Text.readString(in);
-                ImmutableList.Builder<Function> builder = ImmutableList.builder();
-                int numFunctions = in.readInt();
-                for (int j = 0; j < numFunctions; ++j) {
-                    builder.add(Function.read(in));
-                }
-
-                name2Function.put(name, builder.build());
-            }
-        }
-
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_81) {
-            replicaQuotaSize = in.readLong();
-        } else {
-            replicaQuotaSize = FeConstants.default_db_replica_quota_size;
-        }
+    @Override
+    public int hashCode() {
+        return Long.hashCode(id);
     }
 
     public boolean equals(Object obj) {
@@ -669,90 +594,143 @@ public class Database extends MetaObject implements Writable {
                 && dataQuotaBytes == database.dataQuotaBytes);
     }
 
-    public String getClusterName() {
-        return clusterName;
-    }
-
-    public void setClusterName(String clusterName) {
-        this.clusterName = clusterName;
-    }
-
     public void setName(String name) {
         this.fullQualifiedName = name;
     }
 
-    public synchronized void addFunction(Function function) throws UserException {
-        addFunctionImpl(function, false);
+    public void setCatalogName(String name) {
+        this.catalogName = name;
+    }
+
+    public String getCatalogName() {
+        return catalogName;
+    }
+
+    public synchronized void addFunction(Function function) throws StarRocksException {
+        addFunction(function, false, false);
+    }
+
+    public synchronized void addFunction(Function function, boolean allowExists, boolean createIfNotExists) throws
+            StarRocksException {
+        addFunctionImpl(function, false, allowExists, createIfNotExists);
         GlobalStateMgr.getCurrentState().getEditLog().logAddFunction(function);
     }
 
     public synchronized void replayAddFunction(Function function) {
         try {
-            addFunctionImpl(function, true);
-        } catch (UserException e) {
+            addFunctionImpl(function, true, false, false);
+        } catch (StarRocksException e) {
             Preconditions.checkArgument(false);
         }
     }
 
-    // return true if add success, false
-    private void addFunctionImpl(Function function, boolean isReplay) throws UserException {
+    public static void replayCreateFunctionLog(Function function) {
+        String dbName = function.getFunctionName().getDb();
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbName);
+        if (db == null) {
+            throw new Error("unknown database when replay log, db=" + dbName);
+        }
+        db.replayAddFunction(function);
+    }
+
+    private void addFunctionImpl(Function function, boolean isReplay, boolean allowExists, boolean createIfNotExists)
+            throws StarRocksException {
         String functionName = function.getFunctionName().getFunction();
-        List<Function> existFuncs = name2Function.get(functionName);
+        List<Function> existFuncs = name2Function.getOrDefault(functionName, ImmutableList.of());
+        if (allowExists && createIfNotExists) {
+            // In most DB system (like MySQL, Oracle, Snowflake etc.), these two conditions are now allowed to use together
+            throw new StarRocksException(
+                    "\"IF NOT EXISTS\" and \"OR REPLACE\" cannot be used together in the same CREATE statement");
+        }
         if (!isReplay) {
-            if (existFuncs != null) {
-                for (Function existFunc : existFuncs) {
-                    if (function.compare(existFunc, Function.CompareMode.IS_IDENTICAL)) {
-                        throw new UserException("function already exists");
+            for (Function existFunc : existFuncs) {
+                if (function.compare(existFunc, Function.CompareMode.IS_IDENTICAL)) {
+                    if (createIfNotExists) {
+                        LOG.info("create function [{}] which already exists", functionName);
+                        return;
+                    } else if (!allowExists) {
+                        throw new StarRocksException("function already exists");
                     }
                 }
             }
-            // Get function id for this UDF, use CatalogIdGenerator. Only get function id
-            // when isReplay is false
-            long functionId = GlobalStateMgr.getCurrentState().getNextId();
-            // all user-defined functions id are negative to avoid conflicts with the builtin function
-            function.setFunctionId(-functionId);
+            GlobalFunctionMgr.assignIdToUserDefinedFunction(function);
         }
-
-        ImmutableList.Builder<Function> builder = ImmutableList.builder();
-        if (existFuncs != null) {
-            builder.addAll(existFuncs);
-        }
-        builder.add(function);
-        name2Function.put(functionName, builder.build());
+        name2Function.put(functionName, GlobalFunctionMgr.addOrReplaceFunction(function, existFuncs));
     }
 
-    public synchronized void dropFunction(FunctionSearchDesc function) throws UserException {
-        dropFunctionImpl(function);
+    public synchronized void dropFunction(FunctionSearchDesc function, boolean dropIfExists) throws StarRocksException {
+        dropFunctionImpl(function, dropIfExists);
         GlobalStateMgr.getCurrentState().getEditLog().logDropFunction(function);
+    }
+
+    public synchronized void dropFunctionForRestore(Function function) {
+        FunctionSearchDesc fnDesc = new FunctionSearchDesc(function.getFunctionName(), function.getArgs(),
+                                                           function.hasVarArgs());
+        try {
+            dropFunctionImpl(fnDesc, true);
+        } catch (StarRocksException ignore) {
+        }
     }
 
     public synchronized void replayDropFunction(FunctionSearchDesc functionSearchDesc) {
         try {
-            dropFunctionImpl(functionSearchDesc);
-        } catch (UserException e) {
+            dropFunctionImpl(functionSearchDesc, false);
+        } catch (StarRocksException e) {
             Preconditions.checkArgument(false);
         }
     }
 
-    private void dropFunctionImpl(FunctionSearchDesc function) throws UserException {
+    public static void replayDropFunctionLog(FunctionSearchDesc functionSearchDesc) {
+        String dbName = functionSearchDesc.getName().getDb();
+        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(dbName);
+        if (db == null) {
+            throw new Error("unknown database when replay log, db=" + dbName);
+        }
+        db.replayDropFunction(functionSearchDesc);
+    }
+
+    public Function getFunction(FunctionSearchDesc function) {
         String functionName = function.getName().getFunction();
         List<Function> existFuncs = name2Function.get(functionName);
         if (existFuncs == null) {
-            throw new UserException("Unknown function, function=" + function.toString());
+            return null;
+        }
+        Function func = null;
+        for (Function existFunc : existFuncs) {
+            if (function.isIdentical(existFunc)) {
+                func = existFunc;
+                break;
+            }
+        }
+        return func;
+    }
+
+    private void dropFunctionImpl(FunctionSearchDesc function, boolean dropIfExists) throws StarRocksException {
+        String functionName = function.getName().getFunction();
+        List<Function> existFuncs = name2Function.get(functionName);
+        if (existFuncs == null) {
+            if (dropIfExists) {
+                LOG.info("drop function [{}] which does not exist", functionName);
+                return;
+            }
+            throw new StarRocksException("Unknown function, function=" + function.toString());
         }
         boolean isFound = false;
-        ImmutableList.Builder<Function> builder = ImmutableList.builder();
+        List<Function> newFunctions = new ArrayList<>();
         for (Function existFunc : existFuncs) {
             if (function.isIdentical(existFunc)) {
                 isFound = true;
             } else {
-                builder.add(existFunc);
+                newFunctions.add(existFunc);
             }
         }
         if (!isFound) {
-            throw new UserException("Unknown function, function=" + function.toString());
+            if (dropIfExists) {
+                LOG.info("drop function [{}] which does not exist", functionName);
+                return;
+            }
+            throw new StarRocksException("Unknown function, function=" + function.toString());
         }
-        ImmutableList<Function> newFunctions = builder.build();
         if (newFunctions.isEmpty()) {
             name2Function.remove(functionName);
         } else {
@@ -770,13 +748,65 @@ public class Database extends MetaObject implements Writable {
 
     public synchronized List<Function> getFunctions() {
         List<Function> functions = Lists.newArrayList();
-        for (Map.Entry<String, ImmutableList<Function>> entry : name2Function.entrySet()) {
+        for (Map.Entry<String, List<Function>> entry : name2Function.entrySet()) {
             functions.addAll(entry.getValue());
         }
         return functions;
     }
 
-    public boolean isInfoSchemaDb() {
-        return ClusterNamespace.getNameFromFullName(fullQualifiedName).equalsIgnoreCase(InfoSchemaDb.DATABASE_NAME);
+    public synchronized Map<String, List<Function>> getNameToFunction() {
+        return Maps.newHashMap(name2Function);
+    }
+
+    public synchronized List<Function> getFunctionsByName(String functionName) {
+        return name2Function.getOrDefault(functionName, ImmutableList.of());
+    }
+
+    public boolean isSystemDatabase() {
+        return fullQualifiedName.equalsIgnoreCase(InfoSchemaDb.DATABASE_NAME) ||
+                fullQualifiedName.equalsIgnoreCase(SysDb.DATABASE_NAME);
+    }
+
+    public boolean isStatisticsDatabase() {
+        return fullQualifiedName.equalsIgnoreCase(StatsConstants.STATISTICS_DB_NAME);
+    }
+
+    public static boolean isSystemDatabase(String fullQualifiedName) {
+        return fullQualifiedName.equalsIgnoreCase(InfoSchemaDb.DATABASE_NAME) ||
+                fullQualifiedName.equalsIgnoreCase(SysDb.DATABASE_NAME);
+    }
+
+    public static boolean isStatisticsDatabase(String fullQualifiedName) {
+        return fullQualifiedName.equalsIgnoreCase(StatsConstants.STATISTICS_DB_NAME);
+    }
+
+    public static boolean isSystemOrInternalDatabase(String dbName) {
+        return isSystemDatabase(dbName) || isStatisticsDatabase(dbName);
+    }
+
+    // the invoker should hold db's writeLock
+    public void setExist(boolean exist) {
+        this.exist = exist;
+    }
+
+    public boolean getExist() {
+        return exist;
+    }
+
+    public List<PhysicalPartition> getPartitionSamples() {
+        return this.idToTable.values()
+                .stream()
+                .filter(table -> table instanceof OlapTable)
+                .map(table -> ((OlapTable) table).getPartitionSample())
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+    }
+
+    public int getOlapPartitionsCount() {
+        return this.idToTable.values()
+                .stream()
+                .filter(table -> table instanceof OlapTable)
+                .mapToInt(table -> ((OlapTable) table).getPartitionsCount())
+                .sum();
     }
 }

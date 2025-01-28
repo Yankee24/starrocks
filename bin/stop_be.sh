@@ -16,6 +16,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
+#############################################################################
+# This script is used to stop BE process
+# Usage:
+#     sh stop_be.sh [option]
+#
+# Options:
+#     -h, --help              display this usage only
+#     -g, --graceful          send SIGTERM to BE process instead of SIGKILL
+#    
+#############################################################################
+
 curdir=`dirname "$0"`
 curdir=`cd "$curdir"; pwd`
 
@@ -27,8 +38,46 @@ export PID_DIR=`cd "$curdir"; pwd`
 source $STARROCKS_HOME/bin/common.sh
 
 export_env_from_conf $STARROCKS_HOME/conf/be.conf
+export_shared_envvars
 
 pidfile=$PID_DIR/be.pid
+
+sig=9
+
+usage() {
+    echo "
+This script is used to stop BE process
+Usage:
+    sh stop_be.sh [option]
+
+Options:
+    -h, --help              display this usage only
+    -g, --graceful          send SIGTERM to BE process instead of SIGKILL
+"
+    exit 0
+}
+
+for arg in "$@"
+do
+    case $arg in
+        --help|-h)
+            usage
+        ;;
+        --graceful|-g)
+            sig=15
+        ;;
+    esac
+done
+
+# kill all python worker process
+find "${UDF_RUNTIME_DIR}" -maxdepth 1 -name 'pyworker*' -print0 | while IFS= read -r -d $'\0' worker; do
+    pid=$(echo "$worker" | sed -n 's/.*pyworker_\([0-9]*\).*/\1/p')
+    if [[ ! -z "$pid" ]]; then
+        kill -9 "$pid" > /dev/null
+        rm -- "$worker"
+    fi
+done
+
 
 if [ -f $pidfile ]; then
     pid=`cat $pidfile`
@@ -38,20 +87,14 @@ if [ -f $pidfile ]; then
         exit 1
     fi
 
-    if kill -0 $pid; then
-        if kill -9 $pid > /dev/null 2>&1; then
-            echo "stop $pidcomm, and remove pid file. "
-            rm $pidfile
-            exit 0
-        else
+    if kill -0 $pid >/dev/null 2>&1; then
+        kill -${sig} $pid > /dev/null 2>&1
+        if [ $? -ne 0 ]; then
             exit 1
         fi
-    else
-        echo "Backend already exit, remove pid file. "
-        rm $pidfile
+        while kill -0 $pid >/dev/null 2>&1; do
+            sleep 1
+        done
     fi
-else
-    echo "$pidfile does not exist"
-    exit 1
+    rm $pidfile
 fi
-

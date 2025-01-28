@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/HashDistributionInfo.java
 
@@ -22,39 +35,65 @@
 package com.starrocks.catalog;
 
 import com.google.common.base.Joiner;
+import com.google.common.base.Objects;
 import com.google.common.collect.Lists;
 import com.google.gson.annotations.SerializedName;
-import com.starrocks.analysis.DistributionDesc;
-import com.starrocks.analysis.HashDistributionDesc;
+import com.starrocks.persist.gson.GsonPostProcessable;
+import com.starrocks.planner.OlapScanNode;
+import com.starrocks.sql.ast.DistributionDesc;
+import com.starrocks.sql.ast.HashDistributionDesc;
+import com.starrocks.sql.common.MetaUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
-import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import static java.util.Objects.requireNonNull;
 
 /**
  * Hash Distribution Info.
  */
-public class HashDistributionInfo extends DistributionInfo {
+public class HashDistributionInfo extends DistributionInfo implements GsonPostProcessable {
+
+    @SerializedName("colIds")
+    private List<ColumnId> distributionColumnIds;
+
     @SerializedName(value = "distributionColumns")
-    private List<Column> distributionColumns;
+    @Deprecated // Use distributionColumnIds to get columns, this is reserved for rollback compatibility only.
+    private List<Column> deprecatedColumns;
+
     @SerializedName(value = "bucketNum")
     private int bucketNum;
 
+    private static final Logger LOG = LogManager.getLogger(OlapScanNode.class);
+
     public HashDistributionInfo() {
         super();
-        this.distributionColumns = new ArrayList<Column>();
+        this.deprecatedColumns = new ArrayList<>();
+        this.distributionColumnIds = new ArrayList<>();
     }
 
     public HashDistributionInfo(int bucketNum, List<Column> distributionColumns) {
         super(DistributionInfoType.HASH);
-        this.distributionColumns = distributionColumns;
+        this.deprecatedColumns = requireNonNull(distributionColumns, "distributionColumns is null");
+        this.distributionColumnIds = distributionColumns.stream()
+                .map(Column::getColumnId)
+                .collect(Collectors.toList());
         this.bucketNum = bucketNum;
     }
 
-    public List<Column> getDistributionColumns() {
-        return distributionColumns;
+    @Override
+    public boolean supportColocate() {
+        return true;
+    }
+
+    @Override
+    public List<ColumnId> getDistributionColumns() {
+        return distributionColumnIds;
     }
 
     @Override
@@ -62,30 +101,31 @@ public class HashDistributionInfo extends DistributionInfo {
         return bucketNum;
     }
 
-    public void write(DataOutput out) throws IOException {
-        super.write(out);
-        int columnCount = distributionColumns.size();
-        out.writeInt(columnCount);
-        for (Column column : distributionColumns) {
-            column.write(out);
+    @Override
+    public String getDistributionKey(Map<ColumnId, Column> schema) {
+        List<String> colNames = Lists.newArrayList();
+        for (Column column : MetaUtils.getColumnsByColumnIds(schema, distributionColumnIds)) {
+            colNames.add("`" + column.getName() + "`");
         }
-        out.writeInt(bucketNum);
+        String colList = Joiner.on(", ").join(colNames);
+        return colList;
     }
 
-    public void readFields(DataInput in) throws IOException {
-        super.readFields(in);
-        int columnCount = in.readInt();
-        for (int i = 0; i < columnCount; i++) {
-            Column column = Column.read(in);
-            distributionColumns.add(column);
-        }
-        bucketNum = in.readInt();
+    public void setDistributionColumns(List<Column> columns) {
+        this.deprecatedColumns = columns;
+        this.distributionColumnIds = columns.stream()
+                .map(column -> ColumnId.create(column.getName()))
+                .collect(Collectors.toList());
     }
 
-    public static DistributionInfo read(DataInput in) throws IOException {
-        DistributionInfo distributionInfo = new HashDistributionInfo();
-        distributionInfo.readFields(in);
-        return distributionInfo;
+    @Override
+    public void setBucketNum(int bucketNum) {
+        this.bucketNum = bucketNum;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(type, bucketNum, distributionColumnIds);
     }
 
     @Override
@@ -102,13 +142,13 @@ public class HashDistributionInfo extends DistributionInfo {
 
         return type == hashDistributionInfo.type
                 && bucketNum == hashDistributionInfo.bucketNum
-                && distributionColumns.equals(hashDistributionInfo.distributionColumns);
+                && distributionColumnIds.equals(hashDistributionInfo.distributionColumnIds);
     }
 
     @Override
-    public DistributionDesc toDistributionDesc() {
+    public DistributionDesc toDistributionDesc(Map<ColumnId, Column> schema) {
         List<String> distriColNames = Lists.newArrayList();
-        for (Column col : distributionColumns) {
+        for (Column col : MetaUtils.getColumnsByColumnIds(schema, distributionColumnIds)) {
             distriColNames.add(col.getName());
         }
         DistributionDesc distributionDesc = new HashDistributionDesc(bucketNum, distriColNames);
@@ -116,18 +156,32 @@ public class HashDistributionInfo extends DistributionInfo {
     }
 
     @Override
-    public String toSql() {
+    public void gsonPostProcess() throws IOException {
+        if (distributionColumnIds == null || distributionColumnIds.size() <= 0) {
+            distributionColumnIds = deprecatedColumns.stream().map(Column::getColumnId).collect(Collectors.toList());
+        }
+    }
+
+    @Override
+    public HashDistributionInfo copy() {
+        return new HashDistributionInfo(bucketNum, deprecatedColumns);
+    }
+
+    @Override
+    public String toSql(Map<ColumnId, Column> schema) {
         StringBuilder builder = new StringBuilder();
         builder.append("DISTRIBUTED BY HASH(");
 
         List<String> colNames = Lists.newArrayList();
-        for (Column column : distributionColumns) {
+        for (Column column : MetaUtils.getColumnsByColumnIds(schema, distributionColumnIds)) {
             colNames.add("`" + column.getName() + "`");
         }
         String colList = Joiner.on(", ").join(colNames);
         builder.append(colList);
-
-        builder.append(") BUCKETS ").append(bucketNum).append(" ");
+        builder.append(")");
+        if (bucketNum > 0) {
+            builder.append(" BUCKETS ").append(bucketNum).append(" ");
+        }
         return builder.toString();
     }
 
@@ -137,12 +191,14 @@ public class HashDistributionInfo extends DistributionInfo {
         builder.append("type: ").append(type).append("; ");
 
         builder.append("distribution columns: [");
-        for (Column column : distributionColumns) {
-            builder.append(column.getName()).append(",");
+        for (ColumnId name : distributionColumnIds) {
+            builder.append(name.getId()).append(",");
         }
         builder.append("]; ");
 
-        builder.append("bucket num: ").append(bucketNum).append("; ");
+        if (bucketNum > 0) {
+            builder.append("bucket num: ").append(bucketNum).append("; ");
+        }
 
         return builder.toString();
     }

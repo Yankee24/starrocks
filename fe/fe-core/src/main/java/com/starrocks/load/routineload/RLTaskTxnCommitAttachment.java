@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/routineload/RLTaskTxnCommitAttachment.java
 
@@ -21,12 +34,12 @@
 
 package com.starrocks.load.routineload;
 
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.thrift.TRLTaskTxnCommitAttachment;
 import com.starrocks.thrift.TUniqueId;
 import com.starrocks.transaction.TransactionState;
 import com.starrocks.transaction.TxnCommitAttachment;
 
-import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 
@@ -36,13 +49,22 @@ public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
 
     private long jobId;
     private TUniqueId taskId;
+    @SerializedName("filteredRows")
     private long filteredRows;
+    @SerializedName("loadedRows")
     private long loadedRows;
+    @SerializedName("unselectedRows")
     private long unselectedRows;
+    @SerializedName("receivedBytes")
     private long receivedBytes;
+    @SerializedName("taskExecutionTimeMs")
     private long taskExecutionTimeMs;
+    @SerializedName("progress")
     private RoutineLoadProgress progress;
+    @SerializedName("timestampProgress")
+    private RoutineLoadProgress timestampProgress;
     private String errorLogUrl;
+    private long loadedBytes;
 
     public RLTaskTxnCommitAttachment() {
         super(TransactionState.LoadJobSourceType.ROUTINE_LOAD_TASK);
@@ -56,11 +78,19 @@ public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
         this.loadedRows = rlTaskTxnCommitAttachment.getLoadedRows();
         this.unselectedRows = rlTaskTxnCommitAttachment.getUnselectedRows();
         this.receivedBytes = rlTaskTxnCommitAttachment.getReceivedBytes();
+        this.loadedBytes = rlTaskTxnCommitAttachment.getLoadedBytes();
         this.taskExecutionTimeMs = rlTaskTxnCommitAttachment.getLoadCostMs();
 
         switch (rlTaskTxnCommitAttachment.getLoadSourceType()) {
             case KAFKA:
-                this.progress = new KafkaProgress(rlTaskTxnCommitAttachment.getKafkaRLTaskProgress());
+                this.progress = new KafkaProgress(rlTaskTxnCommitAttachment.getKafkaRLTaskProgress()
+                        .getPartitionCmtOffset());
+                this.timestampProgress = new KafkaProgress(rlTaskTxnCommitAttachment.getKafkaRLTaskProgress().
+                        getPartitionCmtOffsetTimestamp());
+                break;
+            case PULSAR:
+                this.progress = new PulsarProgress(rlTaskTxnCommitAttachment.getPulsarRLTaskProgress());
+                this.timestampProgress = new PulsarProgress();
                 break;
             default:
                 break;
@@ -99,12 +129,20 @@ public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
         return receivedBytes;
     }
 
+    public long getLoadedBytes() {
+        return loadedBytes;
+    }
+
     public long getTaskExecutionTimeMs() {
         return taskExecutionTimeMs;
     }
 
     public RoutineLoadProgress getProgress() {
         return progress;
+    }
+
+    public RoutineLoadProgress getTimestampProgress() {
+        return timestampProgress;
     }
 
     public String getErrorLogUrl() {
@@ -132,15 +170,5 @@ public class RLTaskTxnCommitAttachment extends TxnCommitAttachment {
         out.writeLong(receivedBytes);
         out.writeLong(taskExecutionTimeMs);
         progress.write(out);
-    }
-
-    public void readFields(DataInput in) throws IOException {
-        super.readFields(in);
-        filteredRows = in.readLong();
-        loadedRows = in.readLong();
-        unselectedRows = in.readLong();
-        receivedBytes = in.readLong();
-        taskExecutionTimeMs = in.readLong();
-        progress = RoutineLoadProgress.read(in);
     }
 }

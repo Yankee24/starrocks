@@ -30,7 +30,8 @@ inline int64_t zigZag(int64_t value) {
 }
 
 inline int64_t unZigZag(uint64_t value) {
-    return value >> 1 ^ -(value & 1);
+    uint64_t mask = value & 1;
+    return value >> 1 ^ (~mask + 1);
 }
 
 class RleEncoder {
@@ -75,6 +76,13 @@ public:
 
     virtual void write(int64_t val) = 0;
 
+    /**
+     * Finalize the encoding process. This function should be called after all data required for
+     * encoding has been added. It ensures that any remaining data is processed and the final state
+     * of the encoder is set.
+     */
+    virtual void finishEncode();
+
 protected:
     std::unique_ptr<BufferedOutputStream> outputStream;
     size_t bufferPosition;
@@ -96,6 +104,10 @@ public:
     // must be non-inline!
     virtual ~RleDecoder();
 
+    RleDecoder(ReaderMetrics* _metrics) : metrics(_metrics) {
+        // pass
+    }
+
     /**
      * Seek to a particular spot.
      */
@@ -114,6 +126,9 @@ public:
      *    pointer is not null, positions that are false are skipped.
      */
     virtual void next(int64_t* data, uint64_t numValues, const char* notNull) = 0;
+
+protected:
+    ReaderMetrics* metrics;
 };
 
 /**
@@ -134,7 +149,7 @@ std::unique_ptr<RleEncoder> createRleEncoder(std::unique_ptr<BufferedOutputStrea
    * @param pool memory pool to use for allocation
    */
 std::unique_ptr<RleDecoder> createRleDecoder(std::unique_ptr<SeekableInputStream> input, bool isSigned,
-                                             RleVersion version, MemoryPool& pool,
-                                             DataBuffer<char>* sharedBufferPtr = nullptr);
+                                             RleVersion version, MemoryPool& pool, ReaderMetrics* metrics,
+                                             DataBuffer<char>* sharedBufferPtr);
 
 } // namespace orc

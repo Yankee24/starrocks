@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "column/json_column.h"
 
@@ -19,7 +31,7 @@
 #include "testutil/parallel_test.h"
 #include "util/json.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 // NOLINTNEXTLINE
 PARALLEL_TEST(JsonColumnTest, test_parse) {
@@ -38,6 +50,14 @@ PARALLEL_TEST(JsonColumnTest, test_parse) {
         ASSERT_TRUE(json.ok());
         ASSERT_TRUE(json.value().to_string().ok());
         ASSERT_EQ(json_str, json.value().to_string().value());
+    }
+    {
+        // Exceed length limitation
+        Slice slice;
+        slice.data = json_str.data();
+        slice.size = kJSONLengthLimit + 1;
+        auto maybe_json = JsonValue::parse_json_or_string(slice);
+        ASSERT_FALSE(maybe_json.ok());
     }
 }
 
@@ -210,6 +230,30 @@ PARALLEL_TEST(JsonColumnTest, test_compare) {
     }
 }
 
+PARALLEL_TEST(JsonColumnTest, test_compare_array) {
+    auto array0 = JsonValue::parse("[]").value();
+    auto array1 = JsonValue::parse("[1]").value();
+    auto array2 = JsonValue::parse("[1, 2]").value();
+    EXPECT_EQ(0, array0.compare(array0));
+    EXPECT_EQ(0, array1.compare(array1));
+    EXPECT_EQ(0, array2.compare(array2));
+    EXPECT_LT(array0.compare(array1), 0);
+    EXPECT_LT(array0.compare(array2), 0);
+    EXPECT_LT(array1.compare(array2), 0);
+}
+
+PARALLEL_TEST(JsonColumnTest, test_compare_object) {
+    auto obj0 = JsonValue::parse("{}").value();
+    auto obj1 = JsonValue::parse(R"( {"a": 1} )").value();
+    auto obj2 = JsonValue::parse(R"( {"a": 1, "b": 2} )").value();
+    EXPECT_EQ(0, obj0.compare(obj0));
+    EXPECT_EQ(0, obj1.compare(obj1));
+    EXPECT_EQ(0, obj2.compare(obj2));
+    EXPECT_LT(obj0.compare(obj1), 0);
+    EXPECT_LT(obj0.compare(obj2), 0);
+    EXPECT_LT(obj1.compare(obj2), 0);
+}
+
 // NOLINTNEXTLINE
 PARALLEL_TEST(JsonColumnTest, test_hash) {
     JsonValue x = JsonValue::parse(R"({"a": 1, "b": 2})").value();
@@ -228,7 +272,7 @@ PARALLEL_TEST(JsonColumnTest, test_filter) {
         json_column->append(JsonValue::parse(json_str).value());
     }
 
-    Column::Filter filter(N, 1);
+    Filter filter(N, 1);
     json_column->filter_range(filter, 0, N);
     ASSERT_EQ(N, json_column->size());
 }
@@ -250,7 +294,7 @@ PARALLEL_TEST(JsonColumnTest, test_fmt) {
     std::cerr << json;
 
     std::string str = fmt::format("{}", json);
-    ASSERT_EQ("1", str);
+    ASSERT_EQ("\"1\"", str);
 }
 
 // NOLINTNEXTLINE
@@ -298,7 +342,7 @@ PARALLEL_TEST(JsonColumnTest, test_column_builder) {
             // unwrap nullable column
             Column* unwrapped = ColumnHelper::get_data_column(copy.get());
 
-            JsonColumn* json_column_ptr = down_cast<JsonColumn*>(unwrapped);
+            auto* json_column_ptr = down_cast<JsonColumn*>(unwrapped);
             ASSERT_EQ(1, json_column_ptr->size());
             ASSERT_EQ(0, json_column_ptr->compare_at(0, 0, *column, 0));
         }
@@ -339,4 +383,83 @@ PARALLEL_TEST(JsonColumnTest, test_assign) {
     }
 }
 
-} // namespace starrocks::vectorized
+PARALLEL_TEST(JsonColumnTest, test_serialize) {
+    auto column = RunTimeColumnType<TYPE_JSON>::create();
+    JsonValue json = JsonValue::parse("1").value();
+    column->append(&json);
+
+    EXPECT_EQ(json.serialize_size(), column->serialize_size(0));
+    std::vector<uint8_t> buffer;
+    buffer.resize(json.serialize_size());
+    column->serialize(0, buffer.data());
+
+    // deserialize
+    auto new_column = column->clone_empty();
+    new_column->deserialize_and_append(buffer.data());
+    EXPECT_EQ(0, column->compare_at(0, 0, *new_column, 1));
+}
+
+class JsonConvertTestFixture : public ::testing::TestWithParam<std::tuple<std::string>> {
+public:
+};
+
+TEST_P(JsonConvertTestFixture, convert_from_simdjson) {
+    using namespace simdjson;
+    std::string param_0 = std::get<0>(GetParam());
+    ondemand::parser parser;
+    padded_string json_str(param_0);
+    ondemand::document doc = parser.iterate(json_str);
+    ondemand::object obj = doc.get_object();
+    auto maybe_json = JsonValue::from_simdjson(&obj);
+    ASSERT_TRUE(maybe_json.ok());
+    ASSERT_EQ(json_str.data(), maybe_json.value().to_string_uncheck());
+}
+
+INSTANTIATE_TEST_SUITE_P(JsonConvertTest, JsonConvertTestFixture,
+                         ::testing::Values(
+                                 // clang-format off
+                                    std::make_tuple(R"({"a": 1})"),
+                                    std::make_tuple(R"({"a": null})"),
+                                    std::make_tuple(R"({"a": ""})"),
+                                    std::make_tuple(R"({"a": [1, 2, 3]})"),
+                                    std::make_tuple(R"({"a": {"b": 1}})"),
+                                    // unsigned integer
+                                    std::make_tuple(R"({"a": 18446744073709551615})"),
+
+                                    // empty key
+                                    std::make_tuple(R"({"a": {"": ""}})"),
+                                    // empty array
+                                    std::make_tuple(R"({"a": []})")
+
+                                 // clang-format on
+                                 ));
+
+PARALLEL_TEST(JsonConvertTest, convert_from_simdjson_big_integer) {
+    using namespace simdjson;
+    ondemand::parser parser;
+
+    // a is simdjson::ondemand::number_type::big_integer, and should be converted to double
+    auto big_integer_str = R"({"a": 10000000000000000000000000000000000000000})"_padded;
+    ondemand::document big_integer_doc = parser.iterate(big_integer_str);
+    ondemand::object big_integer_obj = big_integer_doc.get_object();
+    auto big_integer_json = JsonValue::from_simdjson(&big_integer_obj);
+    ASSERT_TRUE(big_integer_json.ok());
+
+    // a is simdjson::ondemand::number_type::floating_point_number
+    auto double_str = R"({"a": 10000000000000000000000000000000000000000.0})"_padded;
+    ondemand::document double_doc = parser.iterate(double_str);
+    ondemand::object double_obj = double_doc.get_object();
+    auto double_json = JsonValue::from_simdjson(&double_obj);
+    ASSERT_TRUE(double_json.ok());
+
+    ASSERT_EQ(double_json.value().to_string_uncheck(), big_integer_json.value().to_string_uncheck());
+
+    // a is simdjson::ondemand::number_type::big_integer, but is overflow for double
+    padded_string double_overflow_str = strings::Substitute("{\"a\":$0}", std::string(400, '1'));
+    ondemand::document double_overflow_doc = parser.iterate(double_overflow_str);
+    ondemand::object double_overflow_obj = double_overflow_doc.get_object();
+    auto double_overflow_json = JsonValue::from_simdjson(&double_overflow_obj);
+    ASSERT_FALSE(double_overflow_json.ok());
+}
+
+} // namespace starrocks

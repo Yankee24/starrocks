@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/common/util/DebugUtil.java
 
@@ -21,9 +34,12 @@
 
 package com.starrocks.common.util;
 
+import com.google.common.base.Joiner;
 import com.starrocks.common.Pair;
 import com.starrocks.proto.PUniqueId;
+import com.starrocks.qe.ConnectContext;
 import com.starrocks.thrift.TUniqueId;
+import org.apache.commons.lang3.exception.ExceptionUtils;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -31,7 +47,7 @@ import java.text.DecimalFormat;
 import java.util.UUID;
 
 public class DebugUtil {
-    public static final DecimalFormat DECIMAL_FORMAT_SCALE_3 = new DecimalFormat("#.000");
+    public static final DecimalFormat DECIMAL_FORMAT_SCALE_3 = new DecimalFormat("0.000");
 
     public static int THOUSAND = 1000;
     public static int MILLION = 1000 * THOUSAND;
@@ -47,7 +63,7 @@ public class DebugUtil {
     public static long TERABYTE = 1024 * GIGABYTE;
 
     public static Pair<Double, String> getUint(long value) {
-        Double doubleValue = Double.valueOf(value);
+        double doubleValue = (double) value;
         String unit = "";
         if (value >= BILLION) {
             unit = "B";
@@ -59,8 +75,7 @@ public class DebugUtil {
             unit = "K";
             doubleValue /= THOUSAND;
         }
-        Pair<Double, String> returnValue = Pair.create(doubleValue, unit);
-        return returnValue;
+        return Pair.create(doubleValue, unit);
     }
 
     // Print the value (timestamp in ms) to builder
@@ -108,28 +123,24 @@ public class DebugUtil {
     }
 
     public static Pair<Double, String> getByteUint(long value) {
-        Double doubleValue = Double.valueOf(value);
-        String unit = "";
-        if (value == 0) {
-            // nothing
-            unit = "";
-        } else if (value > TERABYTE) {
+        double doubleValue = (double) value;
+        String unit;
+        if (value >= TERABYTE) {
             unit = "TB";
             doubleValue /= TERABYTE;
-        } else if (value > GIGABYTE) {
+        } else if (value >= GIGABYTE) {
             unit = "GB";
             doubleValue /= GIGABYTE;
-        } else if (value > MEGABYTE) {
+        } else if (value >= MEGABYTE) {
             unit = "MB";
             doubleValue /= MEGABYTE;
-        } else if (value > KILOBYTE) {
+        } else if (value >= KILOBYTE) {
             unit = "KB";
             doubleValue /= KILOBYTE;
         } else {
             unit = "B";
         }
-        Pair<Double, String> returnValue = Pair.create(doubleValue, unit);
-        return returnValue;
+        return Pair.create(doubleValue, unit);
     }
 
     public static String printId(final TUniqueId id) {
@@ -152,9 +163,38 @@ public class DebugUtil {
         return printId(uuid);
     }
 
-    public static String getStackTrace(Exception e) {
-        StringWriter sw = new StringWriter();
+    /**
+     * Get the stack trace of a throwable object.
+     * see {@link ExceptionUtils#getStackTrace(Throwable)}
+     * @param e the throwable object
+     * @return the stack trace of the throwable object
+     */
+    public static String getStackTrace(final Throwable e) {
+        final StringWriter sw = new StringWriter();
         e.printStackTrace(new PrintWriter(sw));
         return sw.toString();
+    }
+
+    /**
+     * Get the root cause stack trace of a throwable object.
+     * @param e the throwable object
+     */
+    public static String getRootStackTrace(Throwable e) {
+        if (e == null) {
+            return "";
+        }
+        String[] stacks = ExceptionUtils.getRootCauseStackTrace(e);
+        return Joiner.on("\n").join(stacks);
+    }
+
+    /**
+     * Get the query-id for current session
+     */
+    public static String getSessionQueryId() {
+        ConnectContext ctx = ConnectContext.get();
+        if (ctx == null || ctx.getQueryId() == null) {
+            return null;
+        }
+        return printId(ctx.getQueryId());
     }
 }

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/util/slice.h
 
@@ -21,6 +34,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -167,6 +181,13 @@ public:
 
     bool ends_with(const Slice& x) const {
         return ((size >= x.size) && memequal(data + (size - x.size), x.size, x.data, x.size));
+    }
+
+    Slice tolower(std::string& buf) {
+        // copy this slice into buf
+        buf.assign(get_data(), get_size());
+        std::transform(buf.begin(), buf.end(), buf.begin(), [](unsigned char c) { return std::tolower(c); });
+        return Slice(buf.data(), buf.size());
     }
 
     /// @brief Comparator struct, useful for ordered collections (like STL maps).

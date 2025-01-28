@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/gensrc/thrift/PlanNodes.thrift
 
@@ -28,6 +41,8 @@ include "Opcodes.thrift"
 include "Descriptors.thrift"
 include "Partitions.thrift"
 include "RuntimeFilter.thrift"
+include "CloudConfiguration.thrift"
+include "DataCache.thrift"
 
 enum TPlanNodeType {
   OLAP_SCAN_NODE,
@@ -46,7 +61,7 @@ enum TPlanNodeType {
   META_SCAN_NODE,
   ANALYTIC_EVAL_NODE,
   OLAP_REWRITE_NODE,
-  KUDU_SCAN_NODE, // Deprecated
+  KUDU_SCAN_NODE,
   FILE_SCAN_NODE,
   EMPTY_SET_NODE,
   UNION_NODE,
@@ -62,6 +77,14 @@ enum TPlanNodeType {
   TABLE_FUNCTION_NODE,
   DECODE_NODE,
   JDBC_SCAN_NODE,
+  LAKE_SCAN_NODE,
+  NESTLOOP_JOIN_NODE,
+  
+  STREAM_SCAN_NODE,
+  STREAM_JOIN_NODE,
+  STREAM_AGG_NODE,
+  LAKE_META_SCAN_NODE,
+  CAPTURE_VERSION_NODE,
 }
 
 // phases of an execution node
@@ -102,7 +125,19 @@ struct TInternalScanRange {
   6: required string db_name
   7: optional list<TKeyRange> partition_column_ranges
   8: optional string index_name
-  9: optional string table_name
+  9: optional string table_name 
+  10: optional i64 partition_id
+  11: optional i64 row_count
+  // Allow this query to cache remote data on local disks or not.
+  // Only the cloud native tablet will respect this field.
+  12: optional bool fill_data_cache = true;
+  // used for per-bucket compute optimize
+  13: optional i32 bucket_sequence
+  // skip page cache when access page data
+  14: optional bool skip_page_cache = false;
+  // skip local disk data cache when access page data
+  15: optional bool skip_disk_cache = false;
+  16: optional i64 gtid
 }
 
 enum TFileFormatType {
@@ -118,6 +153,7 @@ enum TFileFormatType {
     FORMAT_ORC = 8,
     FORMAT_JSON = 9,
     FORMAT_CSV_ZSTD = 10,
+    FORMAT_AVRO = 11,
 }
 
 // One broker range information.
@@ -140,9 +176,48 @@ struct TBrokerRangeDesc {
     // columns parsed from file path should be after the columns read from file
     10: optional list<string> columns_from_path
     //  it's usefull when format_type == FORMAT_JSON
-    11: optional bool strip_outer_array;
-    12: optional string jsonpaths;
-    13: optional string json_root;
+    11: optional bool strip_outer_array
+    12: optional string jsonpaths
+    13: optional string json_root
+    14: optional Types.TCompressionType compression_type
+}
+
+enum TObjectStoreType {
+  HDFS,
+  S3,
+  KS3,
+  OSS,
+  COS,
+  OBS,
+  TOS,
+  UNIVERSAL_FS
+}
+
+struct THdfsProperty {
+  1: required string key
+  2: required string value
+}
+
+struct THdfsProperties {  
+  1: optional list<THdfsProperty> properties
+  2: optional TObjectStoreType object_store_type
+  3: optional string object_store_path
+  4: optional string access_key
+  5: optional string secret_key
+  6: optional string end_point
+  7: optional bool disable_cache
+  8: optional bool ssl_enable
+  9: optional i32 max_connection
+  10: optional string region
+  11: optional string hdfs_username
+  12: optional CloudConfiguration.TCloudConfiguration cloud_configuration
+}
+
+enum TFileScanType {
+    // broker load, stream load, except insert from files
+    LOAD,
+    FILES_INSERT,
+    FILES_QUERY
 }
 
 struct TBrokerScanRangeParams {
@@ -179,6 +254,35 @@ struct TBrokerScanRangeParams {
     11: optional string multi_column_separator;
     // If multi_row_delimiter is set, row_delimiter will ignore.
     12: optional string multi_row_delimiter;
+    // If non_blocking_read is set, stream_load_pipe will not block while performing read io
+    13: optional bool non_blocking_read; // deprecated
+    // If use_broker is set, we will read hdfs thourgh broker
+    // If use_broker is not set, we will read through libhdfs/S3 directly
+    14: optional bool use_broker
+    // hdfs_read_buffer_size_kb for reading through lib hdfs directly
+    15: optional i32 hdfs_read_buffer_size_kb = 0
+    // properties from hdfs-site.xml, core-site.xml and load_properties
+    16: optional THdfsProperties hdfs_properties
+    // used for channel stream load only
+    20: optional string db_name
+    21: optional string table_name
+    22: optional string label
+    23: optional i64 txn_id
+    // number of lines at the start of the file to skip
+    24: optional i64 skip_header
+    // specifies whether to remove white space from fields 
+    25: optional bool trim_space
+    // enclose character
+    26: optional i8 enclose
+    // escape character
+    27: optional i8 escape
+    // confluent schema registry url for pb import
+    28: optional string confluent_schema_registry_url
+    29: optional i64 json_file_size_limit;
+    30: optional i64 schema_sample_file_count
+    31: optional i64 schema_sample_file_row_count
+    32: optional bool flexible_column_mapping
+    33: optional TFileScanType file_scan_type
 }
 
 // Broker scan range
@@ -186,6 +290,12 @@ struct TBrokerScanRange {
     1: required list<TBrokerRangeDesc> ranges
     2: required TBrokerScanRangeParams params
     3: required list<Types.TNetworkAddress> broker_addresses
+    // used for channel stream load only
+    4: optional i32 channel_id
+    // available when this is a stream load in batch write mode
+    5: optional bool enable_batch_write
+    6: optional i32 batch_write_interval_ms
+    7: optional map<string, string> batch_write_parameters;
 }
 
 // Es scan range
@@ -196,6 +306,34 @@ struct TEsScanRange {
   2: required string index
   3: optional string type
   4: required i32 shard_id
+}
+
+enum TIcebergFileContent {
+    DATA,
+    POSITION_DELETES,
+    EQUALITY_DELETES,
+}
+
+struct TIcebergDeleteFile {
+    1: optional string full_path
+    2: optional Descriptors.THdfsFileFormat file_format
+    3: optional TIcebergFileContent file_content
+    4: optional i64 length
+}
+
+struct TPaimonDeletionFile {
+    1: optional string path
+    2: optional i64 offset
+    3: optional i64 length
+}
+
+// refer to https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vector-descriptor-schema
+struct TDeletionVectorDescriptor {
+  1: optional string storageType
+  2: optional string pathOrInlineDv
+  3: optional i64 offset
+  4: optional i64 sizeInBytes
+  5: optional i64 cardinality
 }
 
 // Hdfs scan range
@@ -224,6 +362,78 @@ struct THdfsScanRange {
     
     // for iceberg table scanrange should contains the full path of file
     8: optional string full_path
+
+    // delta logs of hudi MOR table
+    9: optional list<string> hudi_logs
+
+    // whether to use JNI scanner to read data of hudi MOR table for snapshot queries
+    10: optional bool use_hudi_jni_reader
+
+    11: optional list<TIcebergDeleteFile> delete_files
+
+    // number of lines at the start of the file to skip
+    12: optional i64 skip_header
+
+    // whether to use JNI scanner to read data of paimon table
+    13: optional bool use_paimon_jni_reader
+
+    // paimon split info
+    14: optional string paimon_split_info
+
+    // paimon predicate info
+    15: optional string paimon_predicate_info
+
+    // last modification time of the hdfs file, for data cache
+    16: optional i64 modification_time
+
+    17: optional DataCache.TDataCacheOptions datacache_options
+
+    // identity partition column slots
+    18: optional list<Types.TSlotId> identity_partition_slot_ids;
+
+    19: optional bool use_odps_jni_reader
+
+    20: optional map<string, string> odps_split_infos
+
+    // delete columns slots like iceberg equality delete column slots
+    21: optional list<Types.TSlotId> delete_column_slot_ids;
+
+    22: optional bool use_iceberg_jni_metadata_reader
+
+    // for metadata table split (eg: iceberg manifest file bean)
+    23: optional string serialized_split
+
+    // whether to use JNI scanner to read data of kudu table
+    24: optional bool use_kudu_jni_reader
+
+    // kudu master addresses
+    25: optional string kudu_master
+
+    // kudu scan token
+    26: optional string kudu_scan_token
+
+    // Paimon Deletion Vector File
+    27: optional TPaimonDeletionFile paimon_deletion_file
+
+    // for extended column like iceberg data_seq_num or spec_id
+    28: optional map<Types.TSlotId, Exprs.TExpr> extended_columns;
+    
+    // attached partition value.
+    29: optional Descriptors.THdfsPartition partition_value;
+
+    30: optional Types.TTableId table_id;
+
+    31:optional TDeletionVectorDescriptor deletion_vector_descriptor
+}
+
+struct TBinlogScanRange {
+  1: optional string db_name
+  2: optional Types.TTableId table_id
+  3: optional Types.TPartitionId partition_id
+  4: optional Types.TTabletId tablet_id
+  
+  // Start offset of binlog consumption
+  11: optional Types.TBinlogOffset offset
 }
 
 // Specification of an individual data range which is held in its entirety
@@ -237,6 +447,8 @@ struct TScanRange {
 
   // scan range for hdfs
   20: optional THdfsScanRange hdfs_scan_range
+  
+  30: optional TBinlogScanRange binlog_scan_range
 }
 
 struct TMySQLScanNode {
@@ -245,6 +457,7 @@ struct TMySQLScanNode {
   3: required list<string> columns
   4: required list<string> filters
   5: optional i64 limit
+  6: optional string temporal_clause
 }
 
 struct TFileScanNode {
@@ -253,6 +466,7 @@ struct TFileScanNode {
     // Partition info used to process partition select in broker load
     2: optional list<Exprs.TExpr> partition_exprs
     3: optional list<Partitions.TRangePartition> partition_infos
+    4: optional bool enable_pipeline_load
 }
 
 struct TEsScanNode {
@@ -290,6 +504,12 @@ struct TEsScanNode {
     4: optional map<string, string> fields_context
 }
 
+struct TFrontend {
+  1: optional string id
+  2: optional string ip
+  3: optional i32 http_port
+}
+
 struct TSchemaScanNode {
   1: required Types.TTupleId tuple_id
 
@@ -303,8 +523,70 @@ struct TSchemaScanNode {
   9: optional i64 thread_id
   10: optional string user_ip   // deprecated
   11: optional Types.TUserIdentity current_user_ident   // to replace the user and user_ip
+  12: optional i64 table_id
+  13: optional i64 partition_id
+  14: optional i64 tablet_id
+  15: optional i64 txn_id
+  16: optional i64 job_id
+  17: optional string label
+  18: optional string type
+  19: optional string state
+  20: optional i64 limit
+  21: optional i64 log_start_ts;
+  22: optional i64 log_end_ts;
+  23: optional string log_level;
+  24: optional string log_pattern;
+  25: optional i64 log_limit;
+  26: optional list<TFrontend> frontends;
+
+  101: optional string catalog_name;
 }
 
+enum TAccessPathType {
+    ROOT,       // ROOT
+    KEY,        // MAP KEY
+    OFFSET,     // ARRAY/MAP OFFSET
+    FIELD,      // STRUCT FIELD
+    INDEX,      // ARRAY/MAP INDEX-AT POSITION DATA
+    ALL,        // ARRAY/MAP ALL DATA
+}
+
+struct TColumnAccessPath {
+    1: optional TAccessPathType type
+    2: optional Exprs.TExpr path
+    3: optional list<TColumnAccessPath> children
+    4: optional bool from_predicate
+    5: optional Types.TTypeDesc type_desc
+}
+
+struct TVectorSearchOptions {
+  1: optional bool enable_use_ann;
+  2: optional i64 vector_limit_k;
+  3: optional string vector_distance_column_name;
+  4: optional list<string> query_vector;
+  5: optional map<string, string> query_params;
+  6: optional double vector_range;
+  7: optional i32 result_order;
+  8: optional bool use_ivfpq;
+  9: optional double pq_refine_factor;
+  10: optional double k_factor;
+  11: optional i32 vector_slot_id;
+}
+
+enum SampleMethod {
+  BY_BLOCK,
+  BY_PAGE,
+}
+
+struct TTableSampleOptions {
+  1: optional bool enable_sampling;
+  2: optional SampleMethod sample_method;
+  3: optional i64 random_seed;
+  4: optional i64 probability_percent;
+    
+}
+
+// If you find yourself changing this struct, see also TLakeScanNode
 struct TOlapScanNode {
   1: required Types.TTupleId tuple_id
   2: required list<string> key_column_name
@@ -318,6 +600,25 @@ struct TOlapScanNode {
   23: optional map<i32, i32> dict_string_id_to_int_ids
   // which columns only be used to filter data in the stage of scan data
   24: optional list<string> unused_output_column_name
+  25: optional bool sorted_by_keys_per_tablet = false
+
+  26: optional list<Exprs.TExpr> bucket_exprs
+  27: optional list<string> sort_key_column_names
+  28: optional i32 max_parallel_scan_instance_num
+  29: optional list<TColumnAccessPath> column_access_paths
+
+  30: optional bool use_pk_index
+  31: optional list<Descriptors.TColumn> columns_desc
+  32: optional bool output_chunk_by_bucket
+  // order by hint for scan
+  33: optional bool output_asc_hint
+  34: optional bool partition_order_hint
+  35: optional bool enable_prune_column_after_index_filter
+  36: optional bool enable_gin_filter
+  37: optional i64 schema_id
+
+  40: optional TVectorSearchOptions vector_search_options
+  41: optional TTableSampleOptions sample_options;
 }
 
 struct TJDBCScanNode {
@@ -328,6 +629,30 @@ struct TJDBCScanNode {
   5: optional i64 limit
 }
 
+// If you find yourself changing this struct, see also TOlapScanNode
+struct TLakeScanNode {
+  1: required Types.TTupleId tuple_id
+  2: required list<string> key_column_name
+  3: required list<Types.TPrimitiveType> key_column_type
+  4: required bool is_preaggregation
+  5: optional string sort_column
+  // For profile attributes' printing: `Rollup` `Predicates`
+  6: optional string rollup_name
+  7: optional string sql_predicates
+  8: optional bool enable_column_expr_predicate
+  9: optional map<i32, i32> dict_string_id_to_int_ids
+  // which columns only be used to filter data in the stage of scan data
+  10: optional list<string> unused_output_column_name
+  11: optional list<string> sort_key_column_names
+  12: optional list<Exprs.TExpr> bucket_exprs
+  13: optional list<TColumnAccessPath> column_access_paths
+
+  // physical optimize
+  25: optional bool sorted_by_keys_per_tablet = false
+  32: optional bool output_chunk_by_bucket
+  33: optional bool output_asc_hint
+  34: optional bool partition_order_hint
+}
 
 struct TEqJoinCondition {
   // left-hand side of "<a> = <b>"
@@ -341,7 +666,8 @@ struct TEqJoinCondition {
 enum TStreamingPreaggregationMode {
   AUTO,
   FORCE_STREAMING,
-  FORCE_PREAGGREGATION
+  FORCE_PREAGGREGATION,
+  LIMITED_MEM
 }
 
 enum TJoinOp {
@@ -351,6 +677,8 @@ enum TJoinOp {
   RIGHT_OUTER_JOIN,
   FULL_OUTER_JOIN,
   CROSS_JOIN,
+  // only used for compatibility
+  MERGE_JOIN,
 
   RIGHT_SEMI_JOIN,
   LEFT_ANTI_JOIN,
@@ -402,6 +730,11 @@ struct THashJoinNode {
   52: optional TJoinDistributionMode distribution_mode;
   53: optional list<Exprs.TExpr> partition_exprs
   54: optional list<Types.TSlotId> output_columns
+
+  // used in pipeline engine
+  55: optional bool interpolate_passthrough = false
+  56: optional bool late_materialization = false
+  57: optional bool enable_partition_hash_join = false
 }
 
 struct TMergeJoinNode {
@@ -435,6 +768,14 @@ struct TMergeJoinNode {
   54: optional list<Types.TSlotId> output_columns
 }
 
+struct TNestLoopJoinNode {
+    1: optional TJoinOp join_op
+    2: optional list<RuntimeFilter.TRuntimeFilterDescription> build_runtime_filters;
+    3: optional list<Exprs.TExpr> join_conjuncts
+    4: optional string sql_join_conjuncts
+    5: optional bool interpolate_passthrough = false
+}
+
 enum TAggregationOp {
   INVALID,
   COUNT,
@@ -457,20 +798,10 @@ enum TAggregationOp {
   HLL_C,
   BITMAP_UNION,
   ANY_VALUE,
-  NTILE
+  NTILE,
+  CUME_DIST,
+  PERCENT_RANK
 }
-
-//struct TAggregateFunctionCall {
-  // The aggregate function to call.
-//  1: required Types.TFunction fn
-
-  // The input exprs to this aggregate function
-//  2: required list<Exprs.TExpr> input_exprs
-
-  // If set, this aggregate function udf has varargs and this is the index for the
-  // first variable argument.
-//  3: optional i32 vararg_start_idx
-//}
 
 struct TAggregationNode {
   1: optional list<Exprs.TExpr> grouping_exprs
@@ -500,6 +831,19 @@ struct TAggregationNode {
   23: optional string sql_aggregate_functions
 
   24: optional i32 agg_func_set_version = 1
+  
+  // used in query cache
+  25: optional list<Exprs.TExpr> intermediate_aggr_exprs
+
+  // used in pipeline engine
+  26: optional bool interpolate_passthrough = false
+  
+  27: optional bool use_sort_agg
+
+  28: optional bool use_per_bucket_optimize
+
+  // enable runtime limit, pipelines share one limit
+  29: optional bool enable_pipeline_share_limit = false
 }
 
 struct TRepeatNode {
@@ -532,6 +876,12 @@ enum TTopNType {
   DENSE_RANK
 }
 
+enum TLateMaterializeMode {
+  AUTO,
+  ALWAYS,
+  NEVER,
+}
+
 struct TSortNode {
   1: required TSortInfo sort_info
   // Indicates whether the backend service should use topn vs. sorting
@@ -562,6 +912,16 @@ struct TSortNode {
   23: optional list<Exprs.TExpr> partition_exprs
   24: optional i64 partition_limit
   25: optional TTopNType topn_type;
+  26: optional list<RuntimeFilter.TRuntimeFilterDescription> build_runtime_filters;
+  27: optional i64 max_buffered_rows;
+  28: optional i64 max_buffered_bytes;
+  29: optional bool late_materialization;
+  30: optional bool enable_parallel_merge;
+  31: optional bool analytic_partition_skewed;
+  32: optional list<Exprs.TExpr> pre_agg_exprs;
+  33: optional list<Types.TSlotId> pre_agg_output_slot_id;
+  34: optional bool pre_agg_insert_local_shuffle;
+  40: optional TLateMaterializeMode parallel_merge_late_materialize_mode;
 }
 
 enum TAnalyticWindowType {
@@ -656,6 +1016,8 @@ struct TAnalyticNode {
   11: optional string sql_aggregate_functions
 
   20: optional bool has_outer_join_child
+  21: optional bool use_hash_based_partition
+  22: optional bool is_skewed
 }
 
 struct TMergeNode {
@@ -717,6 +1079,8 @@ struct TExchangeNode {
   3: optional i64 offset
   // Sender's partition type
   4: optional Partitions.TPartitionType partition_type;
+  5: optional bool enable_parallel_merge
+  6: optional TLateMaterializeMode parallel_merge_late_materialize_mode;
 }
 
 // This contains all of the information computed by the plan as part of the resource
@@ -786,6 +1150,35 @@ struct THdfsScanNode {
     10: optional string min_max_sql_predicates;
     11: optional string partition_sql_predicates;
 
+    // Flag to indicate wheather the column names are case sensitive
+    12: optional bool case_sensitive;
+
+    13: optional CloudConfiguration.TCloudConfiguration cloud_configuration;
+
+    14: optional bool can_use_any_column;
+
+    15: optional bool can_use_min_max_count_opt;
+
+    16: optional bool use_partition_column_value_only;
+
+    17: optional Types.TTupleId mor_tuple_id;
+
+    // serialized static metadata table
+    18: optional string serialized_table;
+
+    // serialized lake format predicate for data skipping
+    19: optional string serialized_predicate;
+
+    // if load column statistics for metadata table scan
+    20: optional bool load_column_stats;
+
+    // for jni scan factory selection scanner
+    21: optional string metadata_table_type
+
+    22: optional DataCache.TDataCacheOptions datacache_options;
+
+    // for extended column like iceberg data_seq_num or spec_id
+    23: optional list<Types.TSlotId> extended_slot_ids;
 }
 
 struct TProjectNode {
@@ -794,9 +1187,15 @@ struct TProjectNode {
     2: optional map<Types.TSlotId, Exprs.TExpr> common_slot_map
 }
 
+struct TSelectNode {
+     // used for common expressions compute result reuse
+    1: optional map<Types.TSlotId, Exprs.TExpr> common_slot_map
+}
+
 struct TMetaScanNode {
     // column id to column name
     1: optional map<i32, string> id_to_names
+    2: optional list<Descriptors.TColumn> columns
 }
 
 struct TDecodeNode {
@@ -821,6 +1220,65 @@ struct TConnectorScanNode {
   // // Scan node for hdfs
   // 2: optional THdfsScanNode hdfs_scan_node
 }
+
+// binlog meta column names
+const string BINLOG_OP_COLUMN_NAME = "_binlog_op";
+const string BINLOG_VERSION_COLUMN_NAME = "_binlog_version";
+const string BINLOG_SEQ_ID_COLUMN_NAME = "_binlog_seq_id";
+const string BINLOG_TIMESTAMP_COLUMN_NAME = "_binlog_timestamp";
+
+struct TBinlogScanNode {
+  1: optional Types.TTupleId tuple_id
+}
+
+// Union of all stream source nodes, distinguished by type
+struct TStreamScanNode {
+  // Common fields for all stream-scan nodes
+  1: optional Types.StreamSourceType source_type
+  
+  // Specific scan nodes, distinguished by source_type
+  11: optional TBinlogScanNode binlog_scan
+  // TODO: othe stream scan nodes
+}
+
+struct TStreamJoinNode {
+  1: required TJoinOp join_op
+
+  // anything from the ON, USING or WHERE clauses that's an equi-join predicate
+  2: required list<TEqJoinCondition> eq_join_conjuncts
+
+  // anything from the ON or USING clauses (but *not* the WHERE clause) that's not an
+  // equi-join predicate
+  3: optional list<Exprs.TExpr> other_join_conjuncts
+  4: optional bool is_push_down
+  
+  // for profiling
+  21: optional string sql_join_predicates
+  22: optional string sql_predicates
+
+  52: optional TJoinDistributionMode distribution_mode;
+  53: optional list<Exprs.TExpr> partition_exprs
+  54: optional list<Types.TSlotId> output_columns
+}
+
+struct TStreamAggregationNode {
+  1: optional list<Exprs.TExpr> grouping_exprs
+  // aggregate exprs. The root of each expr is the aggregate function. The
+  // other exprs are the inputs to the aggregate function.
+  2: optional list<Exprs.TExpr> aggregate_functions
+
+  // IMT info
+  10: optional Descriptors.TIMTDescriptor agg_result_imt
+  11: optional Descriptors.TIMTDescriptor agg_intermediate_imt
+  12: optional Descriptors.TIMTDescriptor agg_detail_imt
+  
+  // For profile attributes' printing: `Grouping Keys` `Aggregate Functions`
+  22: optional string sql_grouping_keys
+  23: optional string sql_aggregate_functions
+
+  24: optional i32 agg_func_set_version = 1
+}
+
 
 // This is essentially a union of all messages corresponding to subclasses
 // of PlanNode.
@@ -886,6 +1344,18 @@ struct TPlanNode {
   61: optional TConnectorScanNode connector_scan_node;
 
   62: optional TCrossJoinNode cross_join_node;
+
+  63: optional TLakeScanNode lake_scan_node;
+  
+  64: optional TNestLoopJoinNode nestloop_join_node;
+
+  // 70 ~ 80 are reserved for stream operators
+  // Stream plan
+  70: optional TStreamScanNode stream_scan_node;
+  71: optional TStreamJoinNode stream_join_node;
+  72: optional TStreamAggregationNode stream_agg_node;
+
+  81: optional TSelectNode select_node; 
 }
 
 // A flattened representation of a tree of PlanNodes, obtained by depth-first

@@ -56,6 +56,8 @@ if ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86" OR "${CMAKE_BUILD_TARGET_ARCH}" 
     set(SOURCE_FILES ${SOURCE_FILES} atomicops-internals-x86.cc)
 endif()
 
+SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
+
 add_library(Gutil STATIC ${SOURCE_FILES})
 
 set_target_properties(Gutil PROPERTIES COMPILE_FLAGS "-funsigned-char -Wno-deprecated -Wno-char-subscripts")
@@ -64,12 +66,6 @@ set_target_properties(Gutil PROPERTIES COMPILE_FLAGS "-funsigned-char -Wno-depre
 #set(GUTIL_LIBS
 #  glog
 #  protobuf)
-
-#if (NOT APPLE)
-#  set(GUTIL_LIBS
-#    ${GUTIL_LIBS}
-#    rt) # clock_gettime() requires -lrt
-#endif()
 
 #ADD_EXPORTABLE_LIBRARY(gutil
 #  SRCS ${GUTIL_SRCS}

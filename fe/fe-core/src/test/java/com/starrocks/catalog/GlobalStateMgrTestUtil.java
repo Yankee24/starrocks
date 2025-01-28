@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/catalog/CatalogTestUtil.java
 
@@ -23,38 +36,37 @@ package com.starrocks.catalog;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.analysis.PartitionKeyDesc;
-import com.starrocks.analysis.PartitionValue;
-import com.starrocks.analysis.SingleRangePartitionDesc;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
 import com.starrocks.catalog.MaterializedIndex.IndexState;
 import com.starrocks.catalog.Replica.ReplicaState;
 import com.starrocks.common.DdlException;
 import com.starrocks.persist.EditLog;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.LocalMetastore;
+import com.starrocks.sql.ast.PartitionKeyDesc;
+import com.starrocks.sql.ast.PartitionValue;
+import com.starrocks.sql.ast.SingleRangePartitionDesc;
 import com.starrocks.system.Backend;
-import com.starrocks.system.SystemInfoService;
-import com.starrocks.thrift.TDisk;
 import com.starrocks.thrift.TStorageMedium;
 import com.starrocks.thrift.TStorageType;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
 
 public class GlobalStateMgrTestUtil {
 
     public static String testDb1 = "testDb1";
     public static long testDbId1 = 1;
     public static String testTable1 = "testTable1";
+    public static String testTable7 = "testTable7";
     public static long testTableId1 = 2;
     public static String testPartition1 = "testPartition1";
     public static long testPartitionId1 = 3;
     public static String testIndex1 = "testIndex1";
-    public static String testIndex2 = "testIndex2";
     public static long testIndexId1 = 2; // the base indexid == tableid
     public static int testSchemaHash1 = 93423942;
     public static long testBackendId1 = 5;
@@ -65,7 +77,6 @@ public class GlobalStateMgrTestUtil {
     public static long testReplicaId3 = 10;
     public static long testTabletId1 = 11;
     public static long testStartVersion = 12;
-    public static long testRollupIndexId2 = 13;
     public static String testRollupIndex2 = "newRollupIndex";
     public static String testRollupIndex3 = "newRollupIndex2";
     public static String testTxnLable1 = "testTxnLable1";
@@ -78,8 +89,8 @@ public class GlobalStateMgrTestUtil {
     public static String testTxnLable8 = "testTxnLable8";
     public static String testTxnLable9 = "testTxnLable9";
     public static String testTxnLable10 = "testTxnLable10";
-    public static String testTxnLable11 = "testTxnLable11";
-    public static String testTxnLable12 = "testTxnLable12";
+    public static String testTxnLableCompaction1 = "testTxnLableCompaction1";
+    public static String testTxnLableCompaction2 = "testTxnLableCompaction2";
     public static String testEsTable1 = "partitionedEsTable1";
     public static long testEsTableId1 = 14;
 
@@ -88,30 +99,29 @@ public class GlobalStateMgrTestUtil {
         Constructor<GlobalStateMgr> constructor = GlobalStateMgr.class.getDeclaredConstructor();
         constructor.setAccessible(true);
         GlobalStateMgr globalStateMgr = constructor.newInstance();
-        globalStateMgr.setEditLog(new EditLog("name"));
+        globalStateMgr.setEditLog(new EditLog(new ArrayBlockingQueue<>(100)));
         FakeGlobalStateMgr.setGlobalStateMgr(globalStateMgr);
+        GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().clear();
+
         Backend backend1 = createBackend(testBackendId1, "host1", 123, 124, 125);
         Backend backend2 = createBackend(testBackendId2, "host2", 123, 124, 125);
         Backend backend3 = createBackend(testBackendId3, "host3", 123, 124, 125);
-        backend1.setOwnerClusterName(SystemInfoService.DEFAULT_CLUSTER);
-        backend2.setOwnerClusterName(SystemInfoService.DEFAULT_CLUSTER);
-        backend3.setOwnerClusterName(SystemInfoService.DEFAULT_CLUSTER);
-        GlobalStateMgr.getCurrentSystemInfo().addBackend(backend1);
-        GlobalStateMgr.getCurrentSystemInfo().addBackend(backend2);
-        GlobalStateMgr.getCurrentSystemInfo().addBackend(backend3);
-        globalStateMgr.initDefaultCluster();
+        GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().addBackend(backend1);
+        GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().addBackend(backend2);
+        GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().addBackend(backend3);
         Database db = createSimpleDb(testDbId1, testTableId1, testPartitionId1, testIndexId1, testTabletId1,
                 testStartVersion);
-        globalStateMgr.unprotectCreateDb(db);
+        LocalMetastore metastore = (LocalMetastore) globalStateMgr.getLocalMetastore();
+        metastore.unprotectCreateDb(db);
         return globalStateMgr;
     }
 
     public static boolean compareState(GlobalStateMgr masterGlobalStateMgr, GlobalStateMgr slaveGlobalStateMgr) {
-        Database masterDb = masterGlobalStateMgr.getDb(testDb1);
-        Database slaveDb = slaveGlobalStateMgr.getDb(testDb1);
+        Database masterDb = masterGlobalStateMgr.getLocalMetastore().getDb(testDb1);
+        Database slaveDb = slaveGlobalStateMgr.getLocalMetastore().getDb(testDb1);
         List<Table> tables = masterDb.getTables();
         for (Table table : tables) {
-            Table slaveTable = slaveDb.getTable(table.getId());
+            Table slaveTable = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(slaveDb.getId(), table.getId());
             if (slaveTable == null) {
                 return false;
             }
@@ -123,13 +133,16 @@ public class GlobalStateMgrTestUtil {
             if (masterPartition.getId() != slavePartition.getId()) {
                 return false;
             }
-            if (masterPartition.getVisibleVersion() != slavePartition.getVisibleVersion()
-                    || masterPartition.getNextVersion() != slavePartition.getNextVersion()) {
+            if (masterPartition.getDefaultPhysicalPartition().getVisibleVersion()
+                    != slavePartition.getDefaultPhysicalPartition().getVisibleVersion()
+                    || masterPartition.getDefaultPhysicalPartition().getNextVersion()
+                    != slavePartition.getDefaultPhysicalPartition().getNextVersion()) {
                 return false;
             }
-            List<MaterializedIndex> allMaterializedIndices = masterPartition.getMaterializedIndices(IndexExtState.ALL);
+            List<MaterializedIndex> allMaterializedIndices = masterPartition.getDefaultPhysicalPartition()
+                    .getMaterializedIndices(IndexExtState.ALL);
             for (MaterializedIndex masterIndex : allMaterializedIndices) {
-                MaterializedIndex slaveIndex = slavePartition.getIndex(masterIndex.getId());
+                MaterializedIndex slaveIndex = slavePartition.getDefaultPhysicalPartition().getIndex(masterIndex.getId());
                 if (slaveIndex == null) {
                     return false;
                 }
@@ -139,7 +152,7 @@ public class GlobalStateMgrTestUtil {
                     if (slaveTablet == null) {
                         return false;
                     }
-                    List<Replica> allReplicas = ((LocalTablet) masterTablet).getReplicas();
+                    List<Replica> allReplicas = ((LocalTablet) masterTablet).getImmutableReplicas();
                     for (Replica masterReplica : allReplicas) {
                         Replica slaveReplica = ((LocalTablet) slaveTablet).getReplicaById(masterReplica.getId());
                         if (slaveReplica.getBackendId() != masterReplica.getBackendId()
@@ -157,7 +170,7 @@ public class GlobalStateMgrTestUtil {
 
     public static Database createSimpleDb(long dbId, long tableId, long partitionId, long indexId, long tabletId,
                                           long version) {
-        GlobalStateMgr.getCurrentInvertedIndex().clear();
+        GlobalStateMgr.getCurrentState().getTabletInvertedIndex().clear();
 
         // replica
         long replicaId = 0;
@@ -173,7 +186,7 @@ public class GlobalStateMgrTestUtil {
 
         // index
         MaterializedIndex index = new MaterializedIndex(indexId, IndexState.NORMAL);
-        TabletMeta tabletMeta = new TabletMeta(dbId, tableId, partitionId, indexId, 0, TStorageMedium.HDD);
+        TabletMeta tabletMeta = new TabletMeta(dbId, tableId, partitionId + 100, indexId, 0, TStorageMedium.HDD);
         index.addTablet(tablet, tabletMeta);
 
         tablet.addReplica(replica1);
@@ -182,9 +195,9 @@ public class GlobalStateMgrTestUtil {
 
         // partition
         RandomDistributionInfo distributionInfo = new RandomDistributionInfo(10);
-        Partition partition = new Partition(partitionId, testPartition1, index, distributionInfo);
-        partition.updateVisibleVersion(testStartVersion);
-        partition.setNextVersion(testStartVersion + 1);
+        Partition partition = new Partition(partitionId, partitionId + 100, testPartition1, index, distributionInfo);
+        partition.getDefaultPhysicalPartition().updateVisibleVersion(testStartVersion);
+        partition.getDefaultPhysicalPartition().setNextVersion(testStartVersion + 1);
 
         // columns
         List<Column> columns = new ArrayList<Column>();
@@ -216,15 +229,12 @@ public class GlobalStateMgrTestUtil {
         table.setBaseIndexId(indexId);
         // db
         Database db = new Database(dbId, testDb1);
-        db.createTable(table);
-        db.setClusterName(SystemInfoService.DEFAULT_CLUSTER);
+        db.registerTableUnlocked(table);
 
         // add a es table to globalStateMgr
         try {
             createEsTable(db);
-        } catch (DdlException e) {
-            // TODO Auto-generated catch block
-            // e.printStackTrace();
+        } catch (DdlException ignored) {
         }
         return db;
     }
@@ -249,33 +259,20 @@ public class GlobalStateMgrTestUtil {
 
         RangePartitionInfo partitionInfo = new RangePartitionInfo(partitionColumns);
         Map<String, String> properties = Maps.newHashMap();
-        properties.put(EsTable.HOSTS, "xxx");
-        properties.put(EsTable.INDEX, "doe");
-        properties.put(EsTable.TYPE, "doc");
-        properties.put(EsTable.PASSWORD, "");
-        properties.put(EsTable.USER, "root");
-        properties.put(EsTable.DOC_VALUE_SCAN, "true");
-        properties.put(EsTable.KEYWORD_SNIFF, "true");
+        properties.put(EsTable.KEY_HOSTS, "http://xxx");
+        properties.put(EsTable.KEY_INDEX, "doe");
+        properties.put(EsTable.KEY_TYPE, "doc");
+        properties.put(EsTable.KEY_PASSWORD, "");
+        properties.put(EsTable.KEY_USER, "root");
+        properties.put(EsTable.KEY_DOC_VALUE_SCAN, "true");
+        properties.put(EsTable.KEY_KEYWORD_SNIFF, "true");
         EsTable esTable = new EsTable(testEsTableId1, testEsTable1,
                 columns, properties, partitionInfo);
-        db.createTable(esTable);
+        db.registerTableUnlocked(esTable);
     }
 
     public static Backend createBackend(long id, String host, int heartPort, int bePort, int httpPort) {
         Backend backend = new Backend(id, host, heartPort);
-        // backend.updateOnce(bePort, httpPort, 10000);
-        backend.setAlive(true);
-        return backend;
-    }
-
-    public static Backend createBackend(long id, String host, int heartPort, int bePort, int httpPort,
-                                        long totalCapacityB, long availableCapacityB) {
-        Backend backend = createBackend(id, host, heartPort, bePort, httpPort);
-        Map<String, TDisk> backendDisks = new HashMap<String, TDisk>();
-        String rootPath = "root_path";
-        TDisk disk = new TDisk(rootPath, totalCapacityB, availableCapacityB, true);
-        backendDisks.put(rootPath, disk);
-        backend.updateDisks(backendDisks);
         backend.setAlive(true);
         return backend;
     }

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/plugin/DynamicPluginLoader.java
 
@@ -21,7 +34,7 @@
 
 package com.starrocks.plugin;
 
-import com.starrocks.common.UserException;
+import com.starrocks.common.StarRocksException;
 import com.starrocks.server.GlobalStateMgr;
 import org.apache.commons.io.FileUtils;
 import org.apache.logging.log4j.LogManager;
@@ -75,7 +88,7 @@ public class DynamicPluginLoader extends PluginLoader {
      * get Plugin .zip and read plugin.properties
      */
     @Override
-    public PluginInfo getPluginInfo() throws IOException, UserException {
+    public PluginInfo getPluginInfo() throws IOException, StarRocksException {
         // already install
         if (pluginInfo != null) {
             return pluginInfo;
@@ -106,9 +119,10 @@ public class DynamicPluginLoader extends PluginLoader {
     /**
      * move plugin to StarRocks's PLUGIN_DIR and dynamic load the plugin class
      */
-    public void install() throws UserException, IOException {
+    public void install() throws StarRocksException, IOException {
         if (hasInstalled()) {
-            throw new UserException("Plugin " + pluginInfo.getName() + " has already been installed.");
+            String targetPath = pluginDir.toString() + "/" + pluginInfo.getName();
+            throw new StarRocksException("Plugin " + pluginInfo.getName() + " has already been installed at:" + targetPath);
         }
 
         getPluginInfo();
@@ -138,10 +152,14 @@ public class DynamicPluginLoader extends PluginLoader {
     /**
      * close plugin and delete Plugin
      */
-    public void uninstall() throws IOException, UserException {
+    public void uninstall() throws IOException, StarRocksException {
         if (plugin != null) {
             pluginUninstallValid();
-            plugin.close();
+            try {
+                plugin.close();
+            } catch (Throwable t) {
+                LOG.warn("close plugin failed", t);
+            }
         }
 
         if (null != installPath && Files.exists(installPath)
@@ -156,7 +174,7 @@ public class DynamicPluginLoader extends PluginLoader {
      *
      * @throws PluginException
      */
-    public void reload() throws IOException, UserException {
+    public void reload() throws IOException, StarRocksException {
         if (GlobalStateMgr.isCheckpointThread()) {
             /*
              * No need to reload the plugin when this is a checkpoint thread.
@@ -186,7 +204,7 @@ public class DynamicPluginLoader extends PluginLoader {
      * Dynamic load the plugin.
      * if closePreviousPlugin is true, we will check if there is already an instance of plugin, if yes, close it.
      */
-    Plugin dynamicLoadPlugin(boolean closePreviousPlugin) throws IOException, UserException {
+    Plugin dynamicLoadPlugin(boolean closePreviousPlugin) throws IOException, StarRocksException {
         if (closePreviousPlugin) {
             if (plugin != null) {
                 try {
@@ -203,13 +221,13 @@ public class DynamicPluginLoader extends PluginLoader {
 
         // create a child to load the plugin in this bundle
         ClassLoader parentLoader = PluginClassLoader.createLoader(getClass().getClassLoader(), Collections.EMPTY_LIST);
-        ClassLoader loader = URLClassLoader.newInstance(jarList.toArray(new URL[0]), parentLoader);
 
+        URLClassLoader loader = URLClassLoader.newInstance(jarList.toArray(new URL[0]), parentLoader);
         Class<? extends Plugin> pluginClass;
-        try {
+        try  {
             pluginClass = loader.loadClass(pluginInfo.getClassName()).asSubclass(Plugin.class);
         } catch (ClassNotFoundException | NoClassDefFoundError t) {
-            throw new UserException("Could not find plugin class [" + pluginInfo.getClassName() + "]", t);
+            throw new StarRocksException("Could not find plugin class [" + pluginInfo.getClassName() + "]", t);
         }
 
         return loadPluginClass(pluginClass);
@@ -257,7 +275,7 @@ public class DynamicPluginLoader extends PluginLoader {
     /**
      * move plugin's temp install directory to StarRocks's PLUGIN_DIR/plugin_name
      */
-    public void movePlugin() throws UserException, IOException {
+    public void movePlugin() throws StarRocksException, IOException {
         if (installPath == null || !Files.exists(installPath)) {
             throw new PluginException(
                     "Install plugin " + pluginInfo.getName() + " failed, because install path doesn't "

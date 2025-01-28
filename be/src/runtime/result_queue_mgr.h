@@ -23,9 +23,8 @@
 #include <unordered_map>
 
 #include "common/status.h"
-#include "runtime/primitive_type.h"
-#include "runtime/raw_value.h"
 #include "runtime/record_batch_queue.h"
+#include "types/logical_type.h"
 #include "util/hash_util.hpp"
 
 namespace arrow {

@@ -19,6 +19,7 @@
 
 #include <boost/cstdint.hpp>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,8 @@ public:
     static const int64_t POPCNT = (1 << 4);
     static const int64_t AVX = (1 << 5);
     static const int64_t AVX2 = (1 << 6);
+    static const int64_t AVX512F = (1 << 7);
+    static const int64_t AVX512BW = (1 << 8);
 
     /// Cache enums for L1 (data), L2 and L3
     enum CacheLevel {
@@ -50,31 +53,11 @@ public:
     /// Initialize CpuInfo.
     static void init();
 
-    /// Determine if the CPU meets the minimum CPU requirements and if not, log an error.
-    static void verify_cpu_requirements();
-
-    /// Determine if the CPU scaling governor is set to 'performance' and if not, issue an
-    /// error.
-    static void verify_performance_governor();
-
-    /// Determine if CPU turbo is disabled and if not, issue an error.
-    static void verify_turbo_disabled();
-
-    /// Returns all the flags for this cpu
-    static int64_t hardware_flags() {
-        DCHECK(initialized_);
-        return hardware_flags_;
-    }
-
     /// Returns whether of not the cpu supports this flag
     inline static bool is_supported(long flag) {
         DCHECK(initialized_);
         return (hardware_flags_ & flag) != 0;
     }
-
-    /// Toggle a hardware feature on and off.  It is not valid to turn on a feature
-    /// that the underlying hardware cannot support. This is useful for testing.
-    static void enable_feature(long flag, bool enable);
 
     /// Returns the number of cpu cycles per millisecond
     static int64_t cycles_per_ms() {
@@ -100,94 +83,55 @@ public:
     /// remain stable.
     static int get_current_core();
 
-    /// Returns the maximum number of NUMA nodes that will be online in the system,
-    /// including any that may be offline or disabled.
-    static int get_max_num_numa_nodes() { return max_num_numa_nodes_; }
-
-    /// Returns the NUMA node of the core provided. 'core' must be in the range
-    /// [0, GetMaxNumCores()).
-    static int get_numa_node_of_core(int core) {
-        DCHECK_LE(0, core);
-        DCHECK_LT(core, max_num_cores_);
-        return core_to_numa_node_[core];
-    }
-
-    /// Returns the cores in a NUMA node. 'node' must be in the range
-    /// [0, GetMaxNumNumaNodes()).
-    static const std::vector<int>& get_cores_of_numa_node(int node) {
-        DCHECK_LE(0, node);
-        DCHECK_LT(node, max_num_numa_nodes_);
-        return numa_node_to_cores_[node];
-    }
-
-    /// Returns the cores in the same NUMA node as 'core'. 'core' must be in the range
-    /// [0, GetMaxNumCores()).
-    static const std::vector<int>& get_cores_of_same_numa_node(int core) {
-        DCHECK_LE(0, core);
-        DCHECK_LT(core, max_num_cores_);
-        return get_cores_of_numa_node(get_numa_node_of_core(core));
-    }
-
-    /// Returns the index of the given core within the vector returned by
-    /// GetCoresOfNumaNode() and GetCoresOfSameNumaNode(). 'core' must be in the range
-    /// [0, GetMaxNumCores()).
-    static int get_numa_node_core_idx(int core) {
-        DCHECK_LE(0, core);
-        DCHECK_LT(core, max_num_cores_);
-        return numa_node_core_idx_[core];
-    }
-
-    /// Returns the model name of the cpu (e.g. Intel i7-2600)
-    static std::string model_name() {
-        DCHECK(initialized_);
-        return model_name_;
-    }
-
     static std::string debug_string();
 
-    /// A utility class for temporarily disabling CPU features. Usage:
-    ///
-    /// {
-    ///   CpuInfo::TempDisable disabler(CpuInfo::AVX2);
-    ///   // On the previous line, the constructor disables AVX2 instructions. On the next
-    ///   // line, CpuInfo::IsSupported(CpuInfo::AVX2) will return false.
-    ///   SomeOperation();
-    ///   // On the next line, the block closes, 'disabler's destructor runs, and AVX2
-    ///   // instructions are re-enabled.
-    /// }
-    ///
-    /// TempDisable's destructor never re-enables features that were not enabled when then
-    /// constructor ran.
-    struct TempDisable {
-        TempDisable(int64_t feature) : feature_(feature), reenable_(CpuInfo::is_supported(feature)) {
-            CpuInfo::enable_feature(feature_, false);
+    static const std::vector<long>& get_cache_sizes() {
+        static std::vector<long> cache_sizes;
+        static std::vector<long> cache_line_sizes;
+
+        if (cache_sizes.empty()) {
+            cache_sizes.resize(NUM_CACHE_LEVELS);
+            cache_line_sizes.resize(NUM_CACHE_LEVELS);
+            _get_cache_info(cache_sizes.data(), cache_line_sizes.data());
         }
-        ~TempDisable() {
-            if (reenable_) {
-                CpuInfo::enable_feature(feature_, true);
-            }
-        }
+        return cache_sizes;
+    }
 
-    private:
-        int64_t feature_;
-        bool reenable_;
-    };
+    static long get_l3_cache_size() {
+        auto& cache_sizes = get_cache_sizes();
+        return cache_sizes[CacheLevel::L3_CACHE] ? cache_sizes[CacheLevel::L3_CACHE]
+                                                 : cache_sizes[CacheLevel::L2_CACHE];
+    }
 
-protected:
-    friend class CpuTestUtil;
+    static std::vector<size_t> get_core_ids();
 
-    /// Setup fake NUMA info to simulate NUMA for backend tests. Sets up CpuInfo to
-    /// simulate 'max_num_numa_nodes' with 'core_to_numa_node' specifying the NUMA node
-    /// of each core in [0, GetMaxNumCores()).
-    static void _init_fake_numa_for_test(int max_num_numa_nodes, const std::vector<int>& core_to_numa_node);
+    static bool is_cgroup_with_cpuset() { return is_cgroup_with_cpuset_; }
+    static bool is_cgroup_with_cpu_quota() { return is_cgroup_with_cpu_quota_; }
+
+    /// Parse a string-formatted cpus in the format "0-3,5,7-9" and return the parsed core IDs.
+    static std::vector<size_t> parse_cpus(const std::string& cpus_str);
+
+    // Check cpu flags in runtime, whether the running CPU matches the compiled binary with necessary
+    // CPU instruction set such as SSE4/AVX/AVX2/AVX512/...
+    // Return value: the cpu instruction sets that are not supported in the current running env.
+    static std::vector<std::string> unsupported_cpu_flags_from_current_env();
+
+    // For TEST only
+    static int64_t* TEST_mutable_hardware_flags() { return &hardware_flags_; }
 
 private:
     /// Initialize NUMA-related state - called from Init();
     static void _init_numa();
 
+    /// Initialize num cores taking cgroup config into consideration
+    static void _init_num_cores_with_cgroup();
+
     /// Initialize 'numa_node_to_cores_' based on 'max_num_numa_nodes_' and
     /// 'core_to_numa_node_'. Called from InitNuma();
     static void _init_numa_node_to_cores();
+
+    /// Initialize 'core_to_numa_node_' from `/sys/devices/system/cpu/offline`.
+    static void _init_offline_cores();
 
     /// Populates the arguments with information about this machine's caches.
     /// The values returned are not reliable in some environments, e.g. RHEL5 on EC2, so
@@ -196,11 +140,13 @@ private:
 
     static bool initialized_;
     static int64_t hardware_flags_;
-    static int64_t original_hardware_flags_;
     static int64_t cycles_per_ms_;
     static int num_cores_;
     static int max_num_cores_;
     static std::string model_name_;
+
+    static bool is_cgroup_with_cpuset_;
+    static bool is_cgroup_with_cpu_quota_;
 
     /// Maximum possible number of NUMA nodes.
     static int max_num_numa_nodes_;
@@ -211,6 +157,8 @@ private:
     /// Vector with 'max_num_numa_nodes_' entries, each of which is a vector of the cores
     /// belonging to that NUMA node.
     static std::vector<std::vector<int>> numa_node_to_cores_;
+    static std::vector<size_t> cpuset_cores_;
+    static std::set<size_t> offline_cores_;
 
     /// Array with 'max_num_cores_' entries, each of which is the index of that core in its
     /// NUMA node.

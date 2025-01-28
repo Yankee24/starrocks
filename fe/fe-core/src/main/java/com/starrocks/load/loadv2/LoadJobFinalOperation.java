@@ -17,6 +17,7 @@
 
 package com.starrocks.load.loadv2;
 
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.load.EtlStatus;
@@ -24,7 +25,6 @@ import com.starrocks.load.FailMsg;
 import com.starrocks.transaction.TransactionState;
 import com.starrocks.transaction.TxnCommitAttachment;
 
-import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 
@@ -33,13 +33,20 @@ import java.io.IOException;
  * It is used to edit the job final state.
  */
 public class LoadJobFinalOperation extends TxnCommitAttachment implements Writable {
+    @SerializedName("id")
     private long id;
+    @SerializedName("ls")
     private EtlStatus loadingStatus = new EtlStatus();
+    @SerializedName("ps")
     private int progress;
+    @SerializedName("lst")
     private long loadStartTimestamp;
+    @SerializedName("ft")
     private long finishTimestamp;
+    @SerializedName("js")
     private JobState jobState;
     // optional
+    @SerializedName("fm")
     private FailMsg failMsg;
 
     public LoadJobFinalOperation() {
@@ -100,20 +107,6 @@ public class LoadJobFinalOperation extends TxnCommitAttachment implements Writab
         } else {
             out.writeBoolean(true);
             failMsg.write(out);
-        }
-    }
-
-    public void readFields(DataInput in) throws IOException {
-        super.readFields(in);
-        id = in.readLong();
-        loadingStatus.readFields(in);
-        progress = in.readInt();
-        loadStartTimestamp = in.readLong();
-        finishTimestamp = in.readLong();
-        jobState = JobState.valueOf(Text.readString(in));
-        if (in.readBoolean()) {
-            failMsg = new FailMsg();
-            failMsg.readFields(in);
         }
     }
 

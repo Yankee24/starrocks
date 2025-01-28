@@ -19,6 +19,8 @@ package com.starrocks.qe;
 
 import com.google.common.collect.Maps;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.ErrorCode;
+import com.starrocks.common.ErrorReport;
 
 import java.util.Map;
 
@@ -28,16 +30,19 @@ import java.util.Map;
 // with specified name.
 public class VariableVarConverters {
 
-    public static final Map<String, VariableVarConverterI> converters = Maps.newHashMap();
+    public static final Map<String, VariableVarConverterI> CONVERTERS = Maps.newHashMap();
 
     static {
         SqlModeConverter sqlModeConverter = new SqlModeConverter();
-        converters.put(SessionVariable.SQL_MODE, sqlModeConverter);
+        CONVERTERS.put(SessionVariable.SQL_MODE, sqlModeConverter);
+        PartialUpdateModeConverter partialUpdateModeConverter = new PartialUpdateModeConverter();
+        CONVERTERS.put(SessionVariable.PARTIAL_UPDATE_MODE, partialUpdateModeConverter);
+        CONVERTERS.put(SessionVariable.INSERT_MAX_FILTER_RATIO, new InsertMaxFilterRatioConverter());
     }
 
     public static String convert(String varName, String value) throws DdlException {
-        if (converters.containsKey(varName)) {
-            return converters.get(varName).convert(value);
+        if (CONVERTERS.containsKey(varName)) {
+            return CONVERTERS.get(varName).convert(value);
         }
         return value;
     }
@@ -49,6 +54,36 @@ public class VariableVarConverters {
         @Override
         public String convert(String value) throws DdlException {
             return SqlModeHelper.encode(value).toString();
+        }
+    }
+
+    // Converter to convert and check var `partial_update_mode`
+    public static class PartialUpdateModeConverter implements VariableVarConverterI {
+        @Override
+        public String convert(String value) throws DdlException {
+            if (value.equals("auto") || value.equals("row") || value.equals("column")) {
+                return value;
+            } else {
+                throw new DdlException("partial_update_mode only support auto|row|column");
+            }
+        }
+    }
+
+    // Check var `insert_max_filter_ratio`
+    public static class InsertMaxFilterRatioConverter implements VariableVarConverterI {
+        @Override
+        public String convert(String value) throws DdlException {
+            try {
+                double insertMaxFilterRatio = Double.parseDouble(value);
+                if (insertMaxFilterRatio < 0 || insertMaxFilterRatio > 1) {
+                    ErrorReport.reportDdlException(
+                            ErrorCode.ERR_INVALID_VALUE, SessionVariable.INSERT_MAX_FILTER_RATIO, value, "between 0.0 and 1.0");
+                }
+            } catch (NumberFormatException e) {
+                ErrorReport.reportDdlException(
+                        ErrorCode.ERR_INVALID_VALUE, SessionVariable.INSERT_MAX_FILTER_RATIO, value, "between 0.0 and 1.0");
+            }
+            return value;
         }
     }
 }

@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include <cstdint>
 #include <functional>
@@ -7,12 +19,12 @@
 #include "column/column.h" // Column
 #include "column/datum.h"
 #include "common/object_pool.h"
+#include "storage/column_predicate.h"
 #include "storage/olap_common.h" // ColumnId
 #include "storage/range.h"
 #include "storage/rowset/bitmap_index_reader.h"
 #include "storage/rowset/bloom_filter.h"
 #include "storage/types.h"
-#include "storage/vectorized_column_predicate.h"
 #include "storage/zone_map_detail.h"
 #include "util/string_parser.hpp"
 
@@ -27,27 +39,27 @@ class BitmapIndexIterator;
 class BloomFilter;
 } // namespace starrocks
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
-template <FieldType field_type>
+template <LogicalType field_type>
 using GeEval = std::greater_equal<typename CppTypeTraits<field_type>::CppType>;
 
-template <FieldType field_type>
+template <LogicalType field_type>
 using GtEval = std::greater<typename CppTypeTraits<field_type>::CppType>;
 
-template <FieldType field_type>
+template <LogicalType field_type>
 using LeEval = std::less_equal<typename CppTypeTraits<field_type>::CppType>;
 
-template <FieldType field_type>
+template <LogicalType field_type>
 using LtEval = std::less<typename CppTypeTraits<field_type>::CppType>;
 
-template <FieldType field_type>
+template <LogicalType field_type>
 using EqEval = std::equal_to<typename CppTypeTraits<field_type>::CppType>;
 
-template <FieldType field_type>
+template <LogicalType field_type>
 using NeEval = std::not_equal_to<typename CppTypeTraits<field_type>::CppType>;
 
-template <FieldType field_type, template <FieldType> typename Predicate, typename ColumnPredicateBuilder>
+template <LogicalType field_type, template <LogicalType> typename Predicate, typename ColumnPredicateBuilder>
 static Status predicate_convert_to(Predicate<field_type> const& input_predicate,
                                    typename CppTypeTraits<field_type>::CppType const& value,
                                    ColumnPredicateBuilder column_predicate_builder, const ColumnPredicate** output,
@@ -65,104 +77,109 @@ static Status predicate_convert_to(Predicate<field_type> const& input_predicate,
     return Status::OK();
 }
 
-template <template <FieldType> typename Predicate, template <FieldType> typename BinaryPredicate>
+template <template <LogicalType> typename Predicate, template <LogicalType> typename BinaryPredicate>
 static ColumnPredicate* new_column_predicate(const TypeInfoPtr& type_info, ColumnId id, const Slice& operand) {
     auto type = type_info->type();
     switch (type) {
-    case OLAP_FIELD_TYPE_BOOL:
-        return new Predicate<OLAP_FIELD_TYPE_BOOL>(type_info, id, string_to_int<int>(operand) != 0);
-    case OLAP_FIELD_TYPE_TINYINT:
-        return new Predicate<OLAP_FIELD_TYPE_TINYINT>(type_info, id, string_to_int<int8_t>(operand));
-    case OLAP_FIELD_TYPE_UNSIGNED_TINYINT:
+    case TYPE_BOOLEAN:
+        return new Predicate<TYPE_BOOLEAN>(type_info, id, string_to_int<int>(operand) != 0);
+    case TYPE_TINYINT:
+        return new Predicate<TYPE_TINYINT>(type_info, id, string_to_int<int8_t>(operand));
+    case TYPE_UNSIGNED_TINYINT:
         return nullptr;
-    case OLAP_FIELD_TYPE_SMALLINT:
-        return new Predicate<OLAP_FIELD_TYPE_SMALLINT>(type_info, id, string_to_int<int16_t>(operand));
-    case OLAP_FIELD_TYPE_UNSIGNED_SMALLINT:
+    case TYPE_SMALLINT:
+        return new Predicate<TYPE_SMALLINT>(type_info, id, string_to_int<int16_t>(operand));
+    case TYPE_UNSIGNED_SMALLINT:
         return nullptr;
-    case OLAP_FIELD_TYPE_INT:
-        return new Predicate<OLAP_FIELD_TYPE_INT>(type_info, id, string_to_int<int32_t>(operand));
-    case OLAP_FIELD_TYPE_UNSIGNED_INT:
+    case TYPE_INT:
+        return new Predicate<TYPE_INT>(type_info, id, string_to_int<int32_t>(operand));
+    case TYPE_UNSIGNED_INT:
         return nullptr;
-    case OLAP_FIELD_TYPE_BIGINT:
-        return new Predicate<OLAP_FIELD_TYPE_BIGINT>(type_info, id, string_to_int<int64_t>(operand));
-    case OLAP_FIELD_TYPE_UNSIGNED_BIGINT:
+    case TYPE_BIGINT:
+        return new Predicate<TYPE_BIGINT>(type_info, id, string_to_int<int64_t>(operand));
+    case TYPE_UNSIGNED_BIGINT:
         return nullptr;
-    case OLAP_FIELD_TYPE_LARGEINT:
-        return new Predicate<OLAP_FIELD_TYPE_LARGEINT>(type_info, id, string_to_int<int128_t>(operand));
-    case OLAP_FIELD_TYPE_FLOAT:
-        return new Predicate<OLAP_FIELD_TYPE_FLOAT>(type_info, id, string_to_float<float>(operand));
-    case OLAP_FIELD_TYPE_DOUBLE:
-        return new Predicate<OLAP_FIELD_TYPE_DOUBLE>(type_info, id, string_to_float<double>(operand));
-    case OLAP_FIELD_TYPE_DISCRETE_DOUBLE:
+    case TYPE_LARGEINT:
+        return new Predicate<TYPE_LARGEINT>(type_info, id, string_to_int<int128_t>(operand));
+    case TYPE_FLOAT:
+        return new Predicate<TYPE_FLOAT>(type_info, id, string_to_float<float>(operand));
+    case TYPE_DOUBLE:
+        return new Predicate<TYPE_DOUBLE>(type_info, id, string_to_float<double>(operand));
+    case TYPE_DISCRETE_DOUBLE:
         return nullptr;
-    case OLAP_FIELD_TYPE_DECIMAL: {
+    case TYPE_DECIMAL: {
         decimal12_t value;
         auto st = type_info->from_string(&value, operand.to_string());
         DCHECK(st.ok());
-        return new Predicate<OLAP_FIELD_TYPE_DECIMAL>(type_info, id, value);
+        return new Predicate<TYPE_DECIMAL>(type_info, id, value);
     }
-    case OLAP_FIELD_TYPE_DECIMAL_V2: {
+    case TYPE_DECIMALV2: {
         DecimalV2Value value;
         auto st = type_info->from_string(&value, operand.to_string());
         DCHECK(st.ok());
-        return new Predicate<OLAP_FIELD_TYPE_DECIMAL_V2>(type_info, id, value);
+        return new Predicate<TYPE_DECIMALV2>(type_info, id, value);
     }
-    case OLAP_FIELD_TYPE_DECIMAL32: {
+    case TYPE_DECIMAL32: {
         int32_t value;
         auto st = type_info->from_string(&value, operand.to_string());
         DCHECK(st.ok());
-        return new Predicate<OLAP_FIELD_TYPE_DECIMAL32>(type_info, id, value);
+        return new Predicate<TYPE_DECIMAL32>(type_info, id, value);
     }
-    case OLAP_FIELD_TYPE_DECIMAL64: {
+    case TYPE_DECIMAL64: {
         int64_t value;
         auto st = type_info->from_string(&value, operand.to_string());
         DCHECK(st.ok());
-        return new Predicate<OLAP_FIELD_TYPE_DECIMAL64>(type_info, id, value);
+        return new Predicate<TYPE_DECIMAL64>(type_info, id, value);
     }
-    case OLAP_FIELD_TYPE_DECIMAL128: {
+    case TYPE_DECIMAL128: {
         int128_t value;
         auto st = type_info->from_string(&value, operand.to_string());
         DCHECK(st.ok());
-        return new Predicate<OLAP_FIELD_TYPE_DECIMAL128>(type_info, id, value);
+        return new Predicate<TYPE_DECIMAL128>(type_info, id, value);
     }
-    case OLAP_FIELD_TYPE_DATE: {
+    case TYPE_DATE_V1: {
         uint24_t value = 0;
         auto st = type_info->from_string(&value, operand.to_string());
         DCHECK(st.ok());
-        return new Predicate<OLAP_FIELD_TYPE_DATE>(type_info, id, value);
+        return new Predicate<TYPE_DATE_V1>(type_info, id, value);
     }
-    case OLAP_FIELD_TYPE_DATE_V2: {
+    case TYPE_DATE: {
         int32_t value = 0;
         auto st = type_info->from_string(&value, operand.to_string());
         DCHECK(st.ok());
-        return new Predicate<OLAP_FIELD_TYPE_DATE_V2>(type_info, id, value);
+        return new Predicate<TYPE_DATE>(type_info, id, value);
     }
-    case OLAP_FIELD_TYPE_DATETIME: {
+    case TYPE_DATETIME_V1: {
         uint64_t value = 0;
         auto st = type_info->from_string(&value, operand.to_string());
         DCHECK(st.ok());
-        return new Predicate<OLAP_FIELD_TYPE_DATETIME>(type_info, id, value);
+        return new Predicate<TYPE_DATETIME_V1>(type_info, id, value);
     }
-    case OLAP_FIELD_TYPE_TIMESTAMP: {
+    case TYPE_DATETIME: {
         int64_t value = 0;
         auto st = type_info->from_string(&value, operand.to_string());
         DCHECK(st.ok());
-        return new Predicate<OLAP_FIELD_TYPE_TIMESTAMP>(type_info, id, value);
+        return new Predicate<TYPE_DATETIME>(type_info, id, value);
     }
-    case OLAP_FIELD_TYPE_CHAR:
-        return new BinaryPredicate<OLAP_FIELD_TYPE_CHAR>(type_info, id, operand);
-    case OLAP_FIELD_TYPE_VARCHAR:
-        return new BinaryPredicate<OLAP_FIELD_TYPE_VARCHAR>(type_info, id, operand);
-    case OLAP_FIELD_TYPE_STRUCT:
-    case OLAP_FIELD_TYPE_ARRAY:
-    case OLAP_FIELD_TYPE_MAP:
-    case OLAP_FIELD_TYPE_UNKNOWN:
-    case OLAP_FIELD_TYPE_NONE:
-    case OLAP_FIELD_TYPE_HLL:
-    case OLAP_FIELD_TYPE_OBJECT:
-    case OLAP_FIELD_TYPE_PERCENTILE:
-    case OLAP_FIELD_TYPE_JSON:
-    case OLAP_FIELD_TYPE_MAX_VALUE:
+    case TYPE_CHAR:
+        return new BinaryPredicate<TYPE_CHAR>(type_info, id, operand);
+    case TYPE_VARCHAR:
+        return new BinaryPredicate<TYPE_VARCHAR>(type_info, id, operand);
+    case TYPE_STRUCT:
+    case TYPE_ARRAY:
+    case TYPE_MAP:
+    case TYPE_UNKNOWN:
+    case TYPE_NONE:
+    case TYPE_HLL:
+    case TYPE_OBJECT:
+    case TYPE_PERCENTILE:
+    case TYPE_JSON:
+    case TYPE_NULL:
+    case TYPE_FUNCTION:
+    case TYPE_TIME:
+    case TYPE_BINARY:
+    case TYPE_VARBINARY:
+    case TYPE_MAX_VALUE:
         return nullptr;
         // No default to ensure newly added enumerator will be handled.
     }
@@ -170,7 +187,7 @@ static ColumnPredicate* new_column_predicate(const TypeInfoPtr& type_info, Colum
 }
 
 // Base class for column predicate
-template <FieldType field_type, class Eval>
+template <LogicalType field_type, class Eval>
 class ColumnPredicateCmpBase : public ColumnPredicate {
     using ValueType = typename CppTypeTraits<field_type>::CppType;
 
@@ -232,8 +249,8 @@ protected:
     ValueType _value;
 };
 
-template <FieldType field_type>
-class ColumnGePredicate : public ColumnPredicateCmpBase<field_type, GeEval<field_type>> {
+template <LogicalType field_type>
+class ColumnGePredicate final : public ColumnPredicateCmpBase<field_type, GeEval<field_type>> {
 public:
     using ValueType = typename CppTypeTraits<field_type>::CppType;
     using Base = ColumnPredicateCmpBase<field_type, GeEval<field_type>>;
@@ -246,17 +263,28 @@ public:
         return this->type_info()->cmp(Datum(this->_value), max) <= 0;
     }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return true; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         range->clear();
         bool exact_match;
         Status s = iter->seek_dictionary(&this->_value, &exact_match);
         if (s.ok()) {
             rowid_t seeked_ordinal = iter->current_ordinal();
             rowid_t ordinal_limit = iter->bitmap_nums() - iter->has_null_bitmap();
-            range->add(Range(seeked_ordinal, ordinal_limit));
+            range->add(Range<>(seeked_ordinal, ordinal_limit));
         } else if (!s.is_not_found()) {
             return s;
         }
+        return Status::OK();
+    }
+
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::GREATER_EQUAL_QUERY;
+        roaring::Roaring roaring;
+        RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &this->_value, query_type, &roaring));
+        *row_bitmap &= roaring;
         return Status::OK();
     }
 
@@ -267,8 +295,8 @@ public:
     }
 };
 
-template <FieldType field_type>
-class ColumnGtPredicate : public ColumnPredicateCmpBase<field_type, GtEval<field_type>> {
+template <LogicalType field_type>
+class ColumnGtPredicate final : public ColumnPredicateCmpBase<field_type, GtEval<field_type>> {
 public:
     using ValueType = typename CppTypeTraits<field_type>::CppType;
     using Base = ColumnPredicateCmpBase<field_type, GtEval<field_type>>;
@@ -281,17 +309,28 @@ public:
         return this->type_info()->cmp(Datum(this->_value), max) < 0;
     }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return true; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         range->clear();
         bool exact_match = false;
         Status s = iter->seek_dictionary(&this->_value, &exact_match);
         if (s.ok()) {
             rowid_t seeked_ordinal = iter->current_ordinal() + exact_match;
             rowid_t ordinal_limit = iter->bitmap_nums() - iter->has_null_bitmap();
-            range->add(Range(seeked_ordinal, ordinal_limit));
+            range->add(Range<>(seeked_ordinal, ordinal_limit));
         } else if (!s.is_not_found()) {
             return s;
         }
+        return Status::OK();
+    }
+
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::GREATER_THAN_QUERY;
+        roaring::Roaring roaring;
+        RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &this->_value, query_type, &roaring));
+        *row_bitmap &= roaring;
         return Status::OK();
     }
 
@@ -302,8 +341,8 @@ public:
     }
 };
 
-template <FieldType field_type>
-class ColumnLePredicate : public ColumnPredicateCmpBase<field_type, LeEval<field_type>> {
+template <LogicalType field_type>
+class ColumnLePredicate final : public ColumnPredicateCmpBase<field_type, LeEval<field_type>> {
 public:
     using ValueType = typename CppTypeTraits<field_type>::CppType;
     using Base = ColumnPredicateCmpBase<field_type, LeEval<field_type>>;
@@ -317,18 +356,29 @@ public:
         return (this->type_info()->cmp(Datum(this->_value), min) >= 0) & !max.is_null();
     }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return true; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         range->clear();
         bool exact_match = false;
         Status st = iter->seek_dictionary(&this->_value, &exact_match);
         if (st.ok()) {
             rowid_t seeked_ordinal = iter->current_ordinal() + exact_match;
-            range->add(Range(0, seeked_ordinal));
+            range->add(Range<>(0, seeked_ordinal));
         } else if (st.is_not_found()) {
-            range->add(Range(0, iter->bitmap_nums() - iter->has_null_bitmap()));
+            range->add(Range<>(0, iter->bitmap_nums() - iter->has_null_bitmap()));
             st = Status::OK();
         }
         return st;
+    }
+
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::LESS_EQUAL_QUERY;
+        roaring::Roaring roaring;
+        RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &this->_value, query_type, &roaring));
+        *row_bitmap &= roaring;
+        return Status::OK();
     }
 
     Status convert_to(const ColumnPredicate** output, const TypeInfoPtr& target_type_info,
@@ -338,8 +388,8 @@ public:
     }
 };
 
-template <FieldType field_type>
-class ColumnLtPredicate : public ColumnPredicateCmpBase<field_type, LtEval<field_type>> {
+template <LogicalType field_type>
+class ColumnLtPredicate final : public ColumnPredicateCmpBase<field_type, LtEval<field_type>> {
 public:
     using ValueType = typename CppTypeTraits<field_type>::CppType;
     using Base = ColumnPredicateCmpBase<field_type, LtEval<field_type>>;
@@ -353,18 +403,29 @@ public:
         return (this->type_info()->cmp(Datum(this->_value), min) > 0) & !max.is_null();
     }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return true; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         range->clear();
         bool exact_match = false;
         Status st = iter->seek_dictionary(&this->_value, &exact_match);
         if (st.ok()) {
             rowid_t seeked_ordinal = iter->current_ordinal();
-            range->add(Range(0, seeked_ordinal));
+            range->add(Range<>(0, seeked_ordinal));
         } else if (st.is_not_found()) {
-            range->add(Range(0, iter->bitmap_nums() - iter->has_null_bitmap()));
+            range->add(Range<>(0, iter->bitmap_nums() - iter->has_null_bitmap()));
             st = Status::OK();
         }
         return st;
+    }
+
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::LESS_THAN_QUERY;
+        roaring::Roaring roaring;
+        RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &this->_value, query_type, &roaring));
+        *row_bitmap &= roaring;
+        return Status::OK();
     }
 
     Status convert_to(const ColumnPredicate** output, const TypeInfoPtr& target_type_info,
@@ -374,8 +435,8 @@ public:
     }
 };
 
-template <FieldType field_type>
-class ColumnEqPredicate : public ColumnPredicateCmpBase<field_type, EqEval<field_type>> {
+template <LogicalType field_type>
+class ColumnEqPredicate final : public ColumnPredicateCmpBase<field_type, EqEval<field_type>> {
 public:
     using ValueType = typename CppTypeTraits<field_type>::CppType;
     using Base = ColumnPredicateCmpBase<field_type, EqEval<field_type>>;
@@ -390,14 +451,16 @@ public:
         return type_info->cmp(Datum(this->_value), min) >= 0 && type_info->cmp(Datum(this->_value), max) <= 0;
     }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return true; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         range->clear();
         bool exact_match = false;
         Status s = iter->seek_dictionary(&this->_value, &exact_match);
         if (s.ok()) {
             if (exact_match) {
                 rowid_t ordinal = iter->current_ordinal();
-                range->add(Range(ordinal, ordinal + 1));
+                range->add(Range<>(ordinal, ordinal + 1));
             }
         } else if (!s.is_not_found()) {
             return s;
@@ -405,13 +468,22 @@ public:
         return Status::OK();
     }
 
-    bool support_bloom_filter() const override { return true; }
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::EQUAL_QUERY;
+        roaring::Roaring roaring;
+        RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &this->_value, query_type, &roaring));
+        *row_bitmap &= roaring;
+        return Status::OK();
+    }
 
-    bool bloom_filter(const BloomFilter* bf) const override {
-        static_assert(field_type != OLAP_FIELD_TYPE_JSON, "TODO");
-        static_assert(field_type != OLAP_FIELD_TYPE_HLL, "TODO");
-        static_assert(field_type != OLAP_FIELD_TYPE_OBJECT, "TODO");
-        static_assert(field_type != OLAP_FIELD_TYPE_PERCENTILE, "TODO");
+    bool support_original_bloom_filter() const override { return true; }
+
+    bool original_bloom_filter(const BloomFilter* bf) const override {
+        static_assert(field_type != TYPE_JSON, "TODO");
+        static_assert(field_type != TYPE_HLL, "TODO");
+        static_assert(field_type != TYPE_OBJECT, "TODO");
+        static_assert(field_type != TYPE_PERCENTILE, "TODO");
         return bf->test_bytes(reinterpret_cast<const char*>(&this->_value), sizeof(this->_value));
     }
 
@@ -422,8 +494,8 @@ public:
     }
 };
 
-template <FieldType field_type>
-class ColumnNePredicate : public ColumnPredicateCmpBase<field_type, NeEval<field_type>> {
+template <LogicalType field_type>
+class ColumnNePredicate final : public ColumnPredicateCmpBase<field_type, NeEval<field_type>> {
 public:
     using ValueType = typename CppTypeTraits<field_type>::CppType;
     using Base = ColumnPredicateCmpBase<field_type, NeEval<field_type>>;
@@ -433,8 +505,19 @@ public:
 
     bool zone_map_filter(const ZoneMapDetail& detail) const override { return true; }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return false; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         return Status::Cancelled("not-equal predicate not support bitmap index");
+    }
+
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::EQUAL_QUERY;
+        roaring::Roaring roaring;
+        RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &this->_value, query_type, &roaring));
+        *row_bitmap -= roaring;
+        return Status::OK();
     }
 
     Status convert_to(const ColumnPredicate** output, const TypeInfoPtr& target_type_info,
@@ -445,7 +528,7 @@ public:
 };
 
 // Base class for binary column predicate
-template <FieldType field_type, class Eval>
+template <LogicalType field_type, class Eval>
 class BinaryColumnPredicateCmpBase : public ColumnPredicate {
     using ValueType = Slice;
 
@@ -531,7 +614,7 @@ public:
 
     bool can_vectorized() const override { return false; }
 
-    bool support_bloom_filter() const override { return false; }
+    bool support_original_bloom_filter() const override { return false; }
 
     Status convert_to(const ColumnPredicate** output, const TypeInfoPtr& target_type_info,
                       ObjectPool* obj_pool) const override {
@@ -563,8 +646,8 @@ protected:
     ValueType _value;
 };
 
-template <FieldType field_type>
-class BinaryColumnEqPredicate : public BinaryColumnPredicateCmpBase<field_type, EqEval<field_type>> {
+template <LogicalType field_type>
+class BinaryColumnEqPredicate final : public BinaryColumnPredicateCmpBase<field_type, EqEval<field_type>> {
 public:
     using ValueType = Slice;
     using Base = BinaryColumnPredicateCmpBase<field_type, std::equal_to<ValueType>>;
@@ -579,14 +662,16 @@ public:
         return type_info->cmp(Datum(this->_value), min) >= 0 && type_info->cmp(Datum(this->_value), max) <= 0;
     }
 
-    bool support_bloom_filter() const override { return true; }
+    bool support_original_bloom_filter() const override { return true; }
 
-    bool bloom_filter(const BloomFilter* bf) const override {
+    bool original_bloom_filter(const BloomFilter* bf) const override {
         Slice padded(Base::_zero_padded_str);
         return bf->test_bytes(padded.data, padded.size);
     }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return true; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         // see the comment in `predicate_parser.cpp`.
         Slice padded_value(Base::_zero_padded_str);
         range->clear();
@@ -595,17 +680,27 @@ public:
         if (s.ok()) {
             if (exact_match) {
                 rowid_t ordinal = iter->current_ordinal();
-                range->add(Range(ordinal, ordinal + 1));
+                range->add(Range<>(ordinal, ordinal + 1));
             }
         } else if (!s.is_not_found()) {
             return s;
         }
         return Status::OK();
     }
+
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        Slice padded_value(Base::_zero_padded_str);
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::EQUAL_QUERY;
+        roaring::Roaring roaring;
+        RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &padded_value, query_type, &roaring));
+        *row_bitmap &= roaring;
+        return Status::OK();
+    }
 };
 
-template <FieldType field_type>
-class BinaryColumnGePredicate : public BinaryColumnPredicateCmpBase<field_type, GeEval<field_type>> {
+template <LogicalType field_type>
+class BinaryColumnGePredicate final : public BinaryColumnPredicateCmpBase<field_type, GeEval<field_type>> {
 public:
     using ValueType = Slice;
     using Base = BinaryColumnPredicateCmpBase<field_type, std::greater_equal<ValueType>>;
@@ -618,7 +713,9 @@ public:
         return this->type_info()->cmp(Datum(this->_value), max) <= 0;
     }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return true; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         // Can NOT use `_value` here, see the comment in `predicate_parser.cpp`.
         Slice padded_value(Base::_zero_padded_str);
 
@@ -628,16 +725,26 @@ public:
         if (s.ok()) {
             rowid_t seeked_ordinal = iter->current_ordinal();
             rowid_t ordinal_limit = iter->bitmap_nums() - iter->has_null_bitmap();
-            range->add(Range(seeked_ordinal, ordinal_limit));
+            range->add(Range<>(seeked_ordinal, ordinal_limit));
         } else if (!s.is_not_found()) {
             return s;
         }
         return Status::OK();
     }
+
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        Slice padded_value(Base::_zero_padded_str);
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::GREATER_EQUAL_QUERY;
+        roaring::Roaring roaring;
+        RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &padded_value, query_type, &roaring));
+        *row_bitmap &= roaring;
+        return Status::OK();
+    }
 };
 
-template <FieldType field_type>
-class BinaryColumnGtPredicate : public BinaryColumnPredicateCmpBase<field_type, GtEval<field_type>> {
+template <LogicalType field_type>
+class BinaryColumnGtPredicate final : public BinaryColumnPredicateCmpBase<field_type, GtEval<field_type>> {
 public:
     using ValueType = Slice;
     using Base = BinaryColumnPredicateCmpBase<field_type, std::greater<ValueType>>;
@@ -650,7 +757,9 @@ public:
         return this->type_info()->cmp(Datum(this->_value), max) < 0;
     }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return true; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         // Can NOT use `_value` here, see comment in predicate_parser.cpp.
         Slice padded_value(Base::_zero_padded_str);
         range->clear();
@@ -659,16 +768,26 @@ public:
         if (s.ok()) {
             rowid_t seeked_ordinal = iter->current_ordinal() + exact_match;
             rowid_t ordinal_limit = iter->bitmap_nums() - iter->has_null_bitmap();
-            range->add(Range(seeked_ordinal, ordinal_limit));
+            range->add(Range<>(seeked_ordinal, ordinal_limit));
         } else if (!s.is_not_found()) {
             return s;
         }
         return Status::OK();
     }
+
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        Slice padded_value(Base::_zero_padded_str);
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::GREATER_THAN_QUERY;
+        roaring::Roaring roaring;
+        RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &padded_value, query_type, &roaring));
+        *row_bitmap &= roaring;
+        return Status::OK();
+    }
 };
 
-template <FieldType field_type>
-class BinaryColumnLtPredicate : public BinaryColumnPredicateCmpBase<field_type, LtEval<field_type>> {
+template <LogicalType field_type>
+class BinaryColumnLtPredicate final : public BinaryColumnPredicateCmpBase<field_type, LtEval<field_type>> {
 public:
     using ValueType = Slice;
     using Base = BinaryColumnPredicateCmpBase<field_type, std::less<ValueType>>;
@@ -683,24 +802,36 @@ public:
         return (type_info->cmp(Datum(this->_value), min) > 0) & !max.is_null();
     }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return true; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         Slice padded_value(Base::_zero_padded_str);
         range->clear();
         bool exact_match = false;
         Status st = iter->seek_dictionary(&padded_value, &exact_match);
         if (st.ok()) {
             rowid_t seeked_ordinal = iter->current_ordinal();
-            range->add(Range(0, seeked_ordinal));
+            range->add(Range<>(0, seeked_ordinal));
         } else if (st.is_not_found()) {
-            range->add(Range(0, iter->bitmap_nums() - iter->has_null_bitmap()));
+            range->add(Range<>(0, iter->bitmap_nums() - iter->has_null_bitmap()));
             st = Status::OK();
         }
         return st;
     }
+
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        Slice padded_value(Base::_zero_padded_str);
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::LESS_THAN_QUERY;
+        roaring::Roaring roaring;
+        RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &padded_value, query_type, &roaring));
+        *row_bitmap &= roaring;
+        return Status::OK();
+    }
 };
 
-template <FieldType field_type>
-class BinaryColumnLePredicate : public BinaryColumnPredicateCmpBase<field_type, LeEval<field_type>> {
+template <LogicalType field_type>
+class BinaryColumnLePredicate final : public BinaryColumnPredicateCmpBase<field_type, LeEval<field_type>> {
 public:
     using ValueType = Slice;
     using Base = BinaryColumnPredicateCmpBase<field_type, std::less_equal<ValueType>>;
@@ -714,24 +845,36 @@ public:
         return (this->type_info()->cmp(Datum(this->_value), min) >= 0) & !max.is_null();
     }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return true; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         Slice padded_value(Base::_zero_padded_str);
         range->clear();
         bool exact_match = false;
         Status st = iter->seek_dictionary(&padded_value, &exact_match);
         if (st.ok()) {
             rowid_t seeked_ordinal = iter->current_ordinal() + exact_match;
-            range->add(Range(0, seeked_ordinal));
+            range->add(Range<>(0, seeked_ordinal));
         } else if (st.is_not_found()) {
-            range->add(Range(0, iter->bitmap_nums() - iter->has_null_bitmap()));
+            range->add(Range<>(0, iter->bitmap_nums() - iter->has_null_bitmap()));
             st = Status::OK();
         }
         return st;
     }
+
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        Slice padded_value(Base::_zero_padded_str);
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::LESS_EQUAL_QUERY;
+        roaring::Roaring roaring;
+        RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &padded_value, query_type, &roaring));
+        *row_bitmap &= roaring;
+        return Status::OK();
+    }
 };
 
-template <FieldType field_type>
-class BinaryColumnNePredicate : public BinaryColumnPredicateCmpBase<field_type, NeEval<field_type>> {
+template <LogicalType field_type>
+class BinaryColumnNePredicate final : public BinaryColumnPredicateCmpBase<field_type, NeEval<field_type>> {
 public:
     using ValueType = Slice;
     using Base = BinaryColumnPredicateCmpBase<field_type, std::not_equal_to<ValueType>>;
@@ -741,8 +884,20 @@ public:
 
     bool zone_map_filter(const ZoneMapDetail& detail) const override { return true; }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return false; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         return Status::Cancelled("not-equal predicate not support bitmap index");
+    }
+
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        Slice padded_value(Base::_zero_padded_str);
+        InvertedIndexQueryType query_type = InvertedIndexQueryType::EQUAL_QUERY;
+        roaring::Roaring roaring;
+        RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &padded_value, query_type, &roaring));
+        *row_bitmap -= roaring;
+        return Status::OK();
     }
 };
 
@@ -802,16 +957,16 @@ std::ostream& operator<<(std::ostream& os, PredicateType p) {
         os << "!=";
         break;
     case PredicateType::kGT:
-        os << "<";
-        break;
-    case PredicateType::kGE:
-        os << "<=";
-        break;
-    case PredicateType::kLT:
         os << ">";
         break;
-    case PredicateType::kLE:
+    case PredicateType::kGE:
         os << ">=";
+        break;
+    case PredicateType::kLT:
+        os << "<";
+        break;
+    case PredicateType::kLE:
+        os << "<=";
         break;
 
     case PredicateType::kInList:
@@ -847,4 +1002,4 @@ std::ostream& operator<<(std::ostream& os, PredicateType p) {
 
     return os;
 }
-} //namespace starrocks::vectorized
+} //namespace starrocks

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/task/AgentBatchTask.java
 
@@ -22,29 +35,35 @@
 package com.starrocks.task;
 
 import com.google.common.collect.Lists;
-import com.starrocks.common.ClientPool;
+import com.starrocks.rpc.ThriftConnectionPool;
+import com.starrocks.rpc.ThriftRPCRequestExecutor;
 import com.starrocks.server.GlobalStateMgr;
-import com.starrocks.system.Backend;
-import com.starrocks.thrift.BackendService;
+import com.starrocks.server.RunMode;
+import com.starrocks.system.ComputeNode;
 import com.starrocks.thrift.TAgentServiceVersion;
 import com.starrocks.thrift.TAgentTaskRequest;
-import com.starrocks.thrift.TAlterTabletReq;
 import com.starrocks.thrift.TAlterTabletReqV2;
 import com.starrocks.thrift.TCheckConsistencyReq;
 import com.starrocks.thrift.TClearAlterTaskRequest;
 import com.starrocks.thrift.TClearTransactionTaskRequest;
 import com.starrocks.thrift.TCloneReq;
+import com.starrocks.thrift.TCompactionControlReq;
+import com.starrocks.thrift.TCompactionReq;
 import com.starrocks.thrift.TCreateTabletReq;
 import com.starrocks.thrift.TDownloadReq;
+import com.starrocks.thrift.TDropAutoIncrementMapReq;
 import com.starrocks.thrift.TDropTabletReq;
 import com.starrocks.thrift.TMoveDirReq;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TPublishVersionRequest;
 import com.starrocks.thrift.TPushReq;
 import com.starrocks.thrift.TReleaseSnapshotRequest;
+import com.starrocks.thrift.TRemoteSnapshotRequest;
+import com.starrocks.thrift.TReplicateSnapshotRequest;
 import com.starrocks.thrift.TSnapshotRequest;
 import com.starrocks.thrift.TStorageMediumMigrateReq;
 import com.starrocks.thrift.TTaskType;
+import com.starrocks.thrift.TUpdateSchemaReq;
 import com.starrocks.thrift.TUpdateTabletMetaInfoReq;
 import com.starrocks.thrift.TUploadReq;
 import org.apache.logging.log4j.LogManager;
@@ -153,43 +172,43 @@ public class AgentBatchTask implements Runnable {
     @Override
     public void run() {
         for (Long backendId : this.backendIdToTasks.keySet()) {
-            BackendService.Client client = null;
-            TNetworkAddress address = null;
-            boolean ok = false;
             try {
-                Backend backend = GlobalStateMgr.getCurrentSystemInfo().getBackend(backendId);
-                if (backend == null || !backend.isAlive()) {
+                ComputeNode computeNode = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackend(backendId);
+                if (RunMode.isSharedDataMode() && computeNode == null) {
+                    computeNode = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getComputeNode(backendId);
+                }
+
+                if (computeNode == null || !computeNode.isAlive()) {
                     continue;
                 }
+
+                String host = computeNode.getHost();
+                int port = computeNode.getBePort();
+
                 List<AgentTask> tasks = this.backendIdToTasks.get(backendId);
-                // create AgentClient
-                address = new TNetworkAddress(backend.getHost(), backend.getBePort());
-                client = ClientPool.backendPool.borrowObject(address);
                 List<TAgentTaskRequest> agentTaskRequests = new LinkedList<TAgentTaskRequest>();
                 for (AgentTask task : tasks) {
                     agentTaskRequests.add(toAgentTaskRequest(task));
                 }
-                client.submit_tasks(agentTaskRequests);
+
+                ThriftRPCRequestExecutor.call(
+                        ThriftConnectionPool.backendPool,
+                        new TNetworkAddress(host, port),
+                        client -> client.submit_tasks(agentTaskRequests));
+
                 if (LOG.isDebugEnabled()) {
                     for (AgentTask task : tasks) {
                         LOG.debug("send task: type[{}], backend[{}], signature[{}]",
                                 task.getTaskType(), backendId, task.getSignature());
                     }
                 }
-                ok = true;
             } catch (Exception e) {
                 LOG.warn("task exec error. backend[{}]", backendId, e);
-            } finally {
-                if (ok) {
-                    ClientPool.backendPool.returnObject(address, client);
-                } else {
-                    ClientPool.backendPool.invalidateObject(address, client);
-                }
             }
-        } // end for backend
+        } // end for compute node
     }
 
-    private TAgentTaskRequest toAgentTaskRequest(AgentTask task) {
+    public static TAgentTaskRequest toAgentTaskRequest(AgentTask task) {
         TAgentTaskRequest tAgentTaskRequest = new TAgentTaskRequest();
         tAgentTaskRequest.setProtocol_version(TAgentServiceVersion.V1);
         tAgentTaskRequest.setSignature(task.getSignature());
@@ -215,8 +234,7 @@ public class AgentBatchTask implements Runnable {
                 tAgentTaskRequest.setDrop_tablet_req(request);
                 return tAgentTaskRequest;
             }
-            case REALTIME_PUSH:
-            case PUSH: {
+            case REALTIME_PUSH: {
                 PushTask pushTask = (PushTask) task;
                 TPushReq request = pushTask.toThrift();
                 if (LOG.isDebugEnabled()) {
@@ -235,26 +253,9 @@ public class AgentBatchTask implements Runnable {
                 tAgentTaskRequest.setClone_req(request);
                 return tAgentTaskRequest;
             }
-            case ROLLUP: {
-                CreateRollupTask rollupTask = (CreateRollupTask) task;
-                TAlterTabletReq request = rollupTask.toThrift();
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug(request.toString());
-                }
-                tAgentTaskRequest.setAlter_tablet_req(request);
-                tAgentTaskRequest.setResource_info(rollupTask.getResourceInfo());
-                return tAgentTaskRequest;
-            }
-            case SCHEMA_CHANGE: {
-                SchemaChangeTask schemaChangeTask = (SchemaChangeTask) task;
-                TAlterTabletReq request = schemaChangeTask.toThrift();
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug(request.toString());
-                }
-                tAgentTaskRequest.setAlter_tablet_req(request);
-                tAgentTaskRequest.setResource_info(schemaChangeTask.getResourceInfo());
-                return tAgentTaskRequest;
-            }
+            case ROLLUP:
+            case SCHEMA_CHANGE:
+                throw new RuntimeException("Old alter job is not supported.");
             case STORAGE_MEDIUM_MIGRATE: {
                 StorageMediaMigrationTask migrationTask = (StorageMediaMigrationTask) task;
                 TStorageMediumMigrateReq request = migrationTask.toThrift();
@@ -346,12 +347,23 @@ public class AgentBatchTask implements Runnable {
                 return tAgentTaskRequest;
             }
             case UPDATE_TABLET_META_INFO: {
-                UpdateTabletMetaInfoTask updateTabletMetaInfoTask = (UpdateTabletMetaInfoTask) task;
-                TUpdateTabletMetaInfoReq request = updateTabletMetaInfoTask.toThrift();
+                TabletMetadataUpdateAgentTask tabletMetadataUpdateAgentTask = (TabletMetadataUpdateAgentTask) task;
+                TUpdateTabletMetaInfoReq request = tabletMetadataUpdateAgentTask.toThrift();
                 if (LOG.isDebugEnabled()) {
                     LOG.debug(request.toString());
                 }
                 tAgentTaskRequest.setUpdate_tablet_meta_info_req(request);
+                return tAgentTaskRequest;
+            }
+            case DROP_AUTO_INCREMENT_MAP: {
+                LOG.info("DROP_AUTO_INCREMENT_MAP begin");
+                DropAutoIncrementMapTask dropAutoIncrementMapTask = (DropAutoIncrementMapTask) task;
+                TDropAutoIncrementMapReq request = dropAutoIncrementMapTask.toThrift();
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(request.toString());
+                }
+                tAgentTaskRequest.setDrop_auto_increment_map_req(request);
+                LOG.info("DROP_AUTO_INCREMENT_MAP end");
                 return tAgentTaskRequest;
             }
             case ALTER: {
@@ -361,6 +373,36 @@ public class AgentBatchTask implements Runnable {
                     LOG.debug(request.toString());
                 }
                 tAgentTaskRequest.setAlter_tablet_req_v2(request);
+                return tAgentTaskRequest;
+            }
+            case COMPACTION: {
+                CompactionTask compactionTask = (CompactionTask) task;
+                TCompactionReq req = compactionTask.toThrift();
+                tAgentTaskRequest.setCompaction_req(req);
+                return tAgentTaskRequest;
+            }
+            case COMPACTION_CONTROL: {
+                CompactionControlTask compactionControlTask = (CompactionControlTask) task;
+                TCompactionControlReq req = compactionControlTask.toThrift();
+                tAgentTaskRequest.setCompaction_control_req(req);
+                return tAgentTaskRequest;
+            }
+            case REMOTE_SNAPSHOT: {
+                RemoteSnapshotTask remoteSnapshotTask = (RemoteSnapshotTask) task;
+                TRemoteSnapshotRequest req = remoteSnapshotTask.toThrift();
+                tAgentTaskRequest.setRemote_snapshot_req(req);
+                return tAgentTaskRequest;
+            }
+            case REPLICATE_SNAPSHOT: {
+                ReplicateSnapshotTask replicateSnapshotTask = (ReplicateSnapshotTask) task;
+                TReplicateSnapshotRequest req = replicateSnapshotTask.toThrift();
+                tAgentTaskRequest.setReplicate_snapshot_req(req);
+                return tAgentTaskRequest;
+            }
+            case UPDATE_SCHEMA: {
+                UpdateSchemaTask updateSchemaTask = (UpdateSchemaTask) task;
+                TUpdateSchemaReq req = updateSchemaTask.toThrift();
+                tAgentTaskRequest.setUpdate_schema_req(req);
                 return tAgentTaskRequest;
             }
             default:

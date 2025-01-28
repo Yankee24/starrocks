@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.common.proc;
 
@@ -13,11 +26,15 @@ import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.PartitionInfo;
 import com.starrocks.catalog.PartitionType;
 import com.starrocks.catalog.RangePartitionInfo;
+import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.FeConstants;
+import com.starrocks.server.LocalMetastore;
 import mockit.Expectations;
+import mockit.Mock;
+import mockit.MockUp;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -35,7 +52,7 @@ public class TablesProcDirTest {
         Map<String, Long> indexNameToId = Maps.newHashMap();
         indexNameToId.put("index1", 1000L);
 
-        List<Partition> p1 = Lists.newArrayList(new Partition(1001L, "p", null, null));
+        List<Partition> p1 = Lists.newArrayList(new Partition(1001L, 1011L, "p", null, null));
         List<Column> col1 = Lists.newArrayList(new Column("province", Type.VARCHAR));
         PartitionInfo pt1 = new ListPartitionInfo(PartitionType.LIST, col1);
         OlapTable tb1 = new OlapTable(1000L, "tb1", col1, null, pt1, null);
@@ -55,7 +72,7 @@ public class TablesProcDirTest {
             }
         };
 
-        List<Partition> p2 = Lists.newArrayList(new Partition(20001L, "p", null, null));
+        List<Partition> p2 = Lists.newArrayList(new Partition(20001L, 20011L, "p", null, null));
         List<Column> col2 = Lists.newArrayList(new Column("dt", Type.DATE));
         PartitionInfo pt2 = new RangePartitionInfo(col2);
         OlapTable tb2 = new OlapTable(2000L, "tb2", col2, null, pt2, null);
@@ -89,9 +106,31 @@ public class TablesProcDirTest {
             }
         };
 
-        db.createTable(tb1);
-        db.createTable(tb2);
-        db.createTable(tb3);
+        db.registerTableUnlocked(tb1);
+        db.registerTableUnlocked(tb2);
+        db.registerTableUnlocked(tb3);
+
+        new MockUp<LocalMetastore>() {
+            @Mock
+            public Database getDb(String dbName) {
+                return db;
+            }
+
+            @Mock
+            public Table getTable(String dbName, String tblName) {
+                return db.getTable(tblName);
+            }
+
+            @Mock
+            public Table getTable(Long dbId, Long tableId) {
+                return db.getTable(tableId);
+            }
+
+            @Mock
+            public List<Table> getTables(Long dbId) {
+                return db.getTables();
+            }
+        };
     }
 
     @Test
@@ -115,7 +154,7 @@ public class TablesProcDirTest {
         // Type
         Assert.assertEquals("OLAP", list1.get(6));
         // LastConsistencyCheckTime
-        Assert.assertEquals(FeConstants.null_string, list1.get(7));
+        Assert.assertEquals(FeConstants.NULL_STRING, list1.get(7));
         // ReplicaCount
         Assert.assertEquals("2", list1.get(8));
         // PartitionType
@@ -138,7 +177,7 @@ public class TablesProcDirTest {
         // Type
         Assert.assertEquals("OLAP", list2.get(6));
         // LastConsistencyCheckTime
-        Assert.assertEquals(FeConstants.null_string, list2.get(7));
+        Assert.assertEquals(FeConstants.NULL_STRING, list2.get(7));
         // ReplicaCount
         Assert.assertEquals("2", list2.get(8));
         // PartitionType
@@ -151,17 +190,17 @@ public class TablesProcDirTest {
         // TableName
         Assert.assertEquals("tb3", list3.get(1));
         // IndexNum
-        Assert.assertEquals(FeConstants.null_string, list3.get(2));
+        Assert.assertEquals(FeConstants.NULL_STRING, list3.get(2));
         // PartitionColumnName
-        Assert.assertEquals(FeConstants.null_string, list3.get(3));
+        Assert.assertEquals(FeConstants.NULL_STRING, list3.get(3));
         // PartitionNum
         Assert.assertEquals("1", list3.get(4));
         // State
-        Assert.assertEquals(FeConstants.null_string, list3.get(5));
+        Assert.assertEquals(FeConstants.NULL_STRING, list3.get(5));
         // Type
         Assert.assertEquals("HUDI", list3.get(6));
         // LastConsistencyCheckTime
-        Assert.assertEquals(FeConstants.null_string, list3.get(7));
+        Assert.assertEquals(FeConstants.NULL_STRING, list3.get(7));
         // ReplicaCount
         Assert.assertEquals("0", list3.get(8));
         // PartitionType

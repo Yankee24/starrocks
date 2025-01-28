@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/greg7mdp/parallel-hashmap/blob/master/parallel_hashmap/phmap.h
 
@@ -12,7 +25,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//      https://www.apache.org/licenses/LICENSE-2.0
+//     https://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -29,7 +42,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//      https://www.apache.org/licenses/LICENSE-2.0
+//     https://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -1144,9 +1157,12 @@ public:
         if (capacity_ > 127) {
             destroy_slots();
         } else if (capacity_) {
-            for (size_t i = 0; i != capacity_; ++i) {
-                if (IsFull(ctrl_[i])) {
-                    PolicyTraits::destroy(&alloc_ref(), slots_ + i);
+            PHMAP_IF_CONSTEXPR((!std::is_trivially_destructible<typename PolicyTraits::value_type>::value ||
+                                std::is_same<typename Policy::is_flat, std::false_type>::value)) {
+                for (size_t i = 0; i != capacity_; ++i) {
+                    if (IsFull(ctrl_[i])) {
+                        PolicyTraits::destroy(&alloc_ref(), slots_ + i);
+                    }
                 }
             }
             size_ = 0;
@@ -1377,14 +1393,14 @@ public:
                 lazy_emplace_at(res.first, std::forward<F>(f));
             } catch (std::bad_alloc const& e) {
                 erase(iter);
-                throw e;
+                throw;
             }
         }
         return iter;
     }
 
     template <class K = key_type, class F>
-    iterator lazy_emplace_with_hash(const key_arg<K>& key, size_t& hashval, F&& f) {
+    iterator lazy_emplace_with_hash(const key_arg<K>& key, size_t hashval, F&& f) {
         auto res = find_or_prepare_insert(key, hashval);
         auto iter = iterator_at(res.first);
         if (res.second) {
@@ -1392,7 +1408,7 @@ public:
                 lazy_emplace_at(res.first, std::forward<F>(f));
             } catch (std::bad_alloc const& e) {
                 erase(iter);
-                throw e;
+                throw;
             }
         }
         return iter;
@@ -1824,9 +1840,12 @@ private:
 
     void destroy_slots() {
         if (!capacity_) return;
-        for (size_t i = 0; i != capacity_; ++i) {
-            if (IsFull(ctrl_[i])) {
-                PolicyTraits::destroy(&alloc_ref(), slots_ + i);
+        PHMAP_IF_CONSTEXPR((!std::is_trivially_destructible<typename PolicyTraits::value_type>::value ||
+                            std::is_same<typename Policy::is_flat, std::false_type>::value)) {
+            for (size_t i = 0; i != capacity_; ++i) {
+                if (IsFull(ctrl_[i])) {
+                    PolicyTraits::destroy(&alloc_ref(), slots_ + i);
+                }
             }
         }
         auto layout = MakeLayout(capacity_);
@@ -1852,7 +1871,7 @@ private:
             initialize_slots();
         } catch (std::bad_alloc const& e) {
             capacity_ = old_capacity;
-            throw e;
+            throw;
         }
 
         for (size_t i = 0; i != old_capacity; ++i) {
@@ -2181,12 +2200,12 @@ public:
     //   m.insert_or_assign(n, n);
     template <class K = key_type, class V = mapped_type, K* = nullptr, V* = nullptr>
     std::pair<iterator, bool> insert_or_assign(key_arg<K>&& k, V&& v) {
-        return insert_or_assign_impl(std::forward<K>(k), std::forward<V>(v));
+        return insert_or_assign_impl(std::move(k), std::forward<V>(v));
     }
 
     template <class K = key_type, class V = mapped_type, K* = nullptr>
     std::pair<iterator, bool> insert_or_assign(key_arg<K>&& k, const V& v) {
-        return insert_or_assign_impl(std::forward<K>(k), v);
+        return insert_or_assign_impl(std::move(k), v);
     }
 
     template <class K = key_type, class V = mapped_type, V* = nullptr>
@@ -2201,12 +2220,12 @@ public:
 
     template <class K = key_type, class V = mapped_type, K* = nullptr, V* = nullptr>
     iterator insert_or_assign(const_iterator, key_arg<K>&& k, V&& v) {
-        return insert_or_assign(std::forward<K>(k), std::forward<V>(v)).first;
+        return insert_or_assign(std::move(k), std::forward<V>(v)).first;
     }
 
     template <class K = key_type, class V = mapped_type, K* = nullptr>
     iterator insert_or_assign(const_iterator, key_arg<K>&& k, const V& v) {
-        return insert_or_assign(std::forward<K>(k), v).first;
+        return insert_or_assign(std::move(k), v).first;
     }
 
     template <class K = key_type, class V = mapped_type, V* = nullptr>
@@ -2222,7 +2241,7 @@ public:
     template <class K = key_type, class... Args,
               typename std::enable_if<!std::is_convertible<K, const_iterator>::value, int>::type = 0, K* = nullptr>
     std::pair<iterator, bool> try_emplace(key_arg<K>&& k, Args&&... args) {
-        return try_emplace_impl(std::forward<K>(k), std::forward<Args>(args)...);
+        return try_emplace_impl(std::move(k), std::forward<Args>(args)...);
     }
 
     template <class K = key_type, class... Args,
@@ -2233,7 +2252,7 @@ public:
 
     template <class K = key_type, class... Args, K* = nullptr>
     iterator try_emplace(const_iterator, key_arg<K>&& k, Args&&... args) {
-        return try_emplace(std::forward<K>(k), std::forward<Args>(args)...).first;
+        return try_emplace(std::move(k), std::forward<Args>(args)...).first;
     }
 
     template <class K = key_type, class... Args>
@@ -2257,7 +2276,7 @@ public:
 
     template <class K = key_type, class P = Policy, K* = nullptr>
     MappedReference<P> operator[](key_arg<K>&& key) {
-        return Policy::value(&*try_emplace(std::forward<K>(key)).first);
+        return Policy::value(&*try_emplace(std::move(key)).first);
     }
 
     template <class K = key_type, class P = Policy>
@@ -2823,7 +2842,7 @@ public:
     }
 
     template <class K = key_type, class F>
-    iterator lazy_emplace_with_hash(size_t hashval, const key_arg<K>& key, F&& f) {
+    iterator lazy_emplace_with_hash(const key_arg<K>& key, size_t hashval, F&& f) {
         Inner& inner = sets_[subidx(hashval)];
         auto& set = inner.set_;
         typename Lockable::UniqueLock m(inner);
@@ -3397,12 +3416,12 @@ public:
     //   m.insert_or_assign(n, n);
     template <class K = key_type, class V = mapped_type, K* = nullptr, V* = nullptr>
     std::pair<iterator, bool> insert_or_assign(key_arg<K>&& k, V&& v) {
-        return insert_or_assign_impl(std::forward<K>(k), std::forward<V>(v));
+        return insert_or_assign_impl(std::move(k), std::forward<V>(v));
     }
 
     template <class K = key_type, class V = mapped_type, K* = nullptr>
     std::pair<iterator, bool> insert_or_assign(key_arg<K>&& k, const V& v) {
-        return insert_or_assign_impl(std::forward<K>(k), v);
+        return insert_or_assign_impl(std::move(k), v);
     }
 
     template <class K = key_type, class V = mapped_type, V* = nullptr>
@@ -3417,12 +3436,12 @@ public:
 
     template <class K = key_type, class V = mapped_type, K* = nullptr, V* = nullptr>
     iterator insert_or_assign(const_iterator, key_arg<K>&& k, V&& v) {
-        return insert_or_assign(std::forward<K>(k), std::forward<V>(v)).first;
+        return insert_or_assign(std::move(k), std::forward<V>(v)).first;
     }
 
     template <class K = key_type, class V = mapped_type, K* = nullptr>
     iterator insert_or_assign(const_iterator, key_arg<K>&& k, const V& v) {
-        return insert_or_assign(std::forward<K>(k), v).first;
+        return insert_or_assign(std::move(k), v).first;
     }
 
     template <class K = key_type, class V = mapped_type, V* = nullptr>
@@ -3438,7 +3457,7 @@ public:
     template <class K = key_type, class... Args,
               typename std::enable_if<!std::is_convertible<K, const_iterator>::value, int>::type = 0, K* = nullptr>
     std::pair<iterator, bool> try_emplace(key_arg<K>&& k, Args&&... args) {
-        return try_emplace_impl(std::forward<K>(k), std::forward<Args>(args)...);
+        return try_emplace_impl(std::move(k), std::forward<Args>(args)...);
     }
 
     template <class K = key_type, class... Args,
@@ -3449,7 +3468,7 @@ public:
 
     template <class K = key_type, class... Args, K* = nullptr>
     iterator try_emplace(const_iterator, key_arg<K>&& k, Args&&... args) {
-        return try_emplace(std::forward<K>(k), std::forward<Args>(args)...).first;
+        return try_emplace(std::move(k), std::forward<Args>(args)...).first;
     }
 
     template <class K = key_type, class... Args>
@@ -3476,7 +3495,7 @@ public:
     template <class K = key_type, class... Args,
               typename std::enable_if<!std::is_convertible<K, const_iterator>::value, int>::type = 0, K* = nullptr>
     std::pair<iterator, bool> try_emplace_with_hash(size_t hashval, key_arg<K>&& k, Args&&... args) {
-        return try_emplace_impl_with_hash(hashval, std::forward<K>(k), std::forward<Args>(args)...);
+        return try_emplace_impl_with_hash(hashval, std::move(k), std::forward<Args>(args)...);
     }
 
     template <class K = key_type, class... Args,
@@ -3487,7 +3506,7 @@ public:
 
     template <class K = key_type, class... Args, K* = nullptr>
     iterator try_emplace_with_hash(size_t hashval, const_iterator, key_arg<K>&& k, Args&&... args) {
-        return try_emplace_with_hash(hashval, std::forward<K>(k), std::forward<Args>(args)...).first;
+        return try_emplace_with_hash(hashval, std::move(k), std::forward<Args>(args)...).first;
     }
 
     template <class K = key_type, class... Args>
@@ -3558,7 +3577,7 @@ public:
 
     template <class K = key_type, class P = Policy, K* = nullptr>
     MappedReference<P> operator[](key_arg<K>&& key) {
-        return Policy::value(&*try_emplace(std::forward<K>(key)).first);
+        return Policy::value(&*try_emplace(std::move(key)).first);
     }
 
     template <class K = key_type, class P = Policy>
@@ -3732,6 +3751,7 @@ struct FlatHashSetPolicy {
     using key_type = T;
     using init_type = T;
     using constant_iterators = std::true_type;
+    using is_flat = std::true_type;
 
     template <class Allocator, class... Args>
     static void construct(Allocator* alloc, slot_type* slot, Args&&... args) {
@@ -3769,6 +3789,7 @@ struct FlatHashMapPolicy {
     using key_type = K;
     using mapped_type = V;
     using init_type = std::pair</*non const*/ key_type, mapped_type>;
+    using is_flat = std::true_type;
 
     template <class Allocator, class... Args>
     static void construct(Allocator* alloc, slot_type* slot, Args&&... args) {
@@ -3845,6 +3866,7 @@ struct NodeHashSetPolicy : phmap::priv::node_hash_policy<T&, NodeHashSetPolicy<T
     using key_type = T;
     using init_type = T;
     using constant_iterators = std::true_type;
+    using is_flat = std::false_type;
 
     template <class Allocator, class... Args>
     static T* new_element(Allocator* alloc, Args&&... args) {
@@ -3883,6 +3905,7 @@ public:
     using key_type = Key;
     using mapped_type = Value;
     using init_type = std::pair</*non const*/ key_type, mapped_type>;
+    using is_flat = std::false_type;
 
     template <class Allocator, class... Args>
     static value_type* new_element(Allocator* alloc, Args&&... args) {

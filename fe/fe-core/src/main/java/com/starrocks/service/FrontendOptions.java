@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/service/FrontendOptions.java
 
@@ -24,11 +37,11 @@ package com.starrocks.service;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
+import com.google.common.net.InetAddresses;
 import com.starrocks.common.Config;
-import com.starrocks.common.FeConstants;
 import com.starrocks.common.util.NetUtils;
 import com.starrocks.persist.Storage;
-import org.apache.commons.net.util.SubnetUtils;
+import inet.ipaddr.IPAddressString;
 import org.apache.commons.validator.routines.InetAddressValidator;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -37,13 +50,14 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.net.Inet4Address;
+import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.List;
 import java.util.Properties;
 
 public class FrontendOptions {
-    
+
     public enum HostType {
         FQDN,
         IP,
@@ -58,14 +72,14 @@ public class FrontendOptions {
     private static final String ROLE_FILE_PATH = "/image/ROLE";
 
     @VisibleForTesting
-    static final List<String> priorityCidrs = Lists.newArrayList();
+    static final List<String> PRIORITY_CIDRS = Lists.newArrayList();
     private static InetAddress localAddr = InetAddress.getLoopbackAddress();
     private static boolean useFqdn = false;
 
     public static void init(String[] args) throws UnknownHostException {
         localAddr = null;
         if (!"0.0.0.0".equals(Config.frontend_address)) {
-            if (!InetAddressValidator.getInstance().isValidInet4Address(Config.frontend_address)) {
+            if (!InetAddressValidator.getInstance().isValid(Config.frontend_address)) {
                 throw new UnknownHostException("invalid frontend_address: " + Config.frontend_address);
             }
             localAddr = InetAddress.getByName(Config.frontend_address);
@@ -77,11 +91,6 @@ public class FrontendOptions {
         if (hosts.isEmpty()) {
             LOG.error("fail to get localhost");
             System.exit(-1);
-        }
-
-        if (!Config.enable_fqdn_func) {
-            initAddrUseIp(hosts);
-            return;
         }
 
         HostType specifiedHostType = HostType.NOT_SPECIFIED;
@@ -111,10 +120,12 @@ public class FrontendOptions {
             initAddrUseIp(hosts);
             return;
         }
+
+        // Check if it is a new cluster, new clusters start with IP by default
         String roleFilePath = Config.meta_dir + ROLE_FILE_PATH;
         File roleFile = new File(roleFilePath);
         if (!roleFile.exists()) {
-            initAddrUseFqdn(hosts);
+            initAddrUseIp(hosts);
             return;
         }
         
@@ -127,37 +138,99 @@ public class FrontendOptions {
             System.exit(-1);
         }
         fileStoredHostType = prop.getProperty(HOST_TYPE, null);
-        if (null == fileStoredHostType || fileStoredHostType.equals(HostType.IP.toString())) {
+        
+        // Check if the ROLE file has property 'hostType'
+        // If it not has property 'hostType', start with IP
+        // If it has property 'hostType' & hostType = IP, start with IP
+        if (Strings.isNullOrEmpty(fileStoredHostType) || fileStoredHostType.equals(HostType.IP.toString())) {
             initAddrUseIp(hosts);
             return;
         }
+        // If it has property 'hostType' & hostType = FQDN, start with FQDN
         initAddrUseFqdn(hosts);
     }
 
     @VisibleForTesting
-    static void initAddrUseFqdn(List<InetAddress> hosts) throws UnknownHostException {
+    static void initAddrUseFqdn(List<InetAddress> addrs) {
         useFqdn = true;
-        InetAddress uncheckedLocalAddr = InetAddress.getLocalHost();
-        if (null == uncheckedLocalAddr) {
-            LOG.error("get a null localhost when start fe use fqdn");
-            System.exit(-1);
-        }
-        String uncheckedFqdn = uncheckedLocalAddr.getCanonicalHostName();
-        if (null == uncheckedFqdn) {
-            LOG.error("get a null canonicalHostName when start fe use fqdn");
-            System.exit(-1);
-        }
-        String uncheckeddIp = InetAddress.getByName(uncheckedFqdn).getHostAddress();
-        boolean hasInetAddr = false;
-        for (InetAddress addr : hosts) {
-            if (uncheckeddIp.equals(addr.getHostAddress())) {
-                hasInetAddr = true;
+        analyzePriorityCidrs();
+        String fqdn = null;
+
+        if (PRIORITY_CIDRS.isEmpty()) {
+            // Get FQDN from local host by default.
+            try {
+                InetAddress localHost = InetAddress.getLocalHost();
+                fqdn = localHost.getCanonicalHostName();
+                String ip = localHost.getHostAddress();
+                LOG.info("Get FQDN from local host by default, FQDN: {}, ip: {}, v6: {}", fqdn, ip,
+                        localHost instanceof Inet6Address);
+            } catch (UnknownHostException e) {
+                LOG.error("failed to get FQDN from local host, will exit", e);
+                System.exit(-1);
+            }
+            if (fqdn == null) {
+                LOG.error("priority_networks is not set and we cannot get FQDN from local host");
+                System.exit(-1);
+            }
+            // Try to resolve addr from FQDN
+            InetAddress uncheckedInetAddress = null;
+            try {
+                uncheckedInetAddress = InetAddress.getByName(fqdn);
+            } catch (UnknownHostException e) {
+                LOG.error("failed to parse FQDN: {}, message: {}", fqdn, e.getMessage(), e);
+                System.exit(-1);
+            }
+            if (null == uncheckedInetAddress) {
+                LOG.error("failed to parse FQDN: {}", fqdn);
+                System.exit(-1);
+            }
+            // Check whether the InetAddress obtained via FQDN is bound to some network interface
+            boolean hasInetAddr = false;
+            for (InetAddress addr : addrs) {
+                LOG.info("Try to match addr in fqdn mode, ip: {}, FQDN: {}",
+                        addr.getHostAddress(), addr.getCanonicalHostName());
+                if (addr.getCanonicalHostName()
+                        .equals(uncheckedInetAddress.getCanonicalHostName())) {
+                    hasInetAddr = true;
+                    break;
+                }
+            }
+            if (hasInetAddr) {
+                localAddr = uncheckedInetAddress;
+                LOG.info("Using FQDN from local host by default, FQDN: {}, ip: {}, v6: {}",
+                        localAddr.getCanonicalHostName(),
+                        localAddr.getHostAddress(),
+                        localAddr instanceof Inet6Address);
+            } else {
+                LOG.error("Cannot find a network interface matching FQDN: {}", fqdn);
+                System.exit(-1);
+            }
+        } else {
+            LOG.info("using priority_networks in fqdn mode to decide whether ipv6 or ipv4 is preferred");
+            for (InetAddress addr : addrs) {
+                String hostAddr = addr.getHostAddress();
+                String canonicalHostName = addr.getCanonicalHostName();
+                LOG.info("Try to match addr in fqdn mode, ip: {}, FQDN: {}", hostAddr, canonicalHostName);
+                if (isInPriorNetwork(hostAddr)) {
+                    localAddr = addr;
+                    fqdn = canonicalHostName;
+                    LOG.info("Using FQDN from matched addr, FQDN: {}, ip: {}, v6: {}",
+                            fqdn, hostAddr, addr instanceof Inet6Address);
+                    break;
+                }
+                LOG.info("skip addr {} not belonged to priority networks in FQDN mode", addr);
+            }
+            if (fqdn == null) {
+                LOG.error("priority_networks has been set and we cannot find matched addr, will exit");
+                System.exit(-1);
             }
         }
-        if (hasInetAddr) {
-            localAddr = uncheckedLocalAddr;
-        } else {
-            LOG.error("fail to find right localhost when start fe use fqdn");
+
+        // double-check the reverse resolve
+        String canonicalHostName = localAddr.getCanonicalHostName();
+        if (!canonicalHostName.equals(fqdn)) {
+            LOG.error("The FQDN of the parsed address [{}] is not the same as " + 
+                    "the FQDN obtained from the host [{}]", canonicalHostName, fqdn);
             System.exit(-1);
         }
     }
@@ -166,36 +239,57 @@ public class FrontendOptions {
     static void initAddrUseIp(List<InetAddress> hosts) {
         useFqdn = false;
         analyzePriorityCidrs();
-        // if not set frontend_address, get a non-loopback ip
 
         InetAddress loopBack = null;
         boolean hasMatchedIp = false;
-        for (InetAddress addr : hosts) {
-            LOG.debug("check ip address: {}", addr);
-            if (addr instanceof Inet4Address) {
+
+        // If `priority_networks` is configured, find a possible ip matching the configuration first.
+        // Otherwise, find other usable ip as if `priority_networks` is not configured.
+        if (!PRIORITY_CIDRS.isEmpty()) {
+            for (InetAddress addr : hosts) {
+                LOG.info("check ip address: {}", addr);
+                // Whether to use IPv4 or IPv6, it's configured by CIDR format.
+                // If both IPv4 and IPv6 are configured, the config order decides priority.
+                if (isInPriorNetwork(addr.getHostAddress())) {
+                    localAddr = addr;
+                    hasMatchedIp = true;
+                    break;
+                }
+                LOG.info("skip ip not belonged to priority networks: {}", addr);
+            }
+            // If all ips not match the priority_networks then print the warning log
+            if (!hasMatchedIp) {
+                LOG.warn("ip address range configured for priority_networks does not include the current IP address, " +
+                        "will try other usable ip");
+            }
+        }
+
+        if (localAddr == null) {
+            for (InetAddress addr : hosts) {
+                LOG.info("check ip address: {}", addr);
                 if (addr.isLoopbackAddress()) {
                     loopBack = addr;
-                } else if (!priorityCidrs.isEmpty()) {
-                    if (isInPriorNetwork(addr.getHostAddress())) {
+                } else {
+                    if (Config.net_use_ipv6_when_priority_networks_empty) {
+                        if (addr instanceof Inet6Address) {
+                            localAddr = addr;
+                        }
+                    } else if (addr instanceof Inet4Address) {
                         localAddr = addr;
-                        hasMatchedIp = true;
+                    }
+                    if (localAddr != null) {
+                        // Use the first one found.
                         break;
                     }
-                } else {
-                    localAddr = addr;
-                    break;
                 }
             }
         }
-        //if all ips not match the priority_networks then print the warning log
-        if (!priorityCidrs.isEmpty() && !hasMatchedIp) {
-            LOG.warn("ip address range configured for priority_networks does not include the current IP address");
-        }
+
         // nothing found, use loopback addr
         if (localAddr == null) {
             localAddr = loopBack;
         }
-        LOG.info("local address: {}.", localAddr);
+        LOG.info("Use IP init local addr, IP: {}", localAddr);
     }
 
     public static void saveStartType() {
@@ -209,10 +303,6 @@ public class FrontendOptions {
         }
     }
 
-    public static InetAddress getLocalHost() {
-        return localAddr;
-    }
-
     public static boolean isUseFqdn() {
         return useFqdn;
     }
@@ -221,57 +311,42 @@ public class FrontendOptions {
         if (useFqdn) {
             return localAddr.getCanonicalHostName();
         }
-        return localAddr.getHostAddress();
+        return InetAddresses.toAddrString(localAddr);
     }
 
     public static String getHostname() {
         return localAddr.getHostName();
     }
 
-    public static String getHostnameByIp(String ip) {
-        String hostName = FeConstants.null_string;
-        try {
-            InetAddress address = InetAddress.getByName(ip);
-            hostName = address.getHostName();
-        } catch (UnknownHostException e) {
-            LOG.info("unknown host for {}", ip, e);
-            hostName = "unknown";
-        }
-        return hostName;
-    }
-
     private static void analyzePriorityCidrs() {
         String priorCidrs = Config.priority_networks;
         if (Strings.isNullOrEmpty(priorCidrs)) {
+            PRIORITY_CIDRS.clear();
             return;
         }
         LOG.info("configured prior_cidrs value: {}", priorCidrs);
 
         String[] cidrList = priorCidrs.split(PRIORITY_CIDR_SEPARATOR);
         List<String> priorNetworks = Lists.newArrayList(cidrList);
-        priorityCidrs.addAll(priorNetworks);
+        PRIORITY_CIDRS.addAll(priorNetworks);
     }
 
     @VisibleForTesting
     static boolean isInPriorNetwork(String ip) {
         ip = ip.trim();
-        for (String cidr : priorityCidrs) {
+        for (String cidr : PRIORITY_CIDRS) {
             cidr = cidr.trim();
-            if (!cidr.contains("/")) {
-                // it is not valid CIDR, compare ip directly.
-                if (cidr.equals(ip)) {
-                    return true;
-                }
-            } else {
-                SubnetUtils subnetUtils = new SubnetUtils(cidr);
-                subnetUtils.setInclusiveHostCount(true);
-                SubnetUtils.SubnetInfo subnetInfo = subnetUtils.getInfo();
-                if (subnetInfo.isInRange(ip)) {
-                    return true;
-                }
+            IPAddressString network = new IPAddressString(cidr);
+            IPAddressString address = new IPAddressString(ip);
+            if (network.contains(address)) {
+                return true;
             }
         }
         return false;
+    }
+
+    public static boolean isBindIPV6() {
+        return localAddr instanceof Inet6Address;
     }
 }
 

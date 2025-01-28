@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/bdb/BDBToolTest.java
 
@@ -76,10 +89,8 @@ public class BDBToolTest {
             }
 
             // write something
-            ReplicaPersistInfo info = ReplicaPersistInfo.createForAdd(1, 2, 3, 4, 5, 6, 7, 8, 0, 10, 11, 12, 14);
-            JournalEntity entity = new JournalEntity();
-            entity.setOpCode(OperationType.OP_ADD_REPLICA);
-            entity.setData(info);
+            ReplicaPersistInfo info = ReplicaPersistInfo.createForAdd(1, 2, 3, 4, 5, 6, 7, 8, 0, 10, 11, 12, 14, 0);
+            JournalEntity entity = new JournalEntity(OperationType.OP_ADD_REPLICA, info);
 
             // id is the key
             Long journalId = 23456L;
@@ -90,7 +101,8 @@ public class BDBToolTest {
             // entity is the value
             DataOutputBuffer buffer = new DataOutputBuffer(128);
             try {
-                entity.write(buffer);
+                buffer.writeShort(entity.opCode());
+                entity.data().write(buffer);
             } catch (IOException e) {
                 e.printStackTrace();
             }

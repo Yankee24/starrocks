@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/test/util/doris_metrics_test.cpp
 
@@ -24,20 +37,33 @@
 #include <gtest/gtest.h>
 
 #include "common/config.h"
+#include "runtime/mem_tracker.h"
+#include "storage/page_cache.h"
 #include "util/logging.h"
 
 namespace starrocks {
 
 class StarRocksMetricsTest : public testing::Test {
 public:
-    StarRocksMetricsTest() {}
-    virtual ~StarRocksMetricsTest() {}
+    StarRocksMetricsTest() = default;
+    ~StarRocksMetricsTest() override = default;
+
+protected:
+    void SetUp() override {
+        auto _page_cache_mem_tracker = std::make_unique<MemTracker>();
+        static const int kNumShardBits = 5;
+        static const int kNumShards = 1 << kNumShardBits;
+        StoragePageCache::release_global_cache();
+        StoragePageCache::create_global_cache(_page_cache_mem_tracker.get(), kNumShards * 100000);
+    }
+
+    void TearDown() override { StoragePageCache::instance()->prune(); }
 };
 
 class TestMetricsVisitor : public MetricsVisitor {
 public:
-    virtual ~TestMetricsVisitor() {}
-    void visit(const std::string& prefix, const std::string& name, MetricCollector* collector) {
+    ~TestMetricsVisitor() override = default;
+    void visit(const std::string& prefix, const std::string& name, MetricCollector* collector) override {
         for (auto& it : collector->metrics()) {
             Metric* metric = it.second;
             auto& labels = it.first;
@@ -239,6 +265,105 @@ TEST_F(StarRocksMetricsTest, Normal) {
         ASSERT_TRUE(metric != nullptr);
         ASSERT_STREQ("40", metric->to_string().c_str());
     }
+}
+
+TEST_F(StarRocksMetricsTest, PageCacheMetrics) {
+    TestMetricsVisitor visitor;
+    auto instance = StarRocksMetrics::instance();
+    auto metrics = instance->metrics();
+    metrics->collect(&visitor);
+    LOG(INFO) << "\n" << visitor.to_string();
+
+    auto lookup_metric = metrics->get_metric("page_cache_lookup_count");
+    ASSERT_TRUE(lookup_metric != nullptr);
+    auto hit_metric = metrics->get_metric("page_cache_hit_count");
+    ASSERT_TRUE(hit_metric != nullptr);
+    auto capacity_metric = metrics->get_metric("page_cache_capacity");
+    ASSERT_TRUE(capacity_metric != nullptr);
+    auto cache = StoragePageCache::instance();
+    {
+        StoragePageCache::CacheKey key("abc", 0);
+        char* buf = new char[1024];
+        PageCacheHandle handle;
+        Slice data(buf, 1024);
+        cache->insert(key, data, &handle, false);
+        auto found = cache->lookup(key, &handle);
+        ASSERT_TRUE(found);
+        for (int i = 0; i < 1024; i++) {
+            PageCacheHandle handle;
+            StoragePageCache::CacheKey key(std::to_string(i), 0);
+            cache->lookup(key, &handle);
+        }
+    }
+    config::enable_metric_calculator = false;
+    metrics->collect(&visitor);
+    ASSERT_STREQ("1025", lookup_metric->to_string().c_str());
+    ASSERT_STREQ("1", hit_metric->to_string().c_str());
+    ASSERT_STREQ(std::to_string(cache->get_capacity()).c_str(), capacity_metric->to_string().c_str());
+}
+
+void assert_threadpool_metrics_register(const std::string& pool_name, MetricRegistry* instance) {
+    ASSERT_TRUE(instance->get_metric(pool_name + "_threadpool_size") != nullptr);
+    ASSERT_TRUE(instance->get_metric(pool_name + "_executed_tasks_total") != nullptr);
+    ASSERT_TRUE(instance->get_metric(pool_name + "_pending_time_ns_total") != nullptr);
+    ASSERT_TRUE(instance->get_metric(pool_name + "_execute_time_ns_total") != nullptr);
+    ASSERT_TRUE(instance->get_metric(pool_name + "_queue_count") != nullptr);
+}
+
+TEST_F(StarRocksMetricsTest, test_metrics_register) {
+    auto instance = StarRocksMetrics::instance()->metrics();
+    ASSERT_NE(nullptr, instance->get_metric("memtable_flush_total"));
+    ASSERT_NE(nullptr, instance->get_metric("memtable_flush_duration_us"));
+    ASSERT_NE(nullptr, instance->get_metric("memtable_flush_io_time_us"));
+    ASSERT_NE(nullptr, instance->get_metric("memtable_flush_memory_bytes_total"));
+    ASSERT_NE(nullptr, instance->get_metric("memtable_flush_disk_bytes_total"));
+    ASSERT_NE(nullptr, instance->get_metric("segment_flush_total"));
+    ASSERT_NE(nullptr, instance->get_metric("segment_flush_duration_us"));
+    ASSERT_NE(nullptr, instance->get_metric("segment_flush_io_time_us"));
+    ASSERT_NE(nullptr, instance->get_metric("segment_flush_bytes_total"));
+    assert_threadpool_metrics_register("async_delta_writer", instance);
+    assert_threadpool_metrics_register("memtable_flush", instance);
+    assert_threadpool_metrics_register("lake_memtable_flush", instance);
+    assert_threadpool_metrics_register("segment_replicate", instance);
+    assert_threadpool_metrics_register("segment_flush", instance);
+    assert_threadpool_metrics_register("update_apply", instance);
+    assert_threadpool_metrics_register("pk_index_compaction", instance);
+    assert_threadpool_metrics_register("drop", instance);
+    assert_threadpool_metrics_register("create_tablet", instance);
+    assert_threadpool_metrics_register("alter_tablet", instance);
+    assert_threadpool_metrics_register("clear_transaction", instance);
+    assert_threadpool_metrics_register("storage_medium_migrate", instance);
+    assert_threadpool_metrics_register("check_consistency", instance);
+    assert_threadpool_metrics_register("manual_compaction", instance);
+    assert_threadpool_metrics_register("compaction_control", instance);
+    assert_threadpool_metrics_register("update_schema", instance);
+    assert_threadpool_metrics_register("upload", instance);
+    assert_threadpool_metrics_register("download", instance);
+    assert_threadpool_metrics_register("make_snapshot", instance);
+    assert_threadpool_metrics_register("release_snapshot", instance);
+    assert_threadpool_metrics_register("move_dir", instance);
+    assert_threadpool_metrics_register("update_tablet_meta_info", instance);
+    assert_threadpool_metrics_register("drop_auto_increment_map_dir", instance);
+    assert_threadpool_metrics_register("clone", instance);
+    assert_threadpool_metrics_register("remote_snapshot", instance);
+    assert_threadpool_metrics_register("replicate_snapshot", instance);
+    ASSERT_NE(nullptr, instance->get_metric("load_channel_add_chunks_total"));
+    ASSERT_NE(nullptr, instance->get_metric("load_channel_add_chunks_eos_total"));
+    ASSERT_NE(nullptr, instance->get_metric("load_channel_add_chunks_duration_us"));
+    ASSERT_NE(nullptr, instance->get_metric("load_channel_add_chunks_wait_memtable_duration_us"));
+    ASSERT_NE(nullptr, instance->get_metric("load_channel_add_chunks_wait_writer_duration_us"));
+    ASSERT_NE(nullptr, instance->get_metric("load_channel_add_chunks_wait_replica_duration_us"));
+    ASSERT_NE(nullptr, instance->get_metric("async_delta_writer_execute_total"));
+    ASSERT_NE(nullptr, instance->get_metric("async_delta_writer_task_total"));
+    ASSERT_NE(nullptr, instance->get_metric("async_delta_writer_task_execute_duration_us"));
+    ASSERT_NE(nullptr, instance->get_metric("async_delta_writer_task_pending_duration_us"));
+    ASSERT_NE(nullptr, instance->get_metric("delta_writer_commit_task_total"));
+    ASSERT_NE(nullptr, instance->get_metric("delta_writer_wait_flush_task_total"));
+    ASSERT_NE(nullptr, instance->get_metric("delta_writer_wait_flush_duration_us"));
+    ASSERT_NE(nullptr, instance->get_metric("delta_writer_pk_preload_duration_us"));
+    ASSERT_NE(nullptr, instance->get_metric("delta_writer_wait_replica_duration_us"));
+    ASSERT_NE(nullptr, instance->get_metric("delta_writer_txn_commit_duration_us"));
+    ASSERT_NE(nullptr, instance->get_metric("memtable_finalize_duration_us"));
 }
 
 } // namespace starrocks

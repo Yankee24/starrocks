@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/RoutineLoadDesc.java
 
@@ -21,12 +34,14 @@
 
 package com.starrocks.load;
 
-import com.starrocks.analysis.ColumnSeparator;
-import com.starrocks.analysis.ImportColumnDesc;
-import com.starrocks.analysis.ImportColumnsStmt;
-import com.starrocks.analysis.ImportWhereStmt;
-import com.starrocks.analysis.PartitionNames;
-import com.starrocks.analysis.RowDelimiter;
+import com.starrocks.analysis.Expr;
+import com.starrocks.analysis.SlotRef;
+import com.starrocks.sql.ast.ColumnSeparator;
+import com.starrocks.sql.ast.ImportColumnDesc;
+import com.starrocks.sql.ast.ImportColumnsStmt;
+import com.starrocks.sql.ast.ImportWhereStmt;
+import com.starrocks.sql.ast.PartitionNames;
+import com.starrocks.sql.ast.RowDelimiter;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -40,7 +55,8 @@ public class RoutineLoadDesc {
     // nullable
     private PartitionNames partitionNames;
 
-    public RoutineLoadDesc() {}
+    public RoutineLoadDesc() {
+    }
 
     public RoutineLoadDesc(ColumnSeparator columnSeparator, RowDelimiter rowDelimiter, ImportColumnsStmt columnsInfo,
                            ImportWhereStmt wherePredicate, PartitionNames partitionNames) {
@@ -120,6 +136,7 @@ public class RoutineLoadDesc {
             subSQLs.add(subSQL);
         }
         if (wherePredicate != null) {
+            castSlotRef(wherePredicate.getExpr());
             subSQLs.add("WHERE " + wherePredicate.getExpr().toSql());
         }
         return String.join(", ", subSQLs);
@@ -127,6 +144,18 @@ public class RoutineLoadDesc {
 
     private String pack(String str) {
         return "`" + str + "`";
+    }
+
+    private void castSlotRef(Expr expr) {
+        for (int i = 0; i < expr.getChildren().size(); i++) {
+            Expr childExpr = expr.getChild(i);
+            if (childExpr instanceof SlotRef) {
+                SlotRef slotRef = (SlotRef) childExpr;
+                SlotRef newSlotRef = new SlotRef(slotRef.getTblNameWithoutAnalyzed(), slotRef.getColumnName());
+                expr.setChild(i, newSlotRef);
+            }
+            castSlotRef(childExpr);
+        }
     }
 
     public String columnToString(ImportColumnDesc desc) {

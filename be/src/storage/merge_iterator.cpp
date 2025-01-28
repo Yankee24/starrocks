@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/merge_iterator.h"
 
@@ -9,28 +21,39 @@
 
 #include "column/chunk.h"
 #include "common/config.h"
+#include "gutil/strings/substitute.h"
 #include "storage/chunk_helper.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 // Compare the row of index |m| in |lhs|, with the row of index |n| in |rhs|.
-inline int compare_chunk(size_t key_columns, const Chunk& lhs, size_t m, const Chunk& rhs, size_t n) {
-    for (size_t i = 0; i < key_columns; i++) {
-        const ColumnPtr& lc = lhs.get_column_by_index(i);
-        const ColumnPtr& rc = rhs.get_column_by_index(i);
+inline int compare_chunk(size_t key_columns, const std::vector<uint32_t>& sort_key_idxes, const Chunk& lhs, size_t m,
+                         const Chunk& rhs, size_t n, const std::string& merge_condition) {
+    for (unsigned int sort_key_idx : sort_key_idxes) {
+        const ColumnPtr& lc = lhs.get_column_by_index(sort_key_idx);
+        const ColumnPtr& rc = rhs.get_column_by_index(sort_key_idx);
         if (int r = lc->compare_at(m, n, *rc, -1); r != 0) {
             return r;
         }
     }
+
+    // we append merge_condition into schema in rowset writer, so here we use key_columns as
+    // update condition column index
+    if (!merge_condition.empty() && lhs.columns().size() > key_columns) {
+        const ColumnPtr& lc = lhs.get_column_by_index(key_columns);
+        const ColumnPtr& rc = rhs.get_column_by_index(key_columns);
+        if (int r = lc->compare_at(m, n, *rc, -1); r != 0) {
+            return r;
+        }
+    }
+
     return 0;
 }
-
-static const size_t max_merge_chunk_size = 65536;
 
 // MergingChunk contains a chunk for merge and an index of compared row.
 class MergingChunk {
 public:
-    MergingChunk() {}
+    MergingChunk() = default;
     explicit MergingChunk(Chunk* chunk) : _chunk(chunk) {}
 
     size_t compared_row() const { return _compared_row; }
@@ -50,12 +73,24 @@ protected:
 // Compare two chunks by the one specific row of each other.
 class ComparableChunk : public MergingChunk {
 public:
-    explicit ComparableChunk(Chunk* chunk, size_t order, size_t key_columns)
-            : MergingChunk(chunk), _order(order), _key_columns(key_columns) {}
+    explicit ComparableChunk(Chunk* chunk, size_t order, size_t key_columns, std::vector<uint32_t> sort_key_idxes,
+                             std::string merge_condition)
+            : MergingChunk(chunk),
+              _order(order),
+              _key_columns(key_columns),
+              _sort_key_idxes(std::move(sort_key_idxes)),
+              _merge_condition(std::move(merge_condition)) {}
+
+    explicit ComparableChunk(Chunk* chunk, size_t order, size_t key_columns, std::vector<uint32_t> sort_key_idxes,
+                             std::string merge_condition, std::shared_ptr<std::vector<uint64_t>> rssid_rowids)
+            : ComparableChunk(chunk, order, key_columns, std::move(sort_key_idxes), std::move(merge_condition)) {
+        _rssid_rowids = std::move(rssid_rowids);
+    }
 
     bool operator>(const ComparableChunk& rhs) const {
         DCHECK_EQ(_key_columns, rhs._key_columns);
-        int r = compare_chunk(_key_columns, *_chunk, _compared_row, *rhs._chunk, rhs._compared_row);
+        int r = compare_chunk(_key_columns, _sort_key_idxes, *_chunk, _compared_row, *rhs._chunk, rhs._compared_row,
+                              _merge_condition);
         return (r > 0) | ((r == 0) & (_order > rhs._order));
     }
 
@@ -80,7 +115,8 @@ public:
     }
 
     bool less_than(size_t lhs_row, const ComparableChunk& rhs) {
-        int r = compare_chunk(_key_columns, *_chunk, lhs_row, *rhs._chunk, rhs._compared_row);
+        int r = compare_chunk(_key_columns, _sort_key_idxes, *_chunk, lhs_row, *rhs._chunk, rhs._compared_row,
+                              _merge_condition);
         return (r < 0) | ((r == 0) & (_order < rhs._order));
     }
 
@@ -90,6 +126,9 @@ private:
     // used to determinate the order of two rows when their key columns are all equals.
     uint16_t _order;
     uint16_t _key_columns;
+    std::vector<uint32_t> _sort_key_idxes;
+    std::string _merge_condition;
+    std::shared_ptr<std::vector<uint64_t>> _rssid_rowids;
 };
 
 class MergeIterator : public ChunkIterator {
@@ -106,13 +145,6 @@ public:
                 CHECK_EQ(_schema.field(j)->to_string(), _children[i]->schema().field(j)->to_string());
             }
         }
-        // ensure that the key fields are the first |num_key_fields| and sorted by id.
-        for (size_t i = 0; i < _schema.num_key_fields(); i++) {
-            CHECK(_schema.field(i)->is_key());
-        }
-        for (size_t i = 0; i + 1 < _schema.num_key_fields(); i++) {
-            CHECK_LT(_schema.field(i)->id(), _schema.field(i + 1)->id());
-        }
 #endif
     }
 
@@ -122,17 +154,18 @@ public:
 
     size_t merged_rows() const override { return _merged_rows; }
 
-    virtual Status init_encoded_schema(ColumnIdToGlobalDictMap& dict_maps) override {
-        ChunkIterator::init_encoded_schema(dict_maps);
-        for (int i = 0; i < _children.size(); ++i) {
-            RETURN_IF_ERROR(_children[i]->init_encoded_schema(dict_maps));
+    Status init_encoded_schema(ColumnIdToGlobalDictMap& dict_maps) override {
+        RETURN_IF_ERROR(ChunkIterator::init_encoded_schema(dict_maps));
+        for (auto& i : _children) {
+            RETURN_IF_ERROR(i->init_encoded_schema(dict_maps));
         }
         return Status::OK();
     }
-    virtual Status init_output_schema(const std::unordered_set<uint32_t>& unused_output_column_ids) override {
-        ChunkIterator::init_output_schema(unused_output_column_ids);
-        for (int i = 0; i < _children.size(); ++i) {
-            RETURN_IF_ERROR(_children[i]->init_output_schema(unused_output_column_ids));
+
+    Status init_output_schema(const std::unordered_set<uint32_t>& unused_output_column_ids) override {
+        RETURN_IF_ERROR(ChunkIterator::init_output_schema(unused_output_column_ids));
+        for (auto& i : _children) {
+            RETURN_IF_ERROR(i->init_output_schema(unused_output_column_ids));
         }
         return Status::OK();
     }
@@ -153,7 +186,9 @@ inline Status MergeIterator::init() {
     DCHECK(_chunk_size > 0);
     DCHECK_EQ(_children.size(), _chunk_pool.size());
     for (size_t i = 0; i < _children.size(); i++) {
-        _chunk_pool[i] = ChunkHelper::new_chunk(encoded_schema(), _chunk_size);
+        // No need to reserve, because it's already reserved in segment interators.
+        // If we reserve here, for small segment files, it will consume large memory then need.
+        _chunk_pool[i] = ChunkHelper::new_chunk(output_schema(), 0);
         RETURN_IF_ERROR(fill(i));
     }
     _inited = true;
@@ -183,9 +218,21 @@ class HeapMergeIterator final : public MergeIterator {
 public:
     explicit HeapMergeIterator(std::vector<ChunkIteratorPtr> children) : MergeIterator(std::move(children)) {}
 
+    std::string merge_condition;
+
+    // In PK table compaction, we need to get chunk and each row's rssid & rowid
+    bool need_rssid_rowids = false;
+
 protected:
-    Status do_get_next(Chunk* chunk) override { return do_get_next(chunk, nullptr); }
-    Status do_get_next(Chunk* chunk, std::vector<RowSourceMask>* source_masks) override;
+    Status do_get_next(Chunk* chunk, std::vector<RowSourceMask>* source_masks,
+                       std::vector<uint64_t>* rssid_rowids) override;
+    Status do_get_next(Chunk* chunk) override { return do_get_next(chunk, nullptr, nullptr); }
+    Status do_get_next(Chunk* chunk, std::vector<RowSourceMask>* source_masks) override {
+        return do_get_next(chunk, source_masks, nullptr);
+    }
+    Status do_get_next(Chunk* chunk, std::vector<uint64_t>* rssid_rowids) override {
+        return do_get_next(chunk, nullptr, rssid_rowids);
+    }
     Status fill(size_t child) override;
 
 private:
@@ -196,7 +243,8 @@ private:
     ChunkHeap _heap;
 };
 
-inline Status HeapMergeIterator::do_get_next(Chunk* chunk, std::vector<RowSourceMask>* source_masks) {
+inline Status HeapMergeIterator::do_get_next(Chunk* chunk, std::vector<RowSourceMask>* source_masks,
+                                             std::vector<uint64_t>* rssid_rowids) {
     if (!_inited) {
         RETURN_IF_ERROR(init());
     }
@@ -218,6 +266,12 @@ inline Status HeapMergeIterator::do_get_next(Chunk* chunk, std::vector<RowSource
                 // so here we swap the whole min_chunk out.
                 if (rows == 0) {
                     chunk->swap_chunk(*min_chunk._chunk);
+                    if (rssid_rowids != nullptr && need_rssid_rowids) {
+                        // insert into `rssid_rowids` only when need_rssid_rowids is true.
+                        DCHECK(min_chunk._rssid_rowids != nullptr);
+                        rssid_rowids->insert(rssid_rowids->end(), min_chunk._rssid_rowids->begin(),
+                                             min_chunk._rssid_rowids->end());
+                    }
                     if (source_masks) {
                         source_masks->insert(source_masks->end(), chunk->num_rows(),
                                              RowSourceMask{min_chunk._order, false});
@@ -247,6 +301,12 @@ inline Status HeapMergeIterator::do_get_next(Chunk* chunk, std::vector<RowSource
         DCHECK_GT(append_row_num, 0);
 
         chunk->append(*min_chunk._chunk, offset, append_row_num);
+        if (rssid_rowids != nullptr && need_rssid_rowids) {
+            // insert into `rssid_rowids` only when need_rssid_rowids is true.
+            DCHECK(min_chunk._rssid_rowids != nullptr);
+            rssid_rowids->insert(rssid_rowids->end(), min_chunk._rssid_rowids->begin() + offset,
+                                 min_chunk._rssid_rowids->begin() + offset + append_row_num);
+        }
         min_chunk.advance(append_row_num);
         rows += append_row_num;
 
@@ -277,8 +337,14 @@ inline Status HeapMergeIterator::fill(size_t child) {
     Chunk* chunk = _chunk_pool[child].get();
 
     chunk->reset();
+    std::shared_ptr<vector<uint64_t>> rssid_rowids = std::make_shared<vector<uint64_t>>();
 
-    Status st = _children[child]->get_next(chunk);
+    Status st = Status::OK();
+    if (need_rssid_rowids) {
+        st = _children[child]->get_next(chunk, rssid_rowids.get());
+    } else {
+        st = _children[child]->get_next(chunk);
+    }
     if (st.ok()) {
         size_t num_rows = chunk->num_rows();
         DCHECK_GT(num_rows, 0u);
@@ -286,7 +352,13 @@ inline Status HeapMergeIterator::fill(size_t child) {
             return Status::InternalError(strings::Substitute(
                     "Merge iterator only supports merging chunks with rows less than $0", max_merge_chunk_size));
         }
-        _heap.push(ComparableChunk{chunk, child, _schema.num_key_fields()});
+        if (need_rssid_rowids) {
+            _heap.push(ComparableChunk{chunk, child, _schema.num_key_fields(), _schema.sort_key_idxes(),
+                                       merge_condition, std::move(rssid_rowids)});
+        } else {
+            _heap.push(
+                    ComparableChunk{chunk, child, _schema.num_key_fields(), _schema.sort_key_idxes(), merge_condition});
+        }
     } else if (st.is_end_of_file()) {
         // ignore Status::EndOfFile.
         close_child(child);
@@ -320,6 +392,57 @@ ChunkIteratorPtr new_heap_merge_iterator(const std::vector<ChunkIteratorPtr>& ch
     return new_heap_merge_iterator(sub_merge_iterators);
 }
 
+ChunkIteratorPtr new_heap_merge_iterator(const std::vector<ChunkIteratorPtr>& children,
+                                         const std::string& merge_condition) {
+    DCHECK(!children.empty());
+    if (children.size() == 1) {
+        return children[0];
+    }
+
+    // The `ComparableChunk` is using `uint16_t` to save the chunk order, if the size of
+    // children is greater than UINT16_MAX, the value of order will overflow.
+    const static size_t kMaxChildrenSize = std::numeric_limits<uint16_t>::max();
+
+    if (children.size() <= kMaxChildrenSize) {
+        auto heapMergeIterator = std::make_shared<HeapMergeIterator>(children);
+        heapMergeIterator->merge_condition = merge_condition;
+        return heapMergeIterator;
+    }
+    std::vector<ChunkIteratorPtr> sub_merge_iterators;
+    sub_merge_iterators.reserve((children.size() + kMaxChildrenSize - 1) / kMaxChildrenSize);
+    for (size_t i = 0; i < children.size(); i += kMaxChildrenSize) {
+        size_t j = std::min(i + kMaxChildrenSize, children.size());
+        std::vector<ChunkIteratorPtr> v(children.begin() + i, children.begin() + j);
+        sub_merge_iterators.emplace_back(new_heap_merge_iterator(v, merge_condition));
+    }
+    return new_heap_merge_iterator(sub_merge_iterators, merge_condition);
+}
+
+ChunkIteratorPtr new_heap_merge_iterator(const std::vector<ChunkIteratorPtr>& children, const bool need_rssid_rowids) {
+    DCHECK(!children.empty());
+    if (children.size() == 1) {
+        return children[0];
+    }
+
+    // The `ComparableChunk` is using `uint16_t` to save the chunk order, if the size of
+    // children is greater than UINT16_MAX, the value of order will overflow.
+    const static size_t kMaxChildrenSize = std::numeric_limits<uint16_t>::max();
+
+    if (children.size() <= kMaxChildrenSize) {
+        auto heapMergeIterator = std::make_shared<HeapMergeIterator>(children);
+        heapMergeIterator->need_rssid_rowids = need_rssid_rowids;
+        return heapMergeIterator;
+    }
+    std::vector<ChunkIteratorPtr> sub_merge_iterators;
+    sub_merge_iterators.reserve((children.size() + kMaxChildrenSize - 1) / kMaxChildrenSize);
+    for (size_t i = 0; i < children.size(); i += kMaxChildrenSize) {
+        size_t j = std::min(i + kMaxChildrenSize, children.size());
+        std::vector<ChunkIteratorPtr> v(children.begin() + i, children.begin() + j);
+        sub_merge_iterators.emplace_back(new_heap_merge_iterator(v, need_rssid_rowids));
+    }
+    return new_heap_merge_iterator(sub_merge_iterators, need_rssid_rowids);
+}
+
 // Merge iterator based on source masks.
 // The order of rows is determinate by mask sequence.
 class MaskMergeIterator final : public MergeIterator {
@@ -330,7 +453,7 @@ public:
     }
 
 protected:
-    Status do_get_next(Chunk* chunk) override { return Status::NotSupported("get chunk not supported"); }
+    Status do_get_next(Chunk* chunk) override { return do_get_next(chunk, nullptr); }
     Status do_get_next(Chunk* chunk, std::vector<RowSourceMask>* source_masks) override;
     Status fill(size_t child) override;
 
@@ -367,7 +490,9 @@ inline Status MaskMergeIterator::do_get_next(Chunk* chunk, std::vector<RowSource
             if (rows == 0) {
                 chunk->swap_chunk(*min_chunk._chunk);
                 for (int i = 0; i < min_chunk_num_rows; ++i) {
-                    source_masks->emplace_back(_mask_buffer->current());
+                    if (source_masks) {
+                        source_masks->emplace_back(_mask_buffer->current());
+                    }
                     _mask_buffer->advance();
                 }
                 return fill(child);
@@ -390,7 +515,9 @@ inline Status MaskMergeIterator::do_get_next(Chunk* chunk, std::vector<RowSource
         min_chunk.advance(append_row_num);
         rows += append_row_num;
         for (size_t i = 0; i < append_row_num; ++i) {
-            source_masks->emplace_back(_mask_buffer->current());
+            if (source_masks) {
+                source_masks->emplace_back(_mask_buffer->current());
+            }
             _mask_buffer->advance();
         }
 
@@ -446,8 +573,11 @@ inline Status MaskMergeIterator::fill(size_t child) {
 
 ChunkIteratorPtr new_mask_merge_iterator(const std::vector<ChunkIteratorPtr>& children,
                                          RowSourceMaskBuffer* mask_buffer) {
+    if (children.size() == 1) {
+        return children[0];
+    }
     DCHECK(children.size() > 1 && children.size() <= RowSourceMask::MAX_SOURCES);
-    return std::make_shared<MaskMergeIterator>(std::move(children), mask_buffer);
+    return std::make_shared<MaskMergeIterator>(children, mask_buffer);
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

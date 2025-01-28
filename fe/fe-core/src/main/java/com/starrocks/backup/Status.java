@@ -17,6 +17,8 @@
 
 package com.starrocks.backup;
 
+import com.google.gson.annotations.SerializedName;
+
 public class Status {
     public enum ErrCode {
         OK,
@@ -28,11 +30,15 @@ public class Status {
         TIMEOUT,
         BAD_CONNECTION,
         COMMON_ERROR,
-        OLAP_VERSION_ALREADY_MERGED
+        OLAP_VERSION_ALREADY_MERGED,
+        UNSUPPORTED,
+        BAD_REPLACE
     }
 
-    private ErrCode errCode;
-    private String errMsg;
+    @SerializedName("ec")
+    private final ErrCode errCode;
+    @SerializedName("em")
+    private final String errMsg;
 
     public static final Status OK = new Status(ErrCode.OK, "");
 

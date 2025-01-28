@@ -1,3 +1,18 @@
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
 package com.starrocks.consistency;
 
 import com.google.common.collect.Lists;
@@ -31,6 +46,7 @@ public class ConsistencyCheckerTest {
         long tabletId = 5L;
         long replicaId = 6L;
         long backendId = 7L;
+        long physicalPartitionId = 8L;
         TStorageMedium medium = TStorageMedium.HDD;
 
         MaterializedIndex materializedIndex = new MaterializedIndex(indexId, MaterializedIndex.IndexState.NORMAL);
@@ -39,18 +55,18 @@ public class ConsistencyCheckerTest {
 
         TabletMeta tabletMeta = new TabletMeta(dbId, tableId, partitionId, indexId, 1111, medium);
         LocalTablet tablet = new LocalTablet(tabletId, Lists.newArrayList(replica));
-        materializedIndex.addTablet(tablet, tabletMeta, true);
+        materializedIndex.addTablet(tablet, tabletMeta, false);
         PartitionInfo partitionInfo = new PartitionInfo();
         DataProperty dataProperty = new DataProperty(medium);
         partitionInfo.addPartition(partitionId, dataProperty, (short) 3, false);
         DistributionInfo distributionInfo = new HashDistributionInfo(1, Lists.newArrayList());
-        Partition partition = new Partition(partitionId, "partition", materializedIndex, distributionInfo);
-        partition.setVisibleVersion(2L, System.currentTimeMillis());
+        Partition partition = new Partition(partitionId, physicalPartitionId, "partition", materializedIndex, distributionInfo);
+        partition.getDefaultPhysicalPartition().setVisibleVersion(2L, System.currentTimeMillis());
         OlapTable table = new OlapTable(tableId, "table", Lists.newArrayList(), KeysType.AGG_KEYS, partitionInfo,
                 distributionInfo);
         table.addPartition(partition);
         Database database = new Database(dbId, "database");
-        database.createTable(table);
+        database.registerTableUnlocked(table);
 
         new Expectations() {
             {
@@ -58,12 +74,16 @@ public class ConsistencyCheckerTest {
                 result = globalStateMgr;
                 minTimes = 0;
 
-                globalStateMgr.getDbIds();
+                globalStateMgr.getLocalMetastore().getDbIds();
                 result = Lists.newArrayList(dbId);
                 minTimes = 0;
 
-                globalStateMgr.getDb(dbId);
+                globalStateMgr.getLocalMetastore().getDb(dbId);
                 result = database;
+                minTimes = 0;
+
+                globalStateMgr.getLocalMetastore().getTables(dbId);
+                result = database.getTables();
                 minTimes = 0;
             }
         };
@@ -73,5 +93,14 @@ public class ConsistencyCheckerTest {
         // set table state to RESTORE, we will make sure checker will not choose its tablets.
         table.setState(OlapTable.OlapTableState.RESTORE);
         Assert.assertEquals(0, new ConsistencyChecker().chooseTablets().size());
+    }
+
+    @Test
+    public void testResetToBeCleanedTime() {
+        TabletMeta tabletMeta = new TabletMeta(1, 2, 3,
+                4, 5, TStorageMedium.HDD);
+        tabletMeta.setToBeCleanedTime(123L);
+        tabletMeta.resetToBeCleanedTime();
+        Assert.assertNull(tabletMeta.getToBeCleanedTime());
     }
 }

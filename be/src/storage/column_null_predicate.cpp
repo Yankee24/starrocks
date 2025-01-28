@@ -1,17 +1,29 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include <cstring>
 
 #include "column/column.h"
 #include "column/nullable_column.h"
 #include "gutil/casts.h"
+#include "storage/column_predicate.h"
 #include "storage/rowset/bitmap_index_reader.h"
 #include "storage/rowset/bloom_filter.h"
-#include "storage/vectorized_column_predicate.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
-class ColumnIsNullPredicate : public ColumnPredicate {
+class ColumnIsNullPredicate final : public ColumnPredicate {
 public:
     explicit ColumnIsNullPredicate(const TypeInfoPtr& type_info, ColumnId id) : ColumnPredicate(type_info, id) {}
 
@@ -56,17 +68,27 @@ public:
         return min.is_null();
     }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return true; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         range->clear();
         if (iter->has_null_bitmap()) {
-            range->add(Range(iter->bitmap_nums() - 1, iter->bitmap_nums()));
+            range->add(Range<>(iter->bitmap_nums() - 1, iter->bitmap_nums()));
         }
         return Status::OK();
     }
 
-    bool support_bloom_filter() const override { return true; }
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        roaring::Roaring null_roaring;
+        RETURN_IF_ERROR(iterator->read_null(column_name, &null_roaring));
+        *row_bitmap &= null_roaring;
+        return Status::OK();
+    }
 
-    bool bloom_filter(const BloomFilter* bf) const override { return bf->test_bytes(nullptr, 0); }
+    bool support_original_bloom_filter() const override { return true; }
+
+    bool original_bloom_filter(const BloomFilter* bf) const override { return bf->test_bytes(nullptr, 0); }
 
     PredicateType type() const override { return PredicateType::kIsNull; }
 
@@ -77,9 +99,11 @@ public:
         *output = this;
         return Status::OK();
     }
+
+    std::string debug_string() const override { return strings::Substitute("(ColumnId($0) IS NULL)", _column_id); }
 };
 
-class ColumnNotNullPredicate : public ColumnPredicate {
+class ColumnNotNullPredicate final : public ColumnPredicate {
 public:
     explicit ColumnNotNullPredicate(const TypeInfoPtr& type_info, ColumnId id) : ColumnPredicate(type_info, id) {}
 
@@ -127,8 +151,18 @@ public:
         return !max.is_null();
     }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const override {
+    bool support_bitmap_filter() const override { return false; }
+
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const override {
         return Status::Cancelled("not null predicate not support bitmap index");
+    }
+
+    Status seek_inverted_index(const std::string& column_name, InvertedIndexIterator* iterator,
+                               roaring::Roaring* row_bitmap) const override {
+        roaring::Roaring null_roaring;
+        RETURN_IF_ERROR(iterator->read_null(column_name, &null_roaring));
+        *row_bitmap -= null_roaring;
+        return Status::OK();
     }
 
     PredicateType type() const override { return PredicateType::kNotNull; }
@@ -140,6 +174,8 @@ public:
         *output = this;
         return Status::OK();
     }
+
+    std::string debug_string() const override { return strings::Substitute("(ColumnId($0) IS NOT NULL)", _column_id); }
 };
 
 ColumnPredicate* new_column_null_predicate(const TypeInfoPtr& type_info, ColumnId id, bool is_null) {
@@ -149,4 +185,4 @@ ColumnPredicate* new_column_null_predicate(const TypeInfoPtr& type_info, ColumnI
     return new ColumnNotNullPredicate(type_info, id);
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

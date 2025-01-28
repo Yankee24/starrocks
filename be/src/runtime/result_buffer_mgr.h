@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/result_buffer_mgr.h
 
@@ -21,6 +34,8 @@
 
 #pragma once
 
+#include <arrow/record_batch.h>
+
 #include <map>
 #include <thread>
 #include <unordered_map>
@@ -35,16 +50,17 @@ namespace starrocks {
 
 class TFetchDataResult;
 class BufferControlBlock;
-class GetResultBatchCtx;
+struct GetResultBatchCtx;
 class PUniqueId;
 
 // manage all result buffer control block in one backend
 class ResultBufferMgr {
 public:
     ResultBufferMgr();
-    ~ResultBufferMgr();
+    ~ResultBufferMgr() = default;
     // init Result Buffer Mgr, start cancel thread
     Status init();
+    void stop();
     // create one result sender for this query_id
     // the returned sender do not need release
     // sender is not used when call cancel or unregister
@@ -60,9 +76,16 @@ public:
     // cancel one query at a future time.
     Status cancel_at_time(time_t cancel_time, const TUniqueId& query_id);
 
+    Status fetch_arrow_data(const TUniqueId& query_id, std::shared_ptr<arrow::RecordBatch>* result);
+
+    void set_arrow_schema(const TUniqueId& query_id, const std::shared_ptr<arrow::Schema>& arrow_schema);
+
+    std::shared_ptr<arrow::Schema> get_arrow_schema(const TUniqueId& query_id);
+
 private:
     typedef std::unordered_map<TUniqueId, std::shared_ptr<BufferControlBlock>> BufferMap;
     typedef std::map<time_t, std::vector<TUniqueId>> TimeoutMap;
+    typedef std::unordered_map<TUniqueId, std::shared_ptr<arrow::Schema>> ArrowSchemaMap;
 
     std::shared_ptr<BufferControlBlock> find_control_block(const TUniqueId& query_id);
 
@@ -84,5 +107,7 @@ private:
     TimeoutMap _timeout_map;
 
     std::unique_ptr<std::thread> _cancel_thread;
+
+    ArrowSchemaMap _arrow_schema_map;
 };
 } // namespace starrocks

@@ -17,11 +17,11 @@
 
 package com.starrocks.mysql;
 
-import com.starrocks.common.AnalysisException;
+import com.starrocks.common.ErrorReportException;
 import org.junit.Assert;
 import org.junit.Test;
 
-import java.io.UnsupportedEncodingException;
+import java.nio.charset.StandardCharsets;
 
 public class MysqlPasswordTest {
     @Test
@@ -43,36 +43,36 @@ public class MysqlPasswordTest {
     }
 
     @Test
-    public void testCheckPass() throws UnsupportedEncodingException {
+    public void testCheckPass() {
         // client
         byte[] publicSeed = MysqlPassword.createRandomString(20);
         byte[] codePass = MysqlPassword.scramble(publicSeed, "mypass");
 
         Assert.assertTrue(MysqlPassword.checkScramble(codePass,
                 publicSeed,
-                MysqlPassword.getSaltFromPassword("*6C8989366EAF75BB670AD8EA7A7FC1176A95CEF4".getBytes("UTF-8"))));
+                MysqlPassword.getSaltFromPassword("*6C8989366EAF75BB670AD8EA7A7FC1176A95CEF4".getBytes(StandardCharsets.UTF_8))));
 
         Assert.assertFalse(MysqlPassword.checkScramble(codePass,
                 publicSeed,
-                MysqlPassword.getSaltFromPassword("*9A6EC51164108A8D3DA3BE3F35A56F6499B6FC32".getBytes("UTF-8"))));
+                MysqlPassword.getSaltFromPassword("*9A6EC51164108A8D3DA3BE3F35A56F6499B6FC32".getBytes(StandardCharsets.UTF_8))));
     }
 
     @Test
-    public void testCheckPassword() throws AnalysisException {
+    public void testCheckPassword() {
         Assert.assertEquals("*9A6EC51164108A8D3DA3BE3F35A56F6499B6FC32",
                 new String(MysqlPassword.checkPassword("*9A6EC51164108A8D3DA3BE3F35A56F6499B6FC32")));
 
         Assert.assertEquals("", new String(MysqlPassword.checkPassword(null)));
     }
 
-    @Test(expected = AnalysisException.class)
-    public void testCheckPasswdFail() throws AnalysisException {
+    @Test(expected = ErrorReportException.class)
+    public void testCheckPasswdFail() {
         MysqlPassword.checkPassword("*9A6EC1164108A8D3DA3BE3F35A56F6499B6FC32");
         Assert.fail("No exception throws");
     }
 
-    @Test(expected = AnalysisException.class)
-    public void testCheckPasswdFail2() throws AnalysisException {
+    @Test(expected = ErrorReportException.class)
+    public void testCheckPasswdFail2() {
         Assert.assertNotNull(MysqlPassword.checkPassword("*9A6EC51164108A8D3DA3BE3F35A56F6499B6FC32"));
         MysqlPassword.checkPassword("*9A6EC51164108A8D3DA3BE3F35A56F6499B6FC3H");
         Assert.fail("No exception throws");

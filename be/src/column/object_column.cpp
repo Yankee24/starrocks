@@ -1,7 +1,20 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "column/object_column.h"
 
+#include "column/vectorized_fwd.h"
 #include "gutil/casts.h"
 #include "types/bitmap_value.h"
 #include "types/hll.h"
@@ -10,22 +23,22 @@
 #include "util/percentile_value.h"
 #include "util/phmap/phmap.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 template <typename T>
 size_t ObjectColumn<T>::byte_size(size_t from, size_t size) const {
     DCHECK_LE(from + size, this->size()) << "Range error";
     size_t byte_size = 0;
-    for (int i = 0; i < size; ++i) {
-        byte_size += _pool[from + i].serialize_size();
+    for (size_t i = 0; i < size; ++i) {
+        byte_size += _pool[from + i].mem_usage();
     }
     return byte_size;
 }
 
 template <typename T>
 size_t ObjectColumn<T>::byte_size(size_t idx) const {
-    DCHECK(false) << "Don't support object column byte size";
-    return 0;
+    DCHECK_LE(idx, this->size()) << "Range error";
+    return _pool[idx].serialize_size();
 }
 
 template <typename T>
@@ -36,7 +49,7 @@ void ObjectColumn<T>::assign(size_t n, size_t idx) {
     _pool.resize(1);
     _pool.reserve(n);
 
-    for (int i = 1; i < n; ++i) {
+    for (size_t i = 1; i < n; ++i) {
         append(&_pool[0]);
     }
 
@@ -56,9 +69,15 @@ void ObjectColumn<T>::append(T&& object) {
 }
 
 template <typename T>
+void ObjectColumn<T>::append(const T& object) {
+    _pool.emplace_back(object);
+    _cache_ok = false;
+}
+
+template <typename T>
 void ObjectColumn<T>::remove_first_n_values(size_t count) {
     size_t remain_size = _pool.size() - count;
-    for (int i = 0; i < remain_size; ++i) {
+    for (size_t i = 0; i < remain_size; ++i) {
         _pool[i] = std::move(_pool[count + i]);
     }
 
@@ -69,33 +88,33 @@ void ObjectColumn<T>::remove_first_n_values(size_t count) {
 template <typename T>
 void ObjectColumn<T>::append(const Column& src, size_t offset, size_t count) {
     const auto& obj_col = down_cast<const ObjectColumn<T>&>(src);
-    for (int i = offset; i < count + offset; ++i) {
+    for (size_t i = offset; i < count + offset; ++i) {
         append(obj_col.get_object(i));
     }
 }
 
 template <typename T>
-void ObjectColumn<T>::append_selective(const starrocks::vectorized::Column& src, const uint32_t* indexes, uint32_t from,
+void ObjectColumn<T>::append_selective(const starrocks::Column& src, const uint32_t* indexes, uint32_t from,
                                        uint32_t size) {
     const auto& obj_col = down_cast<const ObjectColumn<T>&>(src);
-    for (int j = 0; j < size; ++j) {
+    for (uint32_t j = 0; j < size; ++j) {
         append(obj_col.get_object(indexes[from + j]));
     }
-};
+}
 
 template <typename T>
-void ObjectColumn<T>::append_value_multiple_times(const starrocks::vectorized::Column& src, uint32_t index,
-                                                  uint32_t size) {
+void ObjectColumn<T>::append_value_multiple_times(const starrocks::Column& src, uint32_t index, uint32_t size) {
     const auto& obj_col = down_cast<const ObjectColumn<T>&>(src);
-    for (int j = 0; j < size; ++j) {
+    for (uint32_t i = 0; i < size; i++) {
         append(obj_col.get_object(index));
     }
-};
+}
 
 template <typename T>
-bool ObjectColumn<T>::append_strings(const Buffer<starrocks::Slice>& strs) {
-    _pool.reserve(_pool.size() + strs.size());
-    for (const Slice& s : strs) {
+bool ObjectColumn<T>::append_strings(const Slice* data, size_t size) {
+    _pool.reserve(_pool.size() + size);
+    for (size_t i = 0; i < size; i++) {
+        const auto& s = data[i];
         _pool.emplace_back(s);
     }
 
@@ -105,10 +124,10 @@ bool ObjectColumn<T>::append_strings(const Buffer<starrocks::Slice>& strs) {
 
 template <typename T>
 void ObjectColumn<T>::append_value_multiple_times(const void* value, size_t count) {
-    const Slice* slice = reinterpret_cast<const Slice*>(value);
+    const auto* slice = reinterpret_cast<const Slice*>(value);
     _pool.reserve(_pool.size() + count);
 
-    for (int i = 0; i < count; ++i) {
+    for (size_t i = 0; i < count; ++i) {
         _pool.emplace_back(*reinterpret_cast<T*>(slice->data));
     }
 
@@ -123,7 +142,7 @@ void ObjectColumn<T>::append_default() {
 
 template <typename T>
 void ObjectColumn<T>::append_default(size_t count) {
-    for (int i = 0; i < count; ++i) {
+    for (size_t i = 0; i < count; ++i) {
         append_default();
     }
 }
@@ -139,7 +158,7 @@ void ObjectColumn<T>::fill_default(const Filter& filter) {
 }
 
 template <typename T>
-Status ObjectColumn<T>::update_rows(const Column& src, const uint32_t* indexes) {
+void ObjectColumn<T>::update_rows(const Column& src, const uint32_t* indexes) {
     const auto& obj_col = down_cast<const ObjectColumn<T>&>(src);
     size_t replace_num = src.size();
     for (size_t i = 0; i < replace_num; i++) {
@@ -147,13 +166,11 @@ Status ObjectColumn<T>::update_rows(const Column& src, const uint32_t* indexes) 
         _pool[indexes[i]] = *obj_col.get_object(i);
     }
     _cache_ok = false;
-    return Status::OK();
 }
 
 template <typename T>
 uint32_t ObjectColumn<T>::serialize(size_t idx, uint8_t* pos) {
-    DCHECK(false) << "Don't support object column serialize";
-    return 0;
+    return static_cast<uint32_t>(get_object(idx)->serialize(pos));
 }
 
 template <typename T>
@@ -165,7 +182,9 @@ uint32_t ObjectColumn<T>::serialize_default(uint8_t* pos) {
 template <typename T>
 void ObjectColumn<T>::serialize_batch(uint8_t* dst, Buffer<uint32_t>& slice_sizes, size_t chunk_size,
                                       uint32_t max_one_row_size) {
-    DCHECK(false) << "Don't support object column serialize batch";
+    for (size_t i = 0; i < chunk_size; ++i) {
+        slice_sizes[i] += serialize(i, dst + i * max_one_row_size + slice_sizes[i]);
+    }
 }
 
 template <typename T>
@@ -175,18 +194,30 @@ const uint8_t* ObjectColumn<T>::deserialize_and_append(const uint8_t* pos) {
 }
 
 template <typename T>
+bool ObjectColumn<T>::deserialize_and_append(const Slice& src) {
+    if constexpr (std::is_same_v<T, BitmapValue>) {
+        return _pool.emplace_back().valid_and_deserialize(src.data, src.size);
+    } else if constexpr (std::is_same_v<T, HyperLogLog>) {
+        return _pool.emplace_back().deserialize(src);
+    } else if constexpr (std::is_same_v<T, PercentileValue>) {
+        _pool.emplace_back(src);
+        return true;
+    }
+    return false;
+}
+
+template <typename T>
 void ObjectColumn<T>::deserialize_and_append_batch(Buffer<Slice>& srcs, size_t chunk_size) {
     DCHECK(false) << "Don't support object column deserialize and append";
 }
 
 template <typename T>
 uint32_t ObjectColumn<T>::serialize_size(size_t idx) const {
-    DCHECK(false) << "Don't support object column byte size";
-    return 0;
+    return static_cast<uint32_t>(get_object(idx)->serialize_size());
 }
 
 template <typename T>
-size_t ObjectColumn<T>::filter_range(const Column::Filter& filter, size_t from, size_t to) {
+size_t ObjectColumn<T>::filter_range(const Filter& filter, size_t from, size_t to) {
     size_t old_sz = size();
     size_t new_sz = from;
     for (auto i = from; i < to; ++i) {
@@ -197,7 +228,7 @@ size_t ObjectColumn<T>::filter_range(const Column::Filter& filter, size_t from, 
     }
     DCHECK_LE(new_sz, to);
     if (new_sz < to) {
-        for (int i = to; i < old_sz; i++) {
+        for (size_t i = to; i < old_sz; i++) {
             std::swap(_pool[new_sz], _pool[i]);
             new_sz++;
         }
@@ -207,8 +238,7 @@ size_t ObjectColumn<T>::filter_range(const Column::Filter& filter, size_t from, 
 }
 
 template <typename T>
-int ObjectColumn<T>::compare_at(size_t left, size_t right, const starrocks::vectorized::Column& rhs,
-                                int nan_direction_hint) const {
+int ObjectColumn<T>::compare_at(size_t left, size_t right, const starrocks::Column& rhs, int nan_direction_hint) const {
     DCHECK(false) << "Don't support object column compare_at";
     return 0;
 }
@@ -216,10 +246,11 @@ int ObjectColumn<T>::compare_at(size_t left, size_t right, const starrocks::vect
 template <typename T>
 void ObjectColumn<T>::fnv_hash(uint32_t* hash, uint32_t from, uint32_t to) const {
     std::string s;
-    for (int i = from; i < to; ++i) {
+    for (uint32_t i = from; i < to; ++i) {
         s.resize(_pool[i].serialize_size());
-        int32_t size = _pool[i].serialize(reinterpret_cast<uint8_t*>(s.data()));
-        hash[i] = HashUtil::fnv_hash(s.data(), size, hash[i]);
+        //TODO: May be overflow here if the object is large then 2G.
+        size_t size = _pool[i].serialize(reinterpret_cast<uint8_t*>(s.data()));
+        hash[i] = HashUtil::fnv_hash(s.data(), static_cast<int32_t>(size), hash[i]);
     }
 }
 
@@ -235,7 +266,7 @@ int64_t ObjectColumn<T>::xor_checksum(uint32_t from, uint32_t to) const {
 }
 
 template <typename T>
-void ObjectColumn<T>::put_mysql_row_buffer(starrocks::MysqlRowBuffer* buf, size_t idx) const {
+void ObjectColumn<T>::put_mysql_row_buffer(starrocks::MysqlRowBuffer* buf, size_t idx, bool is_binary_protocol) const {
     buf->push_null();
 }
 
@@ -248,8 +279,11 @@ void ObjectColumn<T>::_build_slices() const {
     // FIXME(kks): bitmap itself compress is more effective than LZ4 compress?
     // Do we really need compress bitmap here?
     if constexpr (std::is_same_v<T, BitmapValue>) {
-        for (int i = 0; i < _pool.size(); ++i) {
-            _pool[i].compress();
+        for (size_t i = 0; i < _pool.size(); ++i) {
+            // TODO: Putting compress here is not a good way to implement it.
+            //  It is better to put it before writing data and provide an independent Column::Optimize interface.
+            //  For now, let’s implement it in this way with relatively small changes.
+            const_cast<T*>(&_pool[i])->compress();
         }
     }
 
@@ -257,9 +291,9 @@ void ObjectColumn<T>::_build_slices() const {
     _buffer.resize(size);
     _slices.reserve(_pool.size());
     size_t old_size = 0;
-    for (int i = 0; i < _pool.size(); ++i) {
-        int32_t slice_size = _pool[i].serialize(_buffer.data() + old_size);
-        _slices.emplace_back(Slice(_buffer.data() + old_size, slice_size));
+    for (size_t i = 0; i < _pool.size(); ++i) {
+        size_t slice_size = _pool[i].serialize(_buffer.data() + old_size);
+        _slices.emplace_back(_buffer.data() + old_size, slice_size);
         old_size += slice_size;
     }
 }
@@ -279,20 +313,23 @@ ColumnPtr ObjectColumn<T>::clone_shared() const {
 }
 
 template <typename T>
-std::string ObjectColumn<T>::debug_item(uint32_t idx) const {
+std::string ObjectColumn<T>::debug_item(size_t idx) const {
     return "";
 }
 
 template <>
-std::string ObjectColumn<BitmapValue>::debug_item(uint32_t idx) const {
+std::string ObjectColumn<HyperLogLog>::debug_item(size_t idx) const {
+    return _pool[idx].to_string();
+}
+
+template <>
+std::string ObjectColumn<BitmapValue>::debug_item(size_t idx) const {
     return _pool[idx].to_string();
 }
 
 template <typename T>
 StatusOr<ColumnPtr> ObjectColumn<T>::upgrade_if_overflow() {
-    if (capacity_limit_reached()) {
-        return Status::InternalError("Size of ObjectColumn exceed the limit");
-    }
+    RETURN_IF_ERROR(capacity_limit_reached());
     return nullptr;
 }
 
@@ -301,4 +338,4 @@ template class ObjectColumn<BitmapValue>;
 template class ObjectColumn<PercentileValue>;
 template class ObjectColumn<JsonValue>;
 
-} // namespace starrocks::vectorized
+} // namespace starrocks
